@@ -1,16 +1,20 @@
 """
 FinAgent Step 3a: PDF解析（pdfplumber）
-用途：用 pdfplumber 提取PDF正文和表格，生成检索chunks
+用途：用 pdfplumber 提取PDF正文和表格，输出统一格式的解析结果
 环境：Google Colab
 依赖：pip install pdfplumber
 
 运行顺序：
     1. 先运行 02_download_pdfs.py 下载PDF
     2. 运行本脚本解析PDF
-    3. 运行 04_build_chunks.py 合并所有chunks
+    3. 运行 04_build_chunks.py 构建chunks
 
 运行方式：
     python 03a_parse_pdfplumber.py                # 解析全部已下载的PDF
+    python 03a_parse_pdfplumber.py --max_pdfs 200 # 最多处理200篇
+
+输出格式（与 03b_parse_marker.py / 03c_parse_mineru.py 一致）：
+    [{"file": "xxx.pdf", "text": "...", "time": 1.23}, ...]
 
 面试追问：pdfplumber vs PyPDF2 vs Marker?
 答：PyPDF2表格准确率只有30%太差；Marker/Nougat用VLM准确率最高(85%+)
@@ -22,26 +26,27 @@ import pdfplumber
 import json
 import os
 import re
+import time
+import argparse
 import logging
-from datetime import datetime
+import random
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
 # ============ 配置 ============
-RAW_DIR = "./data/raw"
-PDF_DIR = os.path.join(RAW_DIR, "report_pdfs")
-PARSED_DIR = os.path.join(RAW_DIR, "report_parsed")
+PDF_DIR = "./data/raw/report_pdfs"
+RESULT_FILE = "./data/raw/report_parsed/pdfplumber_all_results.json"
 
-os.makedirs(PARSED_DIR, exist_ok=True)
+os.makedirs(os.path.dirname(RESULT_FILE), exist_ok=True)
 
 
 # ============ PDF解析 ============
 
-def parse_single_pdf(pdf_path: str) -> list[str]:
+def parse_single_pdf(pdf_path: str) -> str:
     """
-    解析单个PDF，提取文本段落 + 表格内容
+    解析单个PDF，提取文本段落 + 表格内容，返回拼接后的全文字符串
 
     面试追问：表格怎么处理的？
     答：用pdfplumber的extract_tables()单独提取结构化表格，
@@ -105,7 +110,7 @@ def parse_single_pdf(pdf_path: str) -> list[str]:
     except Exception as e:
         logger.error(f"  PDF解析失败 {pdf_path}: {e}")
 
-    return paragraphs
+    return '\n'.join(paragraphs)
 
 
 def _is_noise_line(line: str) -> bool:
@@ -151,151 +156,83 @@ def _is_valid_paragraph(paragraph: str) -> bool:
     return True
 
 
-def paragraphs_to_chunks(paragraphs: list[str], metadata: dict,
-                         chunk_size: int = 512, overlap: int = 64) -> list[dict]:
-    """
-    将段落列表转为定长chunks（滑动窗口）
-
-    面试追问：chunk_size怎么定的？
-    答：512是经验值。256太短一段分析可能被切断，1024太长检索时混入无关信息。
-    消融实验R-1会验证 {256, 512, 768, 1024} 的效果差异。
-
-    overlap=64（约12.5%）保证上下文不断裂。
-    """
-    chunks = []
-
-    # 先拼接所有段落
-    full_text = '\n'.join(paragraphs)
-
-    # 如果全文很短，直接作为一个chunk
-    if len(full_text) <= chunk_size:
-        if len(full_text) >= 50:
-            chunks.append({
-                "text": full_text,
-                "metadata": {**metadata, "chunk_method": "full_text"}
-            })
-        return chunks
-
-    # 滑动窗口切分
-    start = 0
-    chunk_idx = 0
-    while start < len(full_text):
-        end = start + chunk_size
-        chunk_text = full_text[start:end]
-
-        # 尽量在句号/换行处截断，不要切断句子
-        if end < len(full_text):
-            last_break = max(
-                chunk_text.rfind('。'),
-                chunk_text.rfind('\n'),
-                chunk_text.rfind('；'),
-            )
-            if last_break > chunk_size * 0.5:
-                chunk_text = chunk_text[:last_break + 1]
-                end = start + last_break + 1
-
-        chunk_text = chunk_text.strip()
-        if len(chunk_text) >= 50:
-            chunks.append({
-                "text": chunk_text,
-                "metadata": {
-                    **metadata,
-                    "chunk_method": "sliding_window",
-                    "chunk_index": chunk_idx,
-                }
-            })
-            chunk_idx += 1
-
-        start = end - overlap
-        if start >= len(full_text):
-            break
-
-    return chunks
-
-
-def batch_parse_pdfs(pdf_map: dict) -> list[dict]:
-    """批量解析PDF并构建chunks"""
-    all_chunks = []
-    stats = {"total_pdfs": 0, "parsed_ok": 0, "parsed_empty": 0,
-             "parse_failed": 0, "total_chunks": 0}
-
-    logger.info(f"===== 开始解析 {len(pdf_map)} 个PDF =====")
-
-    for filename, meta in tqdm(pdf_map.items(), desc="解析PDF"):
-        pdf_path = meta["pdf_path"]
-        stats["total_pdfs"] += 1
-
-        if not os.path.exists(pdf_path):
-            stats["parse_failed"] += 1
-            continue
-
-        paragraphs = parse_single_pdf(pdf_path)
-
-        if not paragraphs:
-            stats["parsed_empty"] += 1
-            continue
-
-        stats["parsed_ok"] += 1
-
-        chunk_metadata = {
-            "source_type": "report_fulltext",
-            "stock_code": meta["stock_code"],
-            "stock_name": meta["stock_name"],
-            "institution": meta["institution"],
-            "rating": meta["rating"],
-            "industry": meta["industry"],
-            "date": meta["date"],
-            "report_title": meta["report_title"],
-            "pdf_file": filename,
-        }
-
-        chunks = paragraphs_to_chunks(paragraphs, chunk_metadata)
-        all_chunks.extend(chunks)
-        stats["total_chunks"] += len(chunks)
-
-    # 保存解析结果
-    output_path = os.path.join(PARSED_DIR, "pdfplumber_all_chunks.jsonl")
-    with open(output_path, 'w', encoding='utf-8') as f:
-        for chunk in all_chunks:
-            f.write(json.dumps(chunk, ensure_ascii=False) + '\n')
-
-    with open(os.path.join(PARSED_DIR, "parse_stats.json"), 'w', encoding='utf-8') as f:
-        json.dump(stats, f, ensure_ascii=False, indent=2)
-
-    logger.info(f"===== PDF解析完成 =====")
-    logger.info(f"  解析成功: {stats['parsed_ok']}, 空内容: {stats['parsed_empty']}, "
-                f"失败: {stats['parse_failed']}")
-    logger.info(f"  总chunks: {stats['total_chunks']}")
-    logger.info(f"  保存路径: {output_path}")
-
-    return all_chunks
-
-
 # ============ 主流程 ============
 
 def main():
-    logger.info("=" * 60)
-    logger.info("研报PDF解析（pdfplumber）")
-    logger.info(f"时间: {datetime.now():%Y-%m-%d %H:%M:%S}")
-    logger.info("=" * 60)
+    parser = argparse.ArgumentParser(description="pdfplumber PDF 提取")
+    parser.add_argument("--max_pdfs", type=int, default=0, help="最多处理几篇（0=全部）")
+    parser.add_argument("--sample", action="store_true", help="随机抽样而非按顺序")
+    args = parser.parse_args()
 
-    # 从已有映射加载
-    map_path = os.path.join(PDF_DIR, "pdf_map.json")
-    if not os.path.exists(map_path):
-        logger.error(f"PDF映射不存在: {map_path}")
-        logger.error("请先运行 02_download_pdfs.py 下载PDF")
-        return
+    # 获取所有 PDF
+    all_pdfs = [f for f in os.listdir(PDF_DIR) if f.endswith('.pdf')]
+    logger.info(f"共 {len(all_pdfs)} 篇 PDF")
 
-    with open(map_path, 'r', encoding='utf-8') as f:
-        pdf_map = json.load(f)
-    logger.info(f"从本地加载 {len(pdf_map)} 个PDF映射")
+    # 加载已完成的结果（断点续传）
+    results = []
+    done_files = set()
+    if os.path.exists(RESULT_FILE):
+        with open(RESULT_FILE, 'r', encoding='utf-8') as f:
+            results = json.load(f)
+            done_files = {r['file'] for r in results}
+        logger.info(f"已完成 {len(done_files)} 篇，跳过")
 
-    chunks = batch_parse_pdfs(pdf_map)
+    # 过滤已完成的
+    remaining = [f for f in all_pdfs if f not in done_files]
 
-    logger.info("=" * 60)
-    logger.info("完成！下一步:")
-    logger.info("  运行 04_build_chunks.py 合并所有chunks（元数据 + PDF正文 + 财务数据）")
-    logger.info("=" * 60)
+    # 随机抽样
+    if args.sample and args.max_pdfs > 0:
+        remaining = random.sample(remaining, min(args.max_pdfs, len(remaining)))
+    elif args.max_pdfs > 0:
+        remaining = remaining[:args.max_pdfs]
+
+    logger.info(f"本次处理: {len(remaining)} 篇")
+
+    # 处理
+    total_start = time.time()
+    success = 0
+    fail = 0
+    for i, pdf_file in enumerate(remaining):
+        pdf_path = os.path.join(PDF_DIR, pdf_file)
+        start = time.time()
+
+        text = parse_single_pdf(pdf_path)
+        elapsed = time.time() - start
+
+        if text:
+            results.append({"file": pdf_file, "text": text, "time": elapsed})
+            success += 1
+
+            total_elapsed = time.time() - total_start
+            avg = total_elapsed / (i + 1)
+            remain_min = avg * (len(remaining) - i - 1) / 60
+            logger.info(f"[{i+1}/{len(remaining)}] {elapsed:.1f}秒 | "
+                       f"{len(text)}字符 | 剩余{remain_min:.0f}分钟 | {pdf_file}")
+        else:
+            fail += 1
+            logger.warning(f"[{i+1}/{len(remaining)}] 失败/空 | {pdf_file}")
+
+        # 每 50 篇保存 checkpoint
+        if (i + 1) % 50 == 0:
+            with open(RESULT_FILE, 'w', encoding='utf-8') as f:
+                json.dump(results, f, ensure_ascii=False, indent=2)
+            logger.info(f"  [checkpoint] 已保存 {len(results)} 篇 | 成功{success} 失败{fail}")
+
+    # 最终保存
+    with open(RESULT_FILE, 'w', encoding='utf-8') as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    # 统计
+    if results:
+        times = [r['time'] for r in results]
+        texts = [len(r['text']) for r in results]
+        logger.info("=" * 60)
+        logger.info(f"完成! 成功{success}篇, 失败{fail}篇")
+        logger.info(f"平均耗时: {sum(times)/len(times):.1f}秒/篇")
+        logger.info(f"总耗时: {sum(times)/3600:.1f}小时")
+        logger.info(f"平均字符数: {sum(texts)/len(texts):.0f}")
+        logger.info(f"保存到: {RESULT_FILE}")
+        logger.info("=" * 60)
 
 
 if __name__ == "__main__":
