@@ -33,7 +33,7 @@ logger = logging.getLogger(__name__)
 # ============ 配置 ============
 CHUNK_PATH = "./data/processed/all_chunks.jsonl"
 INDEX_DIR = "./data/index"
-EMBEDDING_MODEL = "./models/BAAI/bge-base-zh-v1___5"
+EMBEDDING_MODEL = "./models/bge-base-zh-v1.5"
 BATCH_SIZE = 256  # GPU 上可以用大 batch
 
 os.makedirs(INDEX_DIR, exist_ok=True)
