@@ -14,3 +14,4 @@ __pycache__/
 # 压缩包
 *.tar.gz
 *.zip
+data/
