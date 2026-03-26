@@ -59,7 +59,11 @@ def _format_result(result: dict, max_text_len: int = 200) -> str:
 
     text = _clean_text(result["text"])
     if len(text) > max_text_len:
-        text = text[:max_text_len] + "..."
+        last_period = text[:max_text_len].rfind('。')
+        if last_period > max_text_len * 0.5:
+            text = text[:last_period + 1]
+        else:
+            text = text[:max_text_len] + "..."
 
     return f"[{source} | {name} | {date}] {text}"
 
@@ -142,7 +146,7 @@ class FinAgentTools:
 
     # ---------- search_report ----------
 
-    def _search_report(self, query: str, top_k: int = 5) -> str:
+    def _search_report(self, query: str, top_k: int = 3) -> str:
         """
         检索研报信息
 
@@ -169,7 +173,7 @@ class FinAgentTools:
 
     # ---------- search_financial ----------
 
-    def _search_financial(self, query: str, top_k: int = 5) -> str:
+    def _search_financial(self, query: str, top_k: int = 3) -> str:
         """
         检索财务数据
 
