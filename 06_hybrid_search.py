@@ -264,16 +264,16 @@ class FinAgentRetriever:
 
     @staticmethod
     def _time_bonus(metadata: dict, half_life_days: int = 365,
-                    max_bonus: float = 0.3) -> float:
+                    max_bonus: float = 0.4) -> float:
         """
         时效性加分：越新的文档 bonus 越高，指数衰减
 
         bonus = max_bonus * exp(-0.693 * days_ago / half_life_days)
 
         参数选择：
-        - half_life_days=365：一年前的文档 bonus 衰减到一半（0.15）
-        - max_bonus=0.3：经验值。够大能把 7 年前的高 BM25 分结果压下去，
-          够小不会让完全不相关但很新的文档排到前面
+        - half_life_days=365：一年前的文档 bonus 衰减到一半（0.20）
+        - max_bonus=0.4：初始 0.3 时 2017 老研报仍偶尔排进 top-3，
+          调到 0.4 后新研报 bonus 约 0.34（半年内），老研报接近 0，拉开足够差距
 
         设计决策：
         - 只对 report / report_fulltext 生效

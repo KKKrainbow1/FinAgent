@@ -602,22 +602,25 @@ def validate_sample(sample: dict) -> tuple:
         if step.get("action") != "finish" and not step.get("observation"):
             errors.append(f"OBS: 第{i+1}步缺少 observation")
 
-    # 4. 答案-证据一致性（finish 答案中 80%+ 数字可溯源）
-    finish_step = next((s for s in steps if s.get("action") == "finish"), None)
-    if finish_step:
-        answer = finish_step.get("action_input", "")
-        if answer and answer != "PLACEHOLDER":
-            answer_nums = set(re.findall(r'\d+\.?\d*', answer))
-            obs_text = " ".join(
-                s.get("observation", "") for s in steps
-                if s.get("observation") and s.get("action") != "finish"
-            )
-            obs_nums = set(re.findall(r'\d+\.?\d*', obs_text))
+    # 4. 答案-证据一致性（finish 答案中数字可溯源）
+    # reject 类跳过此检查——拒绝回答的答案本来就不会引用 Observation 中的数字
+    qtype = sample.get("type", "")
+    if qtype != "reject":
+        finish_step = next((s for s in steps if s.get("action") == "finish"), None)
+        if finish_step:
+            answer = finish_step.get("action_input", "")
+            if answer and answer != "PLACEHOLDER":
+                answer_nums = set(re.findall(r'\d+\.?\d*', answer))
+                obs_text = " ".join(
+                    s.get("observation", "") for s in steps
+                    if s.get("observation") and s.get("action") != "finish"
+                )
+                obs_nums = set(re.findall(r'\d+\.?\d*', obs_text))
 
-            if answer_nums:
-                coverage = len(answer_nums & obs_nums) / len(answer_nums)
-                if coverage < 0.5:
-                    errors.append(f"CONSISTENCY: 答案数字溯源率仅 {coverage:.0%}")
+                if answer_nums:
+                    coverage = len(answer_nums & obs_nums) / len(answer_nums)
+                    if coverage < 0.5:
+                        errors.append(f"CONSISTENCY: 答案数字溯源率仅 {coverage:.0%}")
 
     # 5. 步数合理性
     num_steps = len(steps)
