@@ -171,8 +171,14 @@ class FinAgentRetriever:
             top_k=top_k,
         )
 
-        # 交替合并去重
+        # 交替合并去重（保证两路都有露出）
         combined = self._interleave_results(meta_results, text_results, top_k)
+
+        # 按 score 重排：time_bonus 已经加进 score 里了，
+        # 现在两路的分数可比（都包含了时效性加分），按分数统一排序
+        # 这样 2017 老研报即使 BM25 分高，也会被 time_bonus 更大的新研报压下去
+        combined.sort(key=lambda x: x["score"], reverse=True)
+
         return combined
 
     # ================================================================
