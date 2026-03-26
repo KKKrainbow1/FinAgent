@@ -214,12 +214,15 @@ PLAN_PROMPT = """你是金融分析数据标注员。请根据以下要求生成
 | finish | 输出最终答案 | 分析报告文本 | 所有需要的信息已获取且计算已完成，生成最终报告 |
 
 ## 工具使用原则
-- 简单查询（如"XX的ROE是多少"）：1-2步即可
-- 多维度分析（如"分析XX的盈利能力"）：2-3步
-- 对比分析（如"比较A和B"）：需要分别查两家公司，3-4步
+- 简单查询（如"XX的ROE是多少"）：1-2步即可（financial_query 类型）
+- 单公司简单分析（如"机构怎么看XX"）：2步（search_report → finish）
+- 单公司多维度分析（如"分析XX的盈利能力"）：必须3步（search_financial → search_report → finish），不能只用一个工具就finish
+- 对比分析（如"比较A和B"）：必须3-4步，分别查两家公司（search_financial A → search_financial B → calculate → finish）
+- 风险分析：必须至少3步（search_financial → search_report → finish）
+- 行业分析：必须至少3步
 - 每条轨迹控制在2-5步
 - search_financial 的 query 中只写一家公司名，不要同时查多家公司
-- calculate 的 action_input 必须是纯数学表达式（如 36.99 - 24.53），不要用变量名
+- calculate 的 action_input 写 CALC_PLACEHOLDER（后续会基于真实数据自动填充正确的数学表达式），不要写具体数字或变量名
 
 ## Thought 写作要求（⭐重要）
 - 第一步的 Thought 应说明分析框架（如"分析盈利能力需要看ROE、毛利率、净利率"）
@@ -368,6 +371,18 @@ def fill_real_observations(plan: dict, tools: FinAgentTools) -> dict:
             filled_steps.append(step)
             continue
 
+        # calculate 步如果是 PLACEHOLDER 或 {变量名}，Step 2.5 会回填，这里先跳过
+        if action == "calculate":
+            ai = str(action_input)
+            if "PLACEHOLDER" in ai.upper() or "{" in ai:
+                filled_steps.append({
+                    "thought": step["thought"],
+                    "action": action,
+                    "action_input": action_input,
+                    "observation": "[待回填]",
+                })
+                continue
+
         # 调用真实工具
         try:
             observation = tools.call(action, action_input)
@@ -390,6 +405,120 @@ def fill_real_observations(plan: dict, tools: FinAgentTools) -> dict:
 
     plan["steps"] = filled_steps
     plan["retrieval_quality"] = retrieval_quality
+    return plan
+
+
+# ============ Step 2.5: 回填 calculate 表达式 ============
+
+CALC_FILL_PROMPT = """根据以下已获取的真实数据，将 calculate 步骤的 CALC_PLACEHOLDER 替换为正确的纯数学表达式。
+
+用户问题：{question}
+
+已获取的数据：
+{observations}
+
+calculate 步骤的 Thought：{calc_thought}
+
+要求：
+1. 输出一个纯数学表达式，只包含数字和运算符（+、-、*、/、括号）
+2. 表达式中的数字必须来自上面的数据，不能编造
+3. 只输出表达式本身，不要输出其他文字
+4. 如果数据中找不到需要的数字，输出 SKIP
+
+示例：
+- Thought说要算ROE差值，数据中A公司ROE=36.99%，B公司ROE=24.53% → 输出：36.99 - 24.53
+- Thought说要算权益乘数，数据中资产负债率=42.70% → 输出：1 / (1 - 42.70 / 100)
+- Thought说要算杜邦ROE，数据中净利率=14.47%，周转率=0.49，资产负债率=42.70% → 输出：14.47 / 100 * 0.49 * (1 / (1 - 42.70 / 100))
+"""
+
+
+def fill_calculate_expressions(plan: dict, client: OpenAI, model: str) -> dict:
+    """
+    Step 2.5: 对包含 CALC_PLACEHOLDER 的 calculate 步骤，
+    基于前序 Observation 中的真实数字生成正确的数学表达式。
+
+    解决的问题：Step 1 生成计划时还没有 Observation，Qwen 只能写占位符。
+    现在 Observation 已填充，可以用 API 生成正确的表达式。
+    """
+    steps = plan.get("steps", [])
+    has_calc_placeholder = any(
+        s.get("action") == "calculate" and "PLACEHOLDER" in str(s.get("action_input", "")).upper()
+        for s in steps
+    )
+
+    if not has_calc_placeholder:
+        # 没有需要回填的 calculate 步骤，也检查一下 {变量名} 格式的
+        has_var_template = any(
+            s.get("action") == "calculate" and "{" in str(s.get("action_input", ""))
+            for s in steps
+        )
+        if not has_var_template:
+            return plan
+
+    # 收集前序 Observation
+    obs_parts = []
+    for i, step in enumerate(steps):
+        if step.get("observation") and step.get("action") != "finish":
+            obs_parts.append(f"[Step {i+1} - {step['action']}] {step['observation']}")
+
+    obs_text = "\n".join(obs_parts)
+
+    for i, step in enumerate(steps):
+        if step.get("action") != "calculate":
+            continue
+
+        action_input = str(step.get("action_input", ""))
+        # 需要回填：CALC_PLACEHOLDER 或包含 { 变量名 }
+        if "PLACEHOLDER" not in action_input.upper() and "{" not in action_input:
+            continue
+
+        try:
+            prompt = CALC_FILL_PROMPT.format(
+                question=plan.get("question", ""),
+                observations=obs_text,
+                calc_thought=step.get("thought", ""),
+            )
+
+            response = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3,  # 低温度，确定性输出
+                max_tokens=200,
+                extra_body={"enable_thinking": False},
+            )
+            expr = response.choices[0].message.content.strip()
+
+            if expr == "SKIP" or not expr:
+                logger.warning(f"calculate 回填跳过（数据不足）: {step['thought'][:50]}")
+                # 把这步改成 think_only 或直接移除
+                step["action"] = "finish"
+                step["action_input"] = "PLACEHOLDER"
+                step["observation"] = None
+                continue
+
+            # 清理：去掉可能的 markdown 代码块标记
+            expr = expr.replace("`", "").strip()
+
+            # 验证：只包含数字和运算符
+            import re
+            if re.match(r'^[\d\s\.\+\-\*/\(\)]+$', expr):
+                step["action_input"] = expr
+                # 重新执行 calculate 获取正确的 Observation
+                from tools import FinAgentTools
+                try:
+                    result = eval(expr)
+                    step["observation"] = f"计算结果: {result}"
+                    logger.info(f"calculate 回填成功: {expr} = {result}")
+                except Exception:
+                    step["observation"] = f"[计算错误] 表达式: {expr}"
+                    logger.warning(f"calculate 回填后执行失败: {expr}")
+            else:
+                logger.warning(f"calculate 回填格式异常: {expr}")
+                step["observation"] = f"[计算错误] 表达式格式异常: {expr}"
+
+        except Exception as e:
+            logger.error(f"calculate 回填 API 调用失败: {e}")
+
     return plan
 
 
@@ -727,6 +856,11 @@ def main():
             else:
                 # 拒绝类也需要填充 Observation（展示检索结果不相关）
                 plan = fill_real_observations(plan, tools)
+
+            # === Step 2.5: 回填 calculate 表达式 ===
+            # Step 1 生成计划时 calculate 用了 CALC_PLACEHOLDER 或 {变量名}，
+            # 现在 Observation 已填充，用 API 基于真实数字生成正确的数学表达式
+            plan = fill_calculate_expressions(plan, client, model)
 
             # === Step 3: 生成最终答案（仅对 PLACEHOLDER 的 finish 步） ===
             finish_step = next(
