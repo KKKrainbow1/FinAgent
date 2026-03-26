@@ -238,6 +238,12 @@ class FinAgentRetriever:
             b_score = bm25_dict.get(idx, 0.0)
             combined[idx] = alpha * f_score + (1 - alpha) * b_score
 
+        # ---------- 时效性加分 ----------
+        # 只对 report / report_fulltext 生效，financial 不加
+        # 解决的问题：BM25 关键词匹配可能把 7 年前的老研报排在最新研报前面
+        for idx in combined:
+            combined[idx] += self._time_bonus(self.metadatas[idx])
+
         # ---------- 排序返回 ----------
         sorted_ids = sorted(combined.keys(), key=lambda x: combined[x], reverse=True)
 
@@ -249,6 +255,51 @@ class FinAgentRetriever:
                 "score": float(combined[idx]),
             })
         return results
+
+    @staticmethod
+    def _time_bonus(metadata: dict, half_life_days: int = 365,
+                    max_bonus: float = 0.3) -> float:
+        """
+        时效性加分：越新的文档 bonus 越高，指数衰减
+
+        bonus = max_bonus * exp(-0.693 * days_ago / half_life_days)
+
+        参数选择：
+        - half_life_days=365：一年前的文档 bonus 衰减到一半（0.15）
+        - max_bonus=0.3：经验值。够大能把 7 年前的高 BM25 分结果压下去，
+          够小不会让完全不相关但很新的文档排到前面
+
+        设计决策：
+        - 只对 report / report_fulltext 生效
+        - financial 不加（用户可能需要旧财务数据做趋势分析）
+
+        面试话术：
+        "SFT 数据测试中发现 search_report('贵州茅台 目标价') 返回了 2017 年的老研报，
+        因为标题里恰好有'目标价'三个字，BM25 给了高分。加了指数衰减的 time_bonus 后，
+        7 年前的研报 bonus 接近 0，半年内的研报能拿到 0.2+ 的 bonus，排序直接翻转。
+        half_life 设 365 天是因为金融研报时效性强，一年前的评级和目标价参考价值大幅下降。"
+        """
+        import math
+        from datetime import datetime
+
+        source_type = metadata.get("source_type", "")
+        if source_type not in ("report", "report_fulltext"):
+            return 0.0
+
+        # 兼容两种日期字段名：report/report_fulltext 用 "date"，financial 用 "report_date"
+        date_str = metadata.get("date") or metadata.get("report_date") or ""
+        date_str = str(date_str).strip()[:10]  # 处理 "2025-11-05 00:00:00" 格式
+
+        if not date_str:
+            return 0.0
+
+        try:
+            doc_date = datetime.strptime(date_str, "%Y-%m-%d")
+            days_ago = max((datetime.now() - doc_date).days, 0)
+            decay = math.exp(-0.693 * days_ago / half_life_days)
+            return max_bonus * decay
+        except (ValueError, TypeError):
+            return 0.0
 
     @staticmethod
     def _normalize(scores: np.ndarray) -> np.ndarray:
@@ -311,6 +362,7 @@ def main():
         ("search_report", "宁德时代 投资评级 目标价"),
         ("search_report", "贵州茅台 竞争优势 护城河"),
         ("search_report", "隆基绿能 行业前景"),
+        ("search_report", "贵州茅台 目标价"),  # 时效性测试：之前返回 2017 老研报
     ]
 
     for tool, query in test_queries:
@@ -326,9 +378,10 @@ def main():
         for i, r in enumerate(results):
             source = r["metadata"]["source_type"]
             name = r["metadata"].get("stock_name", "")
+            date = r["metadata"].get("date") or r["metadata"].get("report_date", "")
             score = r["score"]
             text_preview = r["text"][:120].replace("\n", " ")
-            print(f"  [{i+1}] {score:.3f} | {source} | {name}")
+            print(f"  [{i+1}] {score:.3f} | {source} | {name} | {str(date)[:10]}")
             print(f"      {text_preview}...")
 
 
