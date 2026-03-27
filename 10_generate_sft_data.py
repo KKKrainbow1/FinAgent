@@ -640,7 +640,9 @@ def validate_sample(sample: dict) -> tuple:
         )
         prior_nums = set(re.findall(r'\d+\.?\d*', prior_obs))
         unmatched = calc_nums - prior_nums
-        significant_unmatched = {n for n in unmatched if float(n) > 10}
+        # 允许公式常数：100（百分比转小数）、2、1 等
+        CALC_CONSTANTS = {"100", "1000", "10000"}
+        significant_unmatched = {n for n in unmatched if float(n) > 10 and n not in CALC_CONSTANTS}
         if significant_unmatched:
             errors.append(f"CALC: 第{i+1}步数字 {significant_unmatched} 未在前序 Observation 中出现")
 
