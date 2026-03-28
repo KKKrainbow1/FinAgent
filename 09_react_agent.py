@@ -327,6 +327,72 @@ def export_trajectory(result: dict) -> dict:
 
 # ============ 主函数 ============
 
+def run_batch(input_path: str, output_path: str, model, tokenizer, tools,
+              system_prompt: str, max_steps: int = MAX_STEPS):
+    """
+    批量运行测试集
+
+    读取 test_questions.jsonl（每行 {question, type}），
+    逐条跑 Agent，结果追加写入 output_path。
+    支持断点续跑：如果 output_path 已有结果，跳过已完成的条目。
+
+    Args:
+        input_path: 测试集路径（jsonl，每行含 question 和 type）
+        output_path: 输出路径（jsonl，每行含完整 Agent 结果）
+    """
+    import json
+
+    # 读取测试集
+    with open(input_path, "r", encoding="utf-8") as f:
+        test_items = [json.loads(line) for line in f]
+
+    # 断点续跑：检查已完成的条目
+    done_questions = set()
+    try:
+        with open(output_path, "r", encoding="utf-8") as f:
+            for line in f:
+                r = json.loads(line)
+                done_questions.add(r["question"])
+        logger.info(f"发现已有结果 {len(done_questions)} 条，跳过已完成")
+    except FileNotFoundError:
+        pass
+
+    total = len(test_items)
+    pending = [item for item in test_items if item["question"] not in done_questions]
+    logger.info(f"测试集共 {total} 条，待运行 {len(pending)} 条")
+
+    with open(output_path, "a", encoding="utf-8") as f_out:
+        for idx, item in enumerate(pending):
+            question = item["question"]
+            q_type = item.get("type", "unknown")
+            completed = total - len(pending) + idx
+
+            print(f"\n[{completed + 1}/{total}] ({q_type}) {question[:50]}...")
+
+            result = run_agent(question, model, tokenizer, tools,
+                               system_prompt, max_steps=max_steps, verbose=False)
+
+            # 写入结果
+            output_record = {
+                "question": question,
+                "type": q_type,
+                "steps": result["steps"],
+                "final_answer": result["final_answer"],
+                "finished": result["finished"],
+                "total_steps": result["total_steps"],
+                "elapsed_seconds": round(result["elapsed_seconds"], 1),
+            }
+            f_out.write(json.dumps(output_record, ensure_ascii=False) + "\n")
+            f_out.flush()
+
+            # 打印摘要
+            status = "✓" if result["finished"] else "✗ 未finish"
+            answer_len = len(result["final_answer"]) if result["final_answer"] else 0
+            print(f"  {status} | {result['total_steps']}步 | {result['elapsed_seconds']:.1f}s | 答案{answer_len}字")
+
+    logger.info(f"批量运行完成，结果保存至 {output_path}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="FinAgent ReAct Agent")
     parser.add_argument("--question", type=str, default=None,
@@ -335,6 +401,10 @@ def main():
                         help="模型路径（默认 ./models/Qwen2.5-14B-Instruct）")
     parser.add_argument("--interactive", action="store_true",
                         help="交互模式（循环提问）")
+    parser.add_argument("--batch", type=str, default=None,
+                        help="批量模式：指定测试集路径（jsonl），如 data/sft/test_questions.jsonl")
+    parser.add_argument("--output", type=str, default=None,
+                        help="批量模式输出路径（默认在输入文件同目录生成 _results.jsonl）")
     args = parser.parse_args()
 
     # 1. 加载检索器
@@ -355,7 +425,14 @@ def main():
     model, tokenizer = load_model(args.model_path)
 
     # 5. 运行
-    if args.question:
+    if args.batch:
+        # 批量模式
+        output_path = args.output
+        if output_path is None:
+            output_path = args.batch.replace(".jsonl", "_results.jsonl")
+        run_batch(args.batch, output_path, model, tokenizer, tools, system_prompt)
+
+    elif args.question:
         # 单次提问
         result = run_agent(args.question, model, tokenizer, tools, system_prompt)
 
