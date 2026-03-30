@@ -280,6 +280,7 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
     steps = []  # 记录每一步的结构化数据
     retrieval_quality = True
     call_counter = 0
+    no_tool_retries = 0  # 模型拒绝调用工具的连续次数
 
     for step_num in range(max_steps):
         # 添加步数引导（作为额外的 user 消息）
@@ -384,10 +385,15 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
             # 防护：未达最少工具调用步数时不允许直接结束
             tool_steps_done = len([s for s in steps if "tool_name" in s])
             if tool_steps_done < min_steps:
-                logger.warning(f"工具调用步数不足 ({tool_steps_done} < {min_steps})，模型试图直接回答，强制要求检索")
+                no_tool_retries += 1
+                if no_tool_retries >= 3:
+                    logger.error(f"模型连续 {no_tool_retries} 次拒绝调用工具，放弃该条数据")
+                    return None
+                logger.warning(f"工具调用步数不足 ({tool_steps_done} < {min_steps})，第 {no_tool_retries} 次重试")
                 messages.append({"role": "user", "content":
                     f"[你还没有调用任何检索工具。请先使用 search_financial 或 search_report 检索数据，"
-                    f"至少还需要 {min_steps - tool_steps_done} 步工具调用。不要凭记忆回答，必须基于检索结果。]"})
+                    f"至少还需要 {min_steps - tool_steps_done} 步工具调用。"
+                    f"不要凭记忆回答，必须基于检索结果。请立即调用工具。]"})
                 continue
 
             # 记录最终回答
@@ -403,6 +409,11 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
         time.sleep(0.3)
 
     # 确保有最终回答
+    tool_steps_done = len([s for s in steps if "tool_name" in s])
+    if tool_steps_done < min_steps:
+        logger.error(f"循环结束但工具调用不足 ({tool_steps_done} < {min_steps})，丢弃该条")
+        return None
+
     if not steps or "final_answer" not in steps[-1]:
         logger.warning("循环结束但未生成最终回答，强制请求")
         try:
