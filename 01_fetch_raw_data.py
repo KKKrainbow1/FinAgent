@@ -1,14 +1,17 @@
 """
-FinAgent 数据拉取脚本 - Day 5
+FinAgent 数据拉取脚本
 用途：批量拉取沪深300研报 + 财务数据，构建检索语料库
-环境：Google Colab
 依赖：pip install akshare pandas tqdm
 
 运行方式：
-    python 01_fetch_raw_data.py                    # 拉取全部沪深300
-    python 01_fetch_raw_data.py --max_stocks 10    # 先拉10只测试
-    python 01_fetch_raw_data.py --skip_reports     # 只拉财务数据
-    python 01_fetch_raw_data.py --skip_financial   # 只拉研报
+    python 01_fetch_raw_data.py                        # 拉取全部（研报+财务）
+    python 01_fetch_raw_data.py --only financial        # 只拉财务数据
+    python 01_fetch_raw_data.py --only reports          # 只拉研报
+    python 01_fetch_raw_data.py --only financial --start_year 2024  # 只拉2024年起的财务数据
+    python 01_fetch_raw_data.py --max_stocks 10         # 先拉10只测试
+    python 01_fetch_raw_data.py --stocks 600519,000858  # 只拉指定股票
+    python 01_fetch_raw_data.py --update                # 增量更新（只拉新数据，不覆盖旧数据）
+    python 01_fetch_raw_data.py --resume                # 断点续传
 """
 
 import akshare as ak
@@ -168,41 +171,33 @@ def _save_report_checkpoint(results: dict, stats: dict):
 
 # ============ Step 3: 拉取财务数据 ============
 
-def fetch_financial_for_stock(stock_code: str) -> dict:
+def fetch_financial_for_stock(stock_code: str, start_year: str = "2022") -> dict:
     """
     拉取单只股票的关键财务数据
-    
+
     改用 stock_financial_analysis_indicator（东财源）统一拉取。
-    原方案用4个接口（利润表/资产负债表/现金流/同花顺指标），但：
-    - stock_profit_sheet_by_report_em 已失效（东财网页结构变更）
-    - stock_financial_abstract_ths 是同花顺源，反爬严格且数据格式不统一
-    
     stock_financial_analysis_indicator 一个接口包含86个字段，覆盖：
     盈利能力（ROE/毛利率/净利率）、成长能力（营收增长率/利润增长率）、
     偿债能力（资产负债率/流动比率）、运营效率（周转率）、每股指标（EPS/BPS）、
-    总资产等。完全满足需求，且只需一次API调用，更稳定。
-    
-    面试追问：为什么不直接用结构化数据做检索？
-    答：向量检索对结构化数据不友好。
-    "ROE: 15.3%"转成"贵州茅台2024年ROE为15.3%"后，
-    query="茅台盈利能力"就能检索到。这是一个工程上的trade-off。
+    总资产等。
+
+    Args:
+        stock_code: 股票代码
+        start_year: 起始年份（默认"2022"）
     """
     result = {}
 
     try:
         df = ak.stock_financial_analysis_indicator(
-            symbol=stock_code, start_year="2022"
+            symbol=stock_code, start_year=start_year
         )
         if df is not None and len(df) > 0:
             # 只保留年报(12-31)和半年报(06-30)，去掉Q1(03-31)和Q3(09-30)
-            # 原因：Q1/Q3的指标是单季或前N季累计，容易误导
-            # 例如Q1的ROE只有一个季度，用户会误以为是全年
-            # 年报是全年累计数据最准确，半年报做同比分析有用
             df['日期'] = pd.to_datetime(df['日期'])
             df = df[df['日期'].dt.month.isin([6, 12])].copy()
-            
+
             if len(df) > 0:
-                records = df.head(6).to_dict(orient='records')
+                records = df.to_dict(orient='records')
                 # 日期转回字符串便于JSON序列化
                 for r in records:
                     r['日期'] = r['日期'].strftime('%Y-%m-%d')
@@ -214,21 +209,37 @@ def fetch_financial_for_stock(stock_code: str) -> dict:
     return result
 
 
-def batch_fetch_financial(stocks: pd.DataFrame) -> dict:
+def batch_fetch_financial(stocks: pd.DataFrame, start_year: str = "2022",
+                          update_mode: bool = False) -> dict:
     """
     批量拉取财务数据
+
+    Args:
+        stocks: 股票列表 DataFrame
+        start_year: 起始年份
+        update_mode: 增量更新模式，合并新旧数据
+
     返回: {stock_code: dict} 的字典
     """
+    # 增量更新：先加载已有数据
+    existing_data = {}
+    if update_mode:
+        existing_path = os.path.join(FINANCIAL_DIR, "all_financial.json")
+        if os.path.exists(existing_path):
+            with open(existing_path, 'r', encoding='utf-8') as f:
+                existing_data = json.load(f)
+            logger.info(f"[增量更新] 已加载 {len(existing_data)} 只股票的现有数据")
+
     results = {}
     stats = {"success": 0, "partial": 0, "failed": 0}
 
-    logger.info(f"===== 开始拉取财务数据，共 {len(stocks)} 只股票 =====")
+    logger.info(f"===== 开始拉取财务数据，共 {len(stocks)} 只股票，起始年份 {start_year} =====")
 
     for idx, row in tqdm(stocks.iterrows(), total=len(stocks), desc="拉取财务"):
         code = row['stock_code']
         name = row['stock_name']
 
-        data = fetch_financial_for_stock(code)
+        data = fetch_financial_for_stock(code, start_year=start_year)
 
         # 统计成功/失败
         has_data = "financial_indicators" in data
@@ -243,6 +254,24 @@ def batch_fetch_financial(stocks: pd.DataFrame) -> dict:
 
         data["stock_code"] = code
         data["stock_name"] = name
+
+        # 增量更新：合并新旧数据
+        if update_mode and code in existing_data:
+            old_indicators = existing_data[code].get("financial_indicators", [])
+            new_indicators = data.get("financial_indicators", [])
+            # 按日期去重合并
+            old_dates = {r['日期'] for r in old_indicators}
+            merged = old_indicators.copy()
+            added = 0
+            for r in new_indicators:
+                if r['日期'] not in old_dates:
+                    merged.append(r)
+                    added += 1
+            merged.sort(key=lambda x: x['日期'])
+            data["financial_indicators"] = merged
+            if added > 0:
+                logger.info(f"  [{code} {name}] 新增 {added} 期数据（总共 {len(merged)} 期）")
+
         results[code] = data
 
         n_periods = len(data.get("financial_indicators", []))
@@ -254,13 +283,16 @@ def batch_fetch_financial(stocks: pd.DataFrame) -> dict:
 
         # 每50只股票保存一次checkpoint
         if (idx + 1) % 50 == 0:
-            _save_financial_checkpoint(results, stats)
+            # 增量模式下合并未处理的旧数据
+            save_results = {**existing_data, **results} if update_mode else results
+            _save_financial_checkpoint(save_results, stats)
 
     # 最终保存
-    _save_financial_checkpoint(results, stats)
+    save_results = {**existing_data, **results} if update_mode else results
+    _save_financial_checkpoint(save_results, stats)
     logger.info(f"===== 财务数据拉取完成: 成功{stats['success']}, "
                 f"部分{stats['partial']}, 失败{stats['failed']} =====")
-    return results
+    return save_results
 
 
 def _save_financial_checkpoint(results: dict, stats: dict):
@@ -301,23 +333,52 @@ def load_existing_progress() -> set:
 
 def main():
     parser = argparse.ArgumentParser(description="FinAgent 数据拉取")
-    parser.add_argument("--max_stocks", type=int, default=0, help="最多拉取股票数（0=全部）")
-    parser.add_argument("--skip_reports", action="store_true", help="跳过研报拉取")
-    parser.add_argument("--skip_financial", action="store_true", help="跳过财务数据拉取")
-    parser.add_argument("--resume", action="store_true", help="断点续传模式")
+    parser.add_argument("--max_stocks", type=int, default=0,
+                        help="最多拉取股票数（0=全部）")
+    parser.add_argument("--only", type=str, choices=["financial", "reports"],
+                        help="只拉取指定类型（financial=财务数据, reports=研报）")
+    parser.add_argument("--skip_reports", action="store_true",
+                        help="跳过研报拉取（等价于 --only financial）")
+    parser.add_argument("--skip_financial", action="store_true",
+                        help="跳过财务数据拉取（等价于 --only reports）")
+    parser.add_argument("--start_year", type=str, default="2022",
+                        help="财务数据起始年份（默认2022）")
+    parser.add_argument("--stocks", type=str, default="",
+                        help="只拉指定股票，逗号分隔（如 600519,000858）")
+    parser.add_argument("--update", action="store_true",
+                        help="增量更新模式：合并新旧数据，不覆盖已有期数")
+    parser.add_argument("--resume", action="store_true",
+                        help="断点续传模式")
     args = parser.parse_args()
+
+    # --only 参数转换为 skip 标记
+    if args.only == "financial":
+        args.skip_reports = True
+    elif args.only == "reports":
+        args.skip_financial = True
 
     logger.info("=" * 60)
     logger.info("FinAgent 数据拉取开始")
     logger.info(f"时间: {datetime.now():%Y-%m-%d %H:%M:%S}")
+    if args.only:
+        logger.info(f"模式: 只拉取 {args.only}")
+    if args.start_year != "2022":
+        logger.info(f"财务数据起始年份: {args.start_year}")
+    if args.update:
+        logger.info(f"增量更新模式: 合并新旧数据")
     logger.info("=" * 60)
 
     # 1. 获取股票列表
-    stocks = get_hs300_stocks()
-    
-    # 保存股票列表（备用）
-    stocks.to_csv(os.path.join(OUTPUT_DIR, "hs300_stocks.csv"), index=False, encoding='utf-8-sig')
-    logger.info(f"沪深300成分股: {len(stocks)} 只")
+    if args.stocks:
+        # 指定股票模式
+        stock_codes = [s.strip() for s in args.stocks.split(",")]
+        stocks = pd.DataFrame({"stock_code": stock_codes, "stock_name": [""] * len(stock_codes)})
+        logger.info(f"指定股票模式: {len(stocks)} 只 ({args.stocks})")
+    else:
+        stocks = get_hs300_stocks()
+        # 保存股票列表（备用）
+        stocks.to_csv(os.path.join(OUTPUT_DIR, "hs300_stocks.csv"), index=False, encoding='utf-8-sig')
+        logger.info(f"沪深300成分股: {len(stocks)} 只")
 
     # 2. 断点续传：过滤已完成的
     if args.resume:
@@ -336,16 +397,25 @@ def main():
 
     # 5. 拉取财务数据
     if not args.skip_financial:
-        financial_results = batch_fetch_financial(stocks)
+        financial_results = batch_fetch_financial(
+            stocks,
+            start_year=args.start_year,
+            update_mode=args.update,
+        )
 
     # 6. 汇总统计
     logger.info("=" * 60)
     logger.info("数据拉取完成！")
     logger.info(f"数据保存目录: {os.path.abspath(OUTPUT_DIR)}")
-    logger.info(f"  研报: {REPORT_DIR}/all_reports.csv")
-    logger.info(f"  财务: {FINANCIAL_DIR}/all_financial.json")
+    if not args.skip_reports:
+        logger.info(f"  研报: {REPORT_DIR}/all_reports.csv")
+    if not args.skip_financial:
+        logger.info(f"  财务: {FINANCIAL_DIR}/all_financial.json")
     logger.info("=" * 60)
-    logger.info("下一步: 运行 02_download_pdfs.py 下载研报PDF")
+    if not args.skip_reports:
+        logger.info("下一步: 运行 02_download_pdfs.py 下载研报PDF")
+    if not args.skip_financial:
+        logger.info("下一步: 运行 04_build_chunks.py 重新构建索引")
 
 
 if __name__ == "__main__":
