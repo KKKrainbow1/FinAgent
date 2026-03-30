@@ -419,15 +419,45 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
             logger.info(f"  Step {step_num+1} Action: {tool_name}({json.dumps(tool_arguments, ensure_ascii=False)[:80]})")
 
         else:
-            # 模型没有调用工具 → 输出最终回答
-            # 合并阶段2的补充内容到 Thought 中
-            extra = msg.content or ""
-            final_answer = f"{thought}\n\n{extra}".strip() if extra else thought
+            # 模型没有调用工具 → 生成最终回答
 
             # 防护：未达最少工具调用次数不应到这里（tool_choice=required 会拦住）
             if tool_steps_done < min_steps:
                 logger.error(f"tool_choice=required 但模型仍未调用工具，放弃该条")
                 return None
+
+            # 阶段1 的 thought 是思考过程，现在单独生成正式报告
+            # 把 thought 和已有数据告诉模型，让它只输出正式报告
+            report_messages = messages.copy()
+            report_messages.append({"role": "assistant", "content": thought})
+            report_messages.append({"role": "user", "content":
+                "请基于以上思考和已检索到的数据，直接输出最终分析报告。"
+                "只输出给用户看的正式报告，不要重复思考过程。"})
+
+            report_resp = None
+            for retry in range(MAX_RETRY):
+                try:
+                    report_resp = client.chat.completions.create(
+                        model=MODEL,
+                        messages=report_messages,
+                        temperature=0.7,
+                        max_tokens=1500,
+                        extra_body={"enable_thinking": False},
+                        # 不传 tools，只输出纯文本报告
+                    )
+                    break
+                except Exception as e:
+                    logger.warning(f"报告生成失败 (retry {retry}): {e}")
+                    time.sleep(1)
+
+            if report_resp is None:
+                logger.error("最终报告生成失败，放弃该条")
+                return None
+
+            final_report = report_resp.choices[0].message.content or ""
+
+            # 合并：Thought + 正式报告，用空行分隔
+            final_answer = f"{thought}\n\n{final_report}"
 
             # 记录最终回答
             steps.append({
@@ -435,7 +465,7 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
                 "final_answer": final_answer,
             })
 
-            logger.info(f"  Final: 回答 {len(final_answer)} 字")
+            logger.info(f"  Final: Thought {len(thought)} 字 + 报告 {len(final_report)} 字")
             break
 
         # API 限频
@@ -450,20 +480,34 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
     if not steps or "final_answer" not in steps[-1]:
         logger.warning("循环结束但未生成最终回答，强制请求")
         try:
+            # 先生成 Thought
             messages.append({"role": "user", "content":
-                "[请根据已获取的数据，直接输出最终分析报告。]"})
-            response = client.chat.completions.create(
+                "请综合已获取的所有数据，写出你的分析思考。"})
+            thought_resp = client.chat.completions.create(
+                model=MODEL,
+                messages=messages,
+                temperature=0.7,
+                max_tokens=500,
+                extra_body={"enable_thinking": False},
+            )
+            final_thought = thought_resp.choices[0].message.content or "综合以上数据进行分析。"
+
+            # 再生成正式报告
+            messages.append({"role": "assistant", "content": final_thought})
+            messages.append({"role": "user", "content":
+                "请基于以上思考，直接输出最终分析报告。只输出正式报告，不要重复思考过程。"})
+            report_resp = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
                 temperature=0.7,
                 max_tokens=1500,
                 extra_body={"enable_thinking": False},
-                # 不传 tools 参数，强制模型输出纯文本
             )
-            final_answer = response.choices[0].message.content or ""
+            final_report = report_resp.choices[0].message.content or ""
+
             steps.append({
-                "thought": "",
-                "final_answer": final_answer,
+                "thought": final_thought,
+                "final_answer": f"{final_thought}\n\n{final_report}",
             })
         except Exception as e:
             logger.error(f"强制生成答案失败: {e}")
