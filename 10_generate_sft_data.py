@@ -281,31 +281,69 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
     steps = []  # 记录每一步的结构化数据
     retrieval_quality = True
     call_counter = 0
-    no_tool_retries = 0  # 模型拒绝调用工具的连续次数
 
     for step_num in range(max_steps):
-        # 添加步数引导（作为额外的 user 消息）
-        # 工具调用步数 = 实际执行了工具的步数，不是循环计数
         tool_steps_done = len([s for s in steps if "tool_name" in s])
         hint = generate_step_hint(tool_steps_done + 1, min_steps, max_steps)
-        hint_messages = messages.copy()
-        # 始终添加步数提示（第一步也需要引导模型调用工具）
-        hint_messages.append({"role": "user", "content": hint})
 
-        # 调用 Qwen3-Max（原生 tool calling）
-        # 未达最少工具调用次数前，强制模型必须调用工具（tool_choice="required"）
-        # 达到后改为 auto，让模型自行决定是否继续检索或输出最终回答
-        tool_steps_so_far = len([s for s in steps if "tool_name" in s])
-        current_tool_choice = "required" if tool_steps_so_far < min_steps else "auto"
+        # ====== 两阶段生成 ======
+        # 阶段1：生成 Thought（不传 tools，模型只能输出文本）
+        thought_messages = messages.copy()
+        if tool_steps_done < min_steps:
+            thought_messages.append({"role": "user", "content":
+                f"{hint}\n请先写出你的思考过程（分析需要什么数据、为什么），然后调用工具检索。"})
+        else:
+            thought_messages.append({"role": "user", "content":
+                f"{hint}\n请先写出你的思考过程。如果信息已足够，直接输出最终分析报告。"})
 
-        retry_count = 0
-        response = None
-
-        while retry_count < MAX_RETRY:
+        thought = None
+        for retry in range(MAX_RETRY):
             try:
-                response = client.chat.completions.create(
+                thought_resp = client.chat.completions.create(
                     model=MODEL,
-                    messages=hint_messages,
+                    messages=thought_messages,
+                    temperature=0.7,
+                    max_tokens=500,
+                    extra_body={"enable_thinking": False},
+                    # 不传 tools，强制模型输出纯文本 Thought
+                )
+                thought = thought_resp.choices[0].message.content or ""
+                break
+            except Exception as e:
+                logger.warning(f"Thought 生成失败 (retry {retry}): {e}")
+                time.sleep(1)
+
+        if thought is None:
+            logger.error("Thought 生成失败，放弃该条")
+            return None
+
+        logger.info(f"  Step {step_num+1} Thought: {thought[:100]}...")
+
+        # 判断：如果已达到最少工具调用次数，模型可能在 Thought 中直接给出最终回答
+        if tool_steps_done >= min_steps:
+            # 检查模型是否想要结束（Thought 本身就是完整回答）
+            # 用阶段2来判断：传 tools 看模型是否选择调用工具
+            pass
+
+        # 阶段2：基于 Thought 生成工具调用（传 tools）
+        # 将 Thought 作为 assistant 消息加入，然后让模型继续
+        tool_messages = messages.copy()
+        tool_messages.append({"role": "assistant", "content": thought})
+        tool_messages.append({"role": "user", "content":
+            "根据你的思考，请调用合适的工具。如果信息已足够，直接输出最终分析报告，不要调用工具。"})
+
+        # 未达最少工具调用次数时，强制调用工具
+        if tool_steps_done < min_steps:
+            current_tool_choice = "required"
+        else:
+            current_tool_choice = "auto"
+
+        tool_resp = None
+        for retry in range(MAX_RETRY):
+            try:
+                tool_resp = client.chat.completions.create(
+                    model=MODEL,
+                    messages=tool_messages,
                     tools=TOOLS_NATIVE,
                     tool_choice=current_tool_choice,
                     temperature=0.7,
@@ -314,15 +352,14 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
                 )
                 break
             except Exception as e:
-                logger.warning(f"API 调用失败 (retry {retry_count}): {e}")
-                retry_count += 1
+                logger.warning(f"Tool call 生成失败 (retry {retry}): {e}")
                 time.sleep(1)
 
-        if response is None:
-            logger.error(f"API 调用失败，已重试 {MAX_RETRY} 次")
+        if tool_resp is None:
+            logger.error("Tool call 生成失败，放弃该条")
             return None
 
-        msg = response.choices[0].message
+        msg = tool_resp.choices[0].message
 
         # 判断模型行为
         if msg.tool_calls:
@@ -337,18 +374,12 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
                 tool_arguments = json.loads(tc.function.arguments)
             except json.JSONDecodeError:
                 logger.warning(f"tool arguments 解析失败: {tc.function.arguments}")
-                retry_count += 1
                 continue
 
             # 校验工具名
             if tool_name not in TOOL_NAMES_NATIVE:
                 logger.warning(f"非法工具 '{tool_name}'，跳过")
                 continue
-
-            # 防护：未达最少步数时不允许直接结束（无 tool_calls 才算结束）
-            # 原生 tool calling 下模型调用工具就不会结束，所以这里不需要额外防护
-
-            thought = msg.content or ""
 
             # 执行工具
             observation = tools_executor.call(tool_name, tool_arguments)
@@ -359,13 +390,15 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
                     retrieval_quality = False
                     logger.warning(f"检索质量低: {observation[:100]}")
 
-            # 追加到 messages
-            assistant_msg = {"role": "assistant", "tool_calls": [
-                {"id": tool_call_id, "type": "function",
-                 "function": {"name": tool_name, "arguments": tc.function.arguments}}
-            ]}
-            if thought:
-                assistant_msg["content"] = thought
+            # 追加到 messages（合并 Thought + tool_call 为一条 assistant 消息）
+            assistant_msg = {
+                "role": "assistant",
+                "content": thought,
+                "tool_calls": [
+                    {"id": tool_call_id, "type": "function",
+                     "function": {"name": tool_name, "arguments": tc.function.arguments}}
+                ]
+            }
             messages.append(assistant_msg)
 
             messages.append({
@@ -383,29 +416,22 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
                 "observation": observation,
             })
 
-            logger.info(f"  Step {step_num+1}: {tool_name}({json.dumps(tool_arguments, ensure_ascii=False)[:80]})")
+            logger.info(f"  Step {step_num+1} Action: {tool_name}({json.dumps(tool_arguments, ensure_ascii=False)[:80]})")
 
         else:
             # 模型没有调用工具 → 输出最终回答
-            final_answer = msg.content or ""
+            # 合并阶段2的补充内容到 Thought 中
+            extra = msg.content or ""
+            final_answer = f"{thought}\n\n{extra}".strip() if extra else thought
 
-            # 防护：未达最少工具调用步数时不允许直接结束
-            tool_steps_done = len([s for s in steps if "tool_name" in s])
+            # 防护：未达最少工具调用次数不应到这里（tool_choice=required 会拦住）
             if tool_steps_done < min_steps:
-                no_tool_retries += 1
-                if no_tool_retries >= 3:
-                    logger.error(f"模型连续 {no_tool_retries} 次拒绝调用工具，放弃该条数据")
-                    return None
-                logger.warning(f"工具调用步数不足 ({tool_steps_done} < {min_steps})，第 {no_tool_retries} 次重试")
-                messages.append({"role": "user", "content":
-                    f"[你还没有调用任何检索工具。请先使用 search_financial 或 search_report 检索数据，"
-                    f"至少还需要 {min_steps - tool_steps_done} 步工具调用。"
-                    f"不要凭记忆回答，必须基于检索结果。请立即调用工具。]"})
-                continue
+                logger.error(f"tool_choice=required 但模型仍未调用工具，放弃该条")
+                return None
 
             # 记录最终回答
             steps.append({
-                "thought": "",  # 最终回答的 thought 在 content 开头
+                "thought": thought,
                 "final_answer": final_answer,
             })
 
