@@ -236,6 +236,72 @@ def load_seed_data(seed_path: str) -> dict:
     return grouped
 
 
+# ============ V1 模板精华（注入两阶段生成以控制内容质量） ============
+
+THOUGHT_GUIDE = """请写出你这一步的思考过程。要求：
+
+## Thought 写作要求
+- **第一步**：说明分析框架和需要获取什么数据
+- **后续步骤（最重要）**：必须引用上一步检索结果中的**至少2个具体数字**，
+  说明这些数字意味着什么，然后解释为什么需要执行下一步
+  - 好的例子："检索结果显示阳光电源2024年 ROE 为29.90%（好，>15%），毛利率29.42%，
+    但营收增速仅7.76%（较2023年79.47%大幅放缓）。盈利能力强但增长乏力，
+    需进一步检索券商研报了解市场对其未来增长的预期。"
+  - 坏的例子："已获取数据，接下来查研报。"（禁止，没有引用任何数字）
+- **finish 步的 Thought**：综合前面所有数据给出明确判断，不要用假设句式
+
+## 时间一致性要求
+- 如果检索结果返回了多个年份的数据，在 Thought 中明确选择使用哪一期
+- 杜邦分析的三个指标（净利率、总资产周转率、权益乘数）必须来自同一期数据
+- 优先使用最新的年报数据（2024年报 > 2023年报 > 半年报）
+
+## 预检索结果（数据库实际能返回的信息样例）
+{pre_retrieved_info}
+
+## 步数信息
+{step_hint}"""
+
+
+ANSWER_GUIDE = """请基于以上思考和已检索到的数据，直接输出最终分析报告。
+
+## 核心原则：回答用户的问题，不要套模板
+最终报告应围绕用户的问题展开，只分析与问题相关的内容。
+
+## 按问题类型调整回答深度
+- **financial_query**（如"ROE是多少""流动比率多少"）：先直接回答数字，再适度展开相关分析，不要做全维度分析。控制在 150-300 字。
+- **single_company_simple**（如"目标价多少""研报观点"）：直接回答核心信息，可补充少量相关背景。控制在 200-350 字。
+- **single_company_medium**（如"全面评估财务状况""盈利能力如何"）：按德勤框架选择相关维度深入分析。控制在 400-600 字。
+- **company_comparison**：用表格对比核心指标，重点分析差异原因。控制在 400-600 字。
+- **risk_analysis**：重点分析偿债能力和风险因素。控制在 400-600 字。
+- **industry_analysis**：选取代表性公司，分析行业整体趋势。控制在 400-600 字。
+- **reject**：简短说明数据库不覆盖该内容，建议调整问题。控制在 100-200 字。
+
+## 写作要求
+1. 所有数字必须来自检索结果，不能编造
+2. 与问题相关的关键指标附带判断和行业对比参考，不相关的不要展开
+3. 如果某个维度的数据不足，不要提及该维度（不要写"数据有限，无法评估XX"）
+4. 风险提示需具体（包含数字或事件），简单查询不需要强制添加风险提示
+5. 金融行业（银行/保险/证券）无存货周转率、毛利率等指标，应解释行业特性而非说"数据缺失"
+
+## 当前问题类型
+{question_type}
+
+## 种子示例的答案风格（参考结构和深度）
+{answer_example}
+
+只输出给用户看的正式报告，不要重复思考过程。"""
+
+
+def get_answer_example(seed_grouped: dict, qtype: str) -> str:
+    """获取种子数据中的答案作为风格参考"""
+    seeds = seed_grouped.get(qtype, [])
+    for seed in seeds:
+        for step in seed.get("steps", []):
+            if step.get("action") == "finish" and step["action_input"] != "PLACEHOLDER":
+                return step["action_input"]
+    return "（无示例，请按写作要求生成）"
+
+
 # ============ ReAct Loop 核心（V2 Native Tool Calling） ============
 
 def generate_step_hint(step_num: int, min_steps: int, max_steps: int) -> str:
@@ -252,7 +318,8 @@ def generate_step_hint(step_num: int, min_steps: int, max_steps: int) -> str:
 
 
 def react_loop(client: OpenAI, tools_executor: FinAgentTools,
-               question: str, question_type: str, pre_info: str) -> dict:
+               question: str, question_type: str, pre_info: str,
+               seed_grouped: dict = None) -> dict:
     """
     核心 ReAct Loop（V2 - 原生 Tool Calling）
 
@@ -287,14 +354,17 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
         hint = generate_step_hint(tool_steps_done + 1, min_steps, max_steps)
 
         # ====== 两阶段生成 ======
-        # 阶段1：生成 Thought（不传 tools，模型只能输出文本）
+        # 阶段1：生成 Thought（不传 tools，注入 V1 STEP_PROMPT 精华）
+        thought_prompt = THOUGHT_GUIDE.format(
+            pre_retrieved_info=pre_info if pre_info else "（无预检索结果）",
+            step_hint=hint,
+        )
         thought_messages = messages.copy()
         if tool_steps_done < min_steps:
-            thought_messages.append({"role": "user", "content":
-                f"{hint}\n请先写出你的思考过程（分析需要什么数据、为什么），然后调用工具检索。"})
+            thought_messages.append({"role": "user", "content": thought_prompt})
         else:
             thought_messages.append({"role": "user", "content":
-                f"{hint}\n请先写出你的思考过程。如果信息已足够，直接输出最终分析报告。"})
+                f"{hint}\n请写出你的思考过程。如果信息已足够，综合所有数据给出明确判断。"})
 
         thought = None
         for retry in range(MAX_RETRY):
@@ -426,13 +496,15 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
                 logger.error(f"tool_choice=required 但模型仍未调用工具，放弃该条")
                 return None
 
-            # 阶段1 的 thought 是思考过程，现在单独生成正式报告
-            # 把 thought 和已有数据告诉模型，让它只输出正式报告
+            # 阶段3：生成正式报告（注入 V1 ANSWER_PROMPT 精华）
+            answer_example = get_answer_example(seed_grouped or {}, question_type)
+            report_prompt = ANSWER_GUIDE.format(
+                question_type=question_type,
+                answer_example=answer_example,
+            )
             report_messages = messages.copy()
             report_messages.append({"role": "assistant", "content": thought})
-            report_messages.append({"role": "user", "content":
-                "请基于以上思考和已检索到的数据，直接输出最终分析报告。"
-                "只输出给用户看的正式报告，不要重复思考过程。"})
+            report_messages.append({"role": "user", "content": report_prompt})
 
             report_resp = None
             for retry in range(MAX_RETRY):
@@ -482,7 +554,8 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
         try:
             # 先生成 Thought
             messages.append({"role": "user", "content":
-                "请综合已获取的所有数据，写出你的分析思考。"})
+                "请综合已获取的所有数据，写出你的分析思考。"
+                "必须引用检索结果中的具体数字，给出明确判断。"})
             thought_resp = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
@@ -492,10 +565,14 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
             )
             final_thought = thought_resp.choices[0].message.content or "综合以上数据进行分析。"
 
-            # 再生成正式报告
+            # 再生成正式报告（注入 ANSWER_GUIDE）
+            answer_example = get_answer_example(seed_grouped or {}, question_type)
+            report_prompt = ANSWER_GUIDE.format(
+                question_type=question_type,
+                answer_example=answer_example,
+            )
             messages.append({"role": "assistant", "content": final_thought})
-            messages.append({"role": "user", "content":
-                "请基于以上思考，直接输出最终分析报告。只输出正式报告，不要重复思考过程。"})
+            messages.append({"role": "user", "content": report_prompt})
             report_resp = client.chat.completions.create(
                 model=MODEL,
                 messages=messages,
@@ -695,12 +772,20 @@ def main():
 
     # 初始化
     client = OpenAI()
-    logger.info("[1/3] 初始化 OpenAI 客户端完成")
+    logger.info("[1/4] 初始化 OpenAI 客户端完成")
 
     retriever = FinAgentRetriever()
     retriever.load_index()
     tools_executor = FinAgentTools(retriever)
-    logger.info("[2/3] 加载检索索引完成")
+    logger.info("[2/4] 加载检索索引完成")
+
+    # 加载种子数据（用于 ANSWER_GUIDE 的风格参考）
+    seed_grouped = {}
+    if os.path.exists(SEED_DATA_PATH):
+        seed_grouped = load_seed_data(SEED_DATA_PATH)
+        logger.info(f"[3/4] 加载种子数据: {', '.join(f'{k}={len(v)}' for k, v in seed_grouped.items())}")
+    else:
+        logger.warning(f"[3/4] 种子数据文件不存在: {SEED_DATA_PATH}，将不使用风格参考")
 
     # 加载 question
     questions = load_questions()
@@ -708,7 +793,7 @@ def main():
         questions = [q for q in questions if q["type"] == args.type]
     if args.test > 0:
         questions = questions[:args.test]
-    logger.info(f"[3/3] 待生成: {len(questions)} 条")
+    logger.info(f"[4/4] 待生成: {len(questions)} 条")
 
     # 断点续传
     results = []
@@ -737,7 +822,8 @@ def main():
             pre_info = pre_retrieve(question, retriever)
 
             # Phase 1: ReAct Loop（原生 Tool Calling）
-            plan = react_loop(client, tools_executor, question, qtype, pre_info)
+            plan = react_loop(client, tools_executor, question, qtype, pre_info,
+                             seed_grouped=seed_grouped)
 
             if not plan:
                 stats["failed_react"] += 1
