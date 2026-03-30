@@ -293,6 +293,11 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
         hint_messages.append({"role": "user", "content": hint})
 
         # 调用 Qwen3-Max（原生 tool calling）
+        # 未达最少工具调用次数前，强制模型必须调用工具（tool_choice="required"）
+        # 达到后改为 auto，让模型自行决定是否继续检索或输出最终回答
+        tool_steps_so_far = len([s for s in steps if "tool_name" in s])
+        current_tool_choice = "required" if tool_steps_so_far < min_steps else "auto"
+
         retry_count = 0
         response = None
 
@@ -302,6 +307,7 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
                     model=MODEL,
                     messages=hint_messages,
                     tools=TOOLS_NATIVE,
+                    tool_choice=current_tool_choice,
                     temperature=0.7,
                     max_tokens=1500,
                     extra_body={"enable_thinking": False},
