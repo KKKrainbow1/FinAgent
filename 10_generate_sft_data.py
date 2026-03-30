@@ -67,14 +67,15 @@ logger = logging.getLogger(__name__)
 
 # ============ 步数控制 ============
 
-MIN_STEPS = {
-    "financial_query": 2,
-    "single_company_simple": 2,
-    "single_company_medium": 3,
-    "company_comparison": 3,
-    "industry_analysis": 3,
-    "risk_analysis": 3,
-    "reject": 2,
+# MIN_TOOL_CALLS: 最少工具调用次数（不含最终回答）
+MIN_TOOL_CALLS = {
+    "financial_query": 1,
+    "single_company_simple": 1,
+    "single_company_medium": 2,
+    "company_comparison": 2,
+    "industry_analysis": 2,
+    "risk_analysis": 2,
+    "reject": 1,
 }
 
 MAX_STEPS = {
@@ -263,7 +264,7 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
     Returns:
         完成的 plan dict，或 None 表示失败
     """
-    min_steps = MIN_STEPS.get(question_type, 2)
+    min_steps = MIN_TOOL_CALLS.get(question_type, 1)
     max_steps = MAX_STEPS.get(question_type, 4)
 
     # 构建初始 messages
