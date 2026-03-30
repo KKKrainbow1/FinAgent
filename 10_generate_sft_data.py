@@ -68,13 +68,13 @@ logger = logging.getLogger(__name__)
 # ============ 步数控制 ============
 
 MIN_STEPS = {
-    "financial_query": 1,
+    "financial_query": 2,
     "single_company_simple": 2,
     "single_company_medium": 3,
     "company_comparison": 3,
     "industry_analysis": 3,
     "risk_analysis": 3,
-    "reject": 1,
+    "reject": 2,
 }
 
 MAX_STEPS = {
