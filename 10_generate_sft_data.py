@@ -283,11 +283,12 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
 
     for step_num in range(max_steps):
         # 添加步数引导（作为额外的 user 消息）
-        hint = generate_step_hint(step_num + 1, min_steps, max_steps)
+        # 工具调用步数 = 实际执行了工具的步数，不是循环计数
+        tool_steps_done = len([s for s in steps if "tool_name" in s])
+        hint = generate_step_hint(tool_steps_done + 1, min_steps, max_steps)
         hint_messages = messages.copy()
-        # 如果不是第一步，在最后追加步数提示
-        if step_num > 0:
-            hint_messages.append({"role": "user", "content": hint})
+        # 始终添加步数提示（第一步也需要引导模型调用工具）
+        hint_messages.append({"role": "user", "content": hint})
 
         # 调用 Qwen3-Max（原生 tool calling）
         retry_count = 0
@@ -380,11 +381,13 @@ def react_loop(client: OpenAI, tools_executor: FinAgentTools,
             # 模型没有调用工具 → 输出最终回答
             final_answer = msg.content or ""
 
-            # 防护：未达最少步数时不允许直接结束
-            if (step_num + 1) < min_steps:
-                logger.warning(f"步数不足 ({step_num + 1} < {min_steps})，模型试图直接回答，添加提示后重试")
+            # 防护：未达最少工具调用步数时不允许直接结束
+            tool_steps_done = len([s for s in steps if "tool_name" in s])
+            if tool_steps_done < min_steps:
+                logger.warning(f"工具调用步数不足 ({tool_steps_done} < {min_steps})，模型试图直接回答，强制要求检索")
                 messages.append({"role": "user", "content":
-                    f"[请继续检索数据，至少还需要 {min_steps - step_num - 1} 步工具调用才能输出最终回答。]"})
+                    f"[你还没有调用任何检索工具。请先使用 search_financial 或 search_report 检索数据，"
+                    f"至少还需要 {min_steps - tool_steps_done} 步工具调用。不要凭记忆回答，必须基于检索结果。]"})
                 continue
 
             # 记录最终回答
