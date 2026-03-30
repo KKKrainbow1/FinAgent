@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """
-FinAgent Step 11: SFT 训练脚本（带 Observation Loss Mask）
+FinAgent Step 11: SFT 训练脚本（V2 - Qwen 原生 Tool Calling + 结构化 Loss Mask）
 
-核心设计：
-    - 使用 LoRA 微调 Qwen2.5-14B-Instruct
-    - Observation token 的 loss 被 mask 掉（设为 -100）
-    - 模型只学习生成 Thought / Action / Action Input / finish 答案
-    - Observation 由检索系统在推理时提供，不需要模型学会生成
+V1 → V2 核心改动：
+    1. 训练数据格式：从纯文本轨迹改为 OpenAI messages 格式
+       每条数据包含 messages 列表，直接用 apply_chat_template(tools=TOOLS_NATIVE) 渲染
+    2. Loss Mask 策略：从正则匹配 "Observation: ..." 改为按 message role 精确切分
+       - role=system / role=user / role=tool → mask=0（不学习）
+       - role=assistant（content + tool_calls）→ mask=1（学习）
+       不再依赖正则，边界精确，不可能切错
+    3. chat_template 自动注入工具定义（<tools>...</tools>），system prompt 不再手动拼接
 
 用法：
     # 默认配置训练
@@ -15,30 +18,35 @@ FinAgent Step 11: SFT 训练脚本（带 Observation Loss Mask）
     # 自定义参数
     python 11_sft_train.py \
         --model_path ./models/Qwen2.5-14B-Instruct \
-        --data_path ./data/sft/sft_data_train.jsonl \
-        --output_dir ./outputs/sft_lora \
+        --data_path ./data/sft/sft_data_native.jsonl \
+        --output_dir ./outputs/sft_lora_native \
         --epochs 3 \
         --lr 2e-4
 
     # 只做数据预处理检查（不训练）
     python 11_sft_train.py --dry-run
 
-面试追问：为什么要 mask Observation？
+面试追问：为什么要 mask Observation（role=tool）？
 答：Observation 是检索系统返回的真实数据，推理时由工具提供，不是模型该生成的。
 如果不 mask，模型会花大量参数去"记忆"检索结果的格式和内容，
 既浪费模型容量，又会导致推理时生成虚假的 Observation。
 mask 之后，模型只学习：给定 Observation → 如何在 Thought 中分析它 →
-选择什么 Action → 最终如何生成 finish 报告。
+选择什么工具和参数 → 最终如何生成分析报告。
+
+面试追问：V2 的 loss mask 相比 V1 有什么优势？
+答：V1 用正则匹配 "Observation: ..." 文本来确定 mask 边界，如果模型输出格式
+稍有偏差（如多空格、换行变化），正则可能切错，导致 Observation 的 token 泄漏进
+loss 计算。V2 基于 message role 切分，role=tool 的消息对应的 token 一定是
+Observation，不可能切错。而且 chat_template 渲染后 role=tool 变成
+<|im_start|>user\n<tool_response>...\n</tool_response><|im_end|>，
+边界由特殊 token 和固定标签确定，非常精确。
 """
 
 import json
 import os
-import re
 import sys
 import argparse
 import logging
-from dataclasses import dataclass, field
-from typing import Optional
 
 import torch
 from torch.utils.data import Dataset
@@ -55,93 +63,100 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 
-# ============ System Prompt（与 08_prompts.py 保持一致） ============
+# ============ 工具定义（训练时需要传入 chat_template） ============
 
-def get_system_prompt():
-    """获取 system prompt，与推理时使用的完全一致"""
-    from tools import FinAgentTools
-    from prompts import build_system_prompt
-    return build_system_prompt(FinAgentTools.TOOL_DESCRIPTIONS)
-
-
-SYSTEM_PROMPT_FALLBACK = """你是"金融翻译官"，一个专业的A股上市公司分析助手。你的任务是将复杂的财务数据和研报信息转化为清晰、有依据的分析报告。
-
-## 可用工具
-1. search_report(query: str) → 检索券商研报信息。返回机构评级、目标价、EPS预测、行业分析等。
-2. search_financial(query: str) → 检索公司财务数据。返回ROE、毛利率、营收增长率、资产负债率等指标。
-3. calculate(expression: str) → 计算数学表达式。支持加减乘除、百分比、括号等。
-4. finish(answer: str) → 输出最终分析报告并结束。
-
-## 输出格式（严格遵守）
-每一步必须按以下格式输出：
-
-Thought: <你的思考过程>
-Action: <工具名>
-Action Input: <工具输入参数>
-
-当信息收集完毕时：
-
-Thought: <总结信息>
-Action: finish
-Action Input: <完整的分析报告>"""
-
-
-# ============ 数据格式化 ============
-
-def format_trajectory(sample: dict) -> str:
-    """
-    将一条 SFT 样本格式化为 assistant 的完整回复文本。
-    与 09_react_agent.py 的输出格式完全一致。
-    """
-    parts = []
-    for step in sample["steps"]:
-        parts.append(f"Thought: {step['thought']}")
-        parts.append(f"Action: {step['action']}")
-        parts.append(f"Action Input: {step['action_input']}")
-        if step.get("observation"):
-            parts.append(f"Observation: {step['observation']}")
-    return "\n".join(parts)
-
-
-def build_observation_spans(trajectory_text: str) -> list[tuple[int, int]]:
-    """
-    找出 trajectory 文本中所有 Observation 内容的字符级 span。
-    返回 [(start, end), ...] 列表，这些区间的 token 需要被 mask。
-
-    Observation 格式：
-        Observation: xxxxxx（多行内容）
-        Thought:  ← 下一个 Thought 标记结束
-
-    最后一步（finish）没有 Observation，不需要处理。
-    """
-    spans = []
-    # 匹配 "Observation: " 开头到下一个 "Thought: " 或文本末尾
-    pattern = r'(Observation: .*?)(?=\nThought: |\Z)'
-    for m in re.finditer(pattern, trajectory_text, re.DOTALL):
-        spans.append((m.start(), m.end()))
-    return spans
+def get_tools_native():
+    """获取 TOOLS_NATIVE，用于 apply_chat_template 的 tools 参数"""
+    try:
+        from tools import TOOLS_NATIVE
+        return TOOLS_NATIVE
+    except ImportError:
+        # fallback：内置工具定义
+        return [
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_report",
+                    "description": "检索券商研报信息，返回机构评级、目标价、EPS预测、行业分析等",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "研报检索关键词"},
+                            "top_k": {"type": "integer", "description": "返回结果数量", "default": 3}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "search_financial",
+                    "description": "检索公司财务数据，返回ROE、毛利率、营收增长率、资产负债率等指标",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "财务数据检索关键词"},
+                            "top_k": {"type": "integer", "description": "返回结果数量", "default": 3}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "calculate",
+                    "description": "计算数学表达式。所有涉及数值计算的场景都必须使用此工具，禁止心算",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "expression": {"type": "string", "description": "纯数学表达式"},
+                            "precision": {"type": "integer", "description": "小数精度位数", "default": 4}
+                        },
+                        "required": ["expression"]
+                    }
+                }
+            }
+        ]
 
 
-# ============ Dataset ============
+# ============ Dataset（V2 - 结构化 Loss Mask） ============
 
 class SFTDataset(Dataset):
     """
-    SFT 训练数据集，支持 Observation loss mask。
+    SFT 训练数据集（V2 - messages 格式 + 结构化 loss mask）
 
-    每条数据格式化为 Qwen2.5 的 chat template：
-        <|im_start|>system\n{system_prompt}<|im_end|>\n
-        <|im_start|>user\n问题：{question}<|im_end|>\n
-        <|im_start|>assistant\n{trajectory}<|im_end|>
+    输入数据格式（10_generate_sft_data.py 生成的 sft_data_native.jsonl）：
+    {
+        "messages": [
+            {"role": "system", "content": "..."},
+            {"role": "user", "content": "分析贵州茅台..."},
+            {"role": "assistant", "content": "思考...", "tool_calls": [...]},
+            {"role": "tool", "tool_call_id": "call_0", "content": "检索结果..."},
+            {"role": "assistant", "content": "继续思考...", "tool_calls": [...]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "检索结果..."},
+            {"role": "assistant", "content": "最终分析报告..."}
+        ],
+        ...
+    }
 
-    Loss mask 策略：
-        - system + user 部分：全部 mask（labels = -100）
-        - assistant 部分：Observation 内容 mask，其余保留
+    Loss Mask 策略（按 message role 精确切分）：
+        role=system    → mask=0（不学习）
+        role=user      → mask=0（不学习）
+        role=assistant → mask=1（学习 Thought + tool_calls + 最终回答）
+        role=tool      → mask=0（不学习，这是 Observation）
+
+    实现方式：
+        1. 用 apply_chat_template 渲染完整序列（不含 labels 信息）
+        2. 分别渲染「不含最后一条 assistant 消息」的前缀，找到每段 assistant 的起始 token 位置
+        3. 利用渐进式渲染确定每条 assistant 消息的 token 范围，设为 loss active
     """
 
-    def __init__(self, data_path: str, tokenizer, system_prompt: str,
-                 max_length: int = 4096):
+    def __init__(self, data_path: str, tokenizer, tools_native: list,
+                 max_length: int = 7168):
         self.tokenizer = tokenizer
-        self.system_prompt = system_prompt
+        self.tools_native = tools_native
         self.max_length = max_length
 
         # 加载数据
@@ -163,22 +178,29 @@ class SFTDataset(Dataset):
         logger.info(f"预处理完成: {len(self.processed)} 条可用, {skipped} 条跳过")
 
     def _process_sample(self, sample: dict):
-        """处理单条样本：tokenize + 构建 loss mask"""
+        """
+        处理单条样本：tokenize + 构建结构化 loss mask
 
-        question = sample["question"]
-        trajectory = format_trajectory(sample)
+        核心思路：渐进式渲染
+        1. 渲染完整 messages 得到 full_tokens
+        2. 逐步添加消息并渲染，确定每条消息对应的 token 范围
+        3. role=assistant 的 token 范围设为 loss active，其余 mask
+        """
+        messages = sample.get("messages")
+        if not messages:
+            return None
 
-        # 构建 messages
-        messages = [
-            {"role": "system", "content": self.system_prompt},
-            {"role": "user", "content": f"问题：{question}"},
-            {"role": "assistant", "content": trajectory},
-        ]
-
-        # 用 chat template tokenize 完整序列
-        full_text = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=False
-        )
+        # 1. 渲染完整序列
+        try:
+            full_text = self.tokenizer.apply_chat_template(
+                messages,
+                tools=self.tools_native,
+                tokenize=False,
+                add_generation_prompt=False,
+            )
+        except Exception as e:
+            logger.warning(f"apply_chat_template 失败: {e}")
+            return None
 
         full_tokens = self.tokenizer(
             full_text,
@@ -193,60 +215,47 @@ class SFTDataset(Dataset):
         if len(input_ids) >= self.max_length:
             return None  # 超长跳过
 
-        # ---- 构建 labels ----
-        # 默认全部 mask（-100）
+        # 2. 确定每条 assistant 消息在 full_text 中的字符范围
+        # 方法：使用 Qwen2.5 chat_template 的固定格式标记
+        #   assistant 消息格式：<|im_start|>assistant\n{content}\n<tool_call>...\n</tool_call><|im_end|>
+        #   tool 消息格式：<|im_start|>user\n<tool_response>\n{content}\n</tool_response><|im_end|>
+        # 我们只需要找到所有 <|im_start|>assistant 到 <|im_end|> 的范围
+
+        assistant_char_ranges = []
+        search_start = 0
+        while True:
+            # 找 <|im_start|>assistant
+            marker = "<|im_start|>assistant"
+            pos = full_text.find(marker, search_start)
+            if pos == -1:
+                break
+
+            # 找对应的 <|im_end|>
+            content_start = pos + len(marker) + 1  # +1 for \n
+            end_pos = full_text.find("<|im_end|>", content_start)
+            if end_pos == -1:
+                end_pos = len(full_text)
+
+            # 记录 assistant 内容的字符范围（不含 <|im_start|>assistant\n 和 <|im_end|>）
+            assistant_char_ranges.append((content_start, end_pos))
+            search_start = end_pos + len("<|im_end|>")
+
+        # 3. 构建 labels：assistant 内容区域 active，其余 mask
         labels = [-100] * len(input_ids)
 
-        # 找到 assistant 回复在原文中的起始位置
-        # Qwen2.5 的 chat template: ...<|im_start|>assistant\n{content}<|im_end|>
-        assistant_marker = "<|im_start|>assistant\n"
-        assistant_start_char = full_text.find(assistant_marker)
-        if assistant_start_char < 0:
-            return None
-
-        assistant_content_start_char = assistant_start_char + len(assistant_marker)
-
-        # assistant 内容的结束位置（<|im_end|> 之前）
-        assistant_end_marker = "<|im_end|>"
-        assistant_end_char = full_text.find(assistant_end_marker, assistant_content_start_char)
-        if assistant_end_char < 0:
-            assistant_end_char = len(full_text)
-
-        # 找出 Observation 在 trajectory 中的 char spans
-        obs_spans_in_traj = build_observation_spans(trajectory)
-
-        # 转换为 full_text 中的 char spans
-        obs_spans_in_full = [
-            (s + assistant_content_start_char, e + assistant_content_start_char)
-            for s, e in obs_spans_in_traj
-        ]
-
-        # 对每个 token，判断是否应该计算 loss
         for token_idx, (tok_start, tok_end) in enumerate(offset_mapping):
             if tok_start == tok_end:
-                continue  # special token
+                continue  # special token，保持 -100
 
-            # 只对 assistant 内容区间的 token 计算 loss
-            if tok_start < assistant_content_start_char:
-                continue  # system + user 部分，保持 -100
-
-            if tok_start >= assistant_end_char:
-                continue  # <|im_end|> 及之后，保持 -100
-
-            # 检查是否在 Observation span 内
-            in_obs = False
-            for obs_start, obs_end in obs_spans_in_full:
-                if tok_start >= obs_start and tok_end <= obs_end:
-                    in_obs = True
+            # 检查 token 是否在某个 assistant 内容范围内
+            for (a_start, a_end) in assistant_char_ranges:
+                if tok_start >= a_start and tok_end <= a_end:
+                    labels[token_idx] = input_ids[token_idx]
                     break
 
-            if not in_obs:
-                labels[token_idx] = input_ids[token_idx]  # 保留 loss
-
-        # 统计 mask 比例
-        total_assistant = sum(1 for l in labels if l != -100 or True)
-        masked = sum(1 for l in labels if l == -100)
-        active = len(labels) - masked
+        # 统计
+        active = sum(1 for l in labels if l != -100)
+        masked = len(labels) - active
 
         return {
             "input_ids": input_ids,
@@ -257,6 +266,7 @@ class SFTDataset(Dataset):
                 "active_tokens": active,
                 "masked_tokens": masked,
                 "mask_ratio": masked / len(input_ids) if input_ids else 0,
+                "num_assistant_segments": len(assistant_char_ranges),
             }
         }
 
@@ -277,22 +287,24 @@ class SFTDataset(Dataset):
         active_tokens = sum(p["_stats"]["active_tokens"] for p in self.processed)
         masked_tokens = sum(p["_stats"]["masked_tokens"] for p in self.processed)
         lengths = [p["_stats"]["total_tokens"] for p in self.processed]
+        num_segments = [p["_stats"]["num_assistant_segments"] for p in self.processed]
 
         print(f"\n{'='*50}")
-        print(f"数据集统计")
+        print(f"数据集统计（V2 Native Tool Calling）")
         print(f"{'='*50}")
         print(f"样本数: {len(self.processed)}")
         print(f"总 token 数: {total_tokens:,}")
-        print(f"有效 token（计算loss）: {active_tokens:,} ({active_tokens/total_tokens:.1%})")
-        print(f"Masked token（Obs+prompt）: {masked_tokens:,} ({masked_tokens/total_tokens:.1%})")
+        print(f"有效 token（计算 loss）: {active_tokens:,} ({active_tokens/total_tokens:.1%})")
+        print(f"Masked token（system+user+tool）: {masked_tokens:,} ({masked_tokens/total_tokens:.1%})")
         print(f"序列长度: min={min(lengths)}, max={max(lengths)}, avg={sum(lengths)/len(lengths):.0f}")
+        print(f"Assistant 段数: min={min(num_segments)}, max={max(num_segments)}, avg={sum(num_segments)/len(num_segments):.1f}")
 
 
 # ============ 训练 ============
 
 def train(args):
     logger.info("=" * 60)
-    logger.info("FinAgent SFT 训练")
+    logger.info("FinAgent SFT 训练（V2 - Native Tool Calling）")
     logger.info("=" * 60)
 
     # 1. 加载 tokenizer
@@ -305,48 +317,49 @@ def train(args):
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
 
-    # 2. 构建 system prompt
-    logger.info("[2/5] 构建 system prompt")
-    try:
-        system_prompt = get_system_prompt()
-        logger.info("  从 08_prompts.py 加载成功")
-    except Exception as e:
-        logger.warning(f"  无法从 08_prompts.py 加载 ({e})，使用内置 fallback")
-        system_prompt = SYSTEM_PROMPT_FALLBACK
+    # 2. 加载工具定义
+    logger.info("[2/5] 加载工具定义")
+    tools_native = get_tools_native()
+    logger.info(f"  工具数量: {len(tools_native)}")
+    for t in tools_native:
+        logger.info(f"  - {t['function']['name']}")
 
     # 3. 构建数据集
     logger.info(f"[3/5] 构建数据集: {args.data_path}")
     dataset = SFTDataset(
         data_path=args.data_path,
         tokenizer=tokenizer,
-        system_prompt=system_prompt,
+        tools_native=tools_native,
         max_length=args.max_length,
     )
     dataset.print_stats()
 
     # 验证 loss mask
     logger.info("\n[验证] Loss mask 样本检查:")
-    sample = dataset.processed[0]
-    tokens = tokenizer.convert_ids_to_tokens(sample["input_ids"])
-    labels = sample["labels"]
-    # 找连续的 masked/active 区间
-    active_segments = []
-    current = None
-    for i, (tok, lab) in enumerate(zip(tokens, labels)):
-        is_active = lab != -100
-        if current is None or current["active"] != is_active:
-            if current:
-                active_segments.append(current)
-            current = {"active": is_active, "start": i, "count": 1}
-        else:
-            current["count"] += 1
-    if current:
-        active_segments.append(current)
+    if dataset.processed:
+        sample = dataset.processed[0]
+        tokens = tokenizer.convert_ids_to_tokens(sample["input_ids"])
+        labels = sample["labels"]
 
-    for seg in active_segments[:15]:
-        status = "LEARN" if seg["active"] else "MASK "
-        start_tok = tokens[seg["start"]] if seg["start"] < len(tokens) else "?"
-        print(f"  {status} | {seg['count']:>4d} tokens | starts: {start_tok[:20]}")
+        # 找连续的 masked/active 区间
+        segments = []
+        current = None
+        for i, (tok, lab) in enumerate(zip(tokens, labels)):
+            is_active = lab != -100
+            if current is None or current["active"] != is_active:
+                if current:
+                    segments.append(current)
+                current = {"active": is_active, "start": i, "count": 1}
+            else:
+                current["count"] += 1
+        if current:
+            segments.append(current)
+
+        for seg in segments[:20]:
+            status = "LEARN" if seg["active"] else "MASK "
+            start_tok = tokens[seg["start"]] if seg["start"] < len(tokens) else "?"
+            # 显示该段的角色类型
+            print(f"  {status} | {seg['count']:>4d} tokens | starts: {repr(start_tok[:30])}")
 
     if args.dry_run:
         logger.info("\n[dry-run] 数据预处理检查完成，不执行训练")
@@ -420,17 +433,17 @@ def train(args):
 # ============ 主函数 ============
 
 def main():
-    parser = argparse.ArgumentParser(description="FinAgent SFT 训练")
+    parser = argparse.ArgumentParser(description="FinAgent SFT 训练（V2 Native Tool Calling）")
     parser.add_argument("--model_path", type=str,
                         default="./models/Qwen2.5-14B-Instruct",
                         help="基座模型路径")
     parser.add_argument("--data_path", type=str,
-                        default="./data/sft/sft_data_train.jsonl",
-                        help="训练数据路径")
+                        default="./data/sft/sft_data_native.jsonl",
+                        help="训练数据路径（messages 格式）")
     parser.add_argument("--output_dir", type=str,
-                        default="./outputs/sft_lora",
+                        default="./outputs/sft_lora_native",
                         help="输出目录")
-    parser.add_argument("--max_length", type=int, default=4096,
+    parser.add_argument("--max_length", type=int, default=7168,
                         help="最大序列长度")
     parser.add_argument("--epochs", type=int, default=3,
                         help="训练轮数")
