@@ -47,8 +47,8 @@ from tools import FinAgentTools, TOOLS_NATIVE
 OUTPUT_DIR = "./data/sft"
 SEED_DATA_PATH = "./sft_seed_data_v3.jsonc"
 QUESTIONS_PATH = "./data/sft/all_questions_v2.jsonl"
-CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "checkpoint_final.json")
-FINAL_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "sft_data_native.jsonl")
+CHECKPOINT_PATH = os.path.join(OUTPUT_DIR, "checkpoint_v3_native.json")
+FINAL_OUTPUT_PATH = os.path.join(OUTPUT_DIR, "sft_data_v3_native.jsonl")
 
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
@@ -96,13 +96,13 @@ STEP_PROMPT = """你是"金融翻译官"，一个专业的A股上市公司分析
 你正在逐步分析用户的问题，每次只输出一步（Thought + Action + Action Input）。
 
 ## 数据库覆盖范围（⭐生成 query 时必须参考）
-- **财务数据**：2022H1 ~ 2024年报（共6期，300家A股公司）。没有2025年及以后的财务数据。
+- **财务数据**：2022H1 ~ 2025年报（300家A股公司，所有公司有2025H1，约半数有2025年报，其余最新年报为2024年）
 - **行业对比数据**：按行业聚合的多家公司核心指标对比表和行业均值（沪深300成分股），用 search_industry 检索
 - **券商研报**：2017年 ~ 2026年3月（约39,000篇元数据 + 64,000篇PDF正文chunk）
   - 注意：数据库中存在 2017-2021 年的老研报，评级和目标价已严重过时
   - 除非用户明确询问历史数据，否则应优先检索最近1-2年的研报
 - **时效性原则**：
-  - 用户问"XX怎么样"/"XX盈利能力" → 检索最新数据（query 中加 "2024"）
+  - 用户问"XX怎么样"/"XX盈利能力" → 检索最新数据（query 中加 "2025" 或 "2024"）
   - 用户问"XX近几年趋势"/"XX变化" → 不限定年份，让检索返回多期数据
   - 用户问"XX目标价"/"XX评级" → query 中加 "2025 2026" 以获取最新研报
 
@@ -136,7 +136,7 @@ STEP_PROMPT = """你是"金融翻译官"，一个专业的A股上市公司分析
 - 如果 Observation 返回了多个年份的数据，在 Thought 中明确选择使用哪一期
 - 杜邦分析的三个指标（净利率、总资产周转率、权益乘数）必须来自同一期数据
 - 不要在同一段分析中混用年报和半年报数据
-- 优先使用最新的年报数据（2024年报 > 2023年报 > 半年报）
+- 优先使用最新的年报数据（2025年报 > 2024年报 > 2023年报 > 半年报），半年报可作为补充参考但不能替代年报
 
 ## 预检索结果（数据库实际能返回的信息样例）
 {pre_retrieved_info}
@@ -184,8 +184,8 @@ calculate 步骤的 Thought：{calc_thought}
 
 示例：
 - Thought说要算ROE差值，数据中A公司ROE=36.99%，B公司ROE=24.53% → 输出：36.99 - 24.53
-- Thought说要算权益乘数，数据中资产负债率=42.70% → 输出：1 / (1 - 42.70 / 100)
-- Thought说要算杜邦ROE，数据中净利率=14.47%，周转率=0.49，资产负债率=42.70% → 输出：14.47 / 100 * 0.49 * (1 / (1 - 42.70 / 100))
+- Thought说要算同比增长率，数据中2024年营收=1505亿，2023年营收=1294亿 → 输出：(1505 - 1294) / 1294 * 100
+- Thought说要验算杜邦ROE，数据中净利率=14.47%，周转率=0.49，权益乘数=1.75 → 输出：14.47 / 100 * 0.49 * 1.75 * 100
 """
 
 

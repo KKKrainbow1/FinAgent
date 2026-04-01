@@ -508,7 +508,7 @@ def _structure_to_text(code: str, name: str, date: str, record: dict,
 def _dupont_to_text(code: str, name: str, date: str, record: dict,
                     period_label: str = "", prev_record: dict = None) -> str:
     """杜邦分析专属chunk：净利率 + 总资产周转率 + 权益乘数 + ROE，一次检索拿全三因子"""
-    # 三因子必须至少有两个才生成chunk
+    # 提取三因子 + ROE
     net_margin = record.get("销售净利率(%)")
     turnover = record.get("总资产周转率(次)")
     equity_ratio = record.get("股东权益比率(%)")
@@ -743,7 +743,7 @@ def build_industry_chunks(financial_path: str, report_path: str = None) -> list[
         parts.append("，".join(avg_parts))
 
         parts.append(f"（数据来源：沪深300成分股中{industry}行业代表性公司）")
-        text = "。\n".join(parts) + ""
+        text = "。\n".join(parts) + "。"
 
         chunks.append({
             "text": text,
@@ -815,7 +815,7 @@ def main():
             "total_chunks": len(all_chunks),
             "by_source_type": source_counts,
             "parser": args.parser,
-            "unique_stocks": len(set(c["metadata"]["stock_code"] for c in all_chunks)),
+            "unique_stocks": len(set(c["metadata"].get("stock_code", "") for c in all_chunks if c["metadata"].get("stock_code"))),
             "avg_text_length": sum(len(c["text"]) for c in all_chunks) / len(all_chunks),
             "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
         }
