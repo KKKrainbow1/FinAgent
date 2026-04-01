@@ -142,6 +142,27 @@ class FinAgentRetriever:
         )
         return results
 
+    def search_industry(self, query: str, top_k: int = 5) -> list[dict]:
+        """
+        检索行业汇总数据
+
+        策略：混合检索（BM25 权重高 alpha=0.4）
+        范围：只返回 source_type == "industry" 的 chunk
+
+        为什么 BM25 权重更高？
+        行业 chunk 是结构化的行业名+指标表，BM25 能精确匹配行业名关键词。
+        """
+        valid_ids = self._source_type_ids.get("industry", set())
+        if not valid_ids:
+            return []
+        results = self._hybrid_search(
+            query,
+            valid_ids=valid_ids,
+            alpha=0.4,        # BM25 权重高，精确匹配行业名
+            top_k=top_k,
+        )
+        return results
+
     def search_report(self, query: str, top_k: int = 5) -> list[dict]:
         """
         检索研报信息（元数据 + PDF 正文）

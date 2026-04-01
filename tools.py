@@ -92,6 +92,33 @@ TOOLS_NATIVE = [
     {
         "type": "function",
         "function": {
+            "name": "search_industry",
+            "description": (
+                "检索行业对比数据，返回同行业多家公司的关键指标对比表（ROE、净利率、"
+                "周转率、资产负债率、营收增长率等）和行业均值。"
+                "适用于：行业分析、同行对比、行业排名、行业趋势等。"
+                "示例：search_industry(query='光伏行业 ROE 盈利能力')"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "行业检索关键词，如'银行行业 ROE 对比'、'光伏 盈利能力'"
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "返回结果数量，默认3",
+                        "default": 3
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "calculate",
             "description": (
                 "计算数学表达式。所有涉及数值计算的场景（同比增长率、行业均值、"
@@ -203,6 +230,11 @@ class FinAgentTools:
             "返回ROE、毛利率、营收增长率、资产负债率等指标。"
             "适用于：查具体财务数据、盈利能力、偿债能力、运营效率等。"
         ),
+        "search_industry": (
+            "search_industry(query: str) → 检索行业对比数据。"
+            "返回同行业多家公司的关键指标对比表和行业均值。"
+            "适用于：行业分析、同行对比、行业排名等。"
+        ),
         "calculate": (
             "calculate(expression: str) → 计算数学表达式。"
             "支持加减乘除、百分比、括号等。"
@@ -242,7 +274,7 @@ class FinAgentTools:
                 tool_input = json.loads(tool_input)
             except (json.JSONDecodeError, TypeError):
                 # 纯字符串，包装为 dict
-                if tool_name in ("search_report", "search_financial"):
+                if tool_name in ("search_report", "search_financial", "search_industry"):
                     tool_input = {"query": tool_input.strip()}
                 elif tool_name == "calculate":
                     tool_input = {"expression": tool_input.strip()}
@@ -256,6 +288,11 @@ class FinAgentTools:
             )
         elif tool_name == "search_financial":
             return self._search_financial(
+                query=tool_input.get("query", ""),
+                top_k=tool_input.get("top_k", 3),
+            )
+        elif tool_name == "search_industry":
+            return self._search_industry(
                 query=tool_input.get("query", ""),
                 top_k=tool_input.get("top_k", 3),
             )
@@ -318,6 +355,42 @@ class FinAgentTools:
         lines = [f"找到 {len(results)} 条相关财务数据："]
         for i, r in enumerate(results):
             lines.append(f"{i+1}. {_format_result(r)}")
+
+        return "\n".join(lines)
+
+    # ---------- search_industry ----------
+
+    def _search_industry(self, query: str, top_k: int = 3) -> str:
+        """
+        检索行业对比数据
+
+        返回格式示例：
+        找到 2 条相关行业数据：
+        1. [industry | 银行 | 5家公司] 银行行业对比（5家公司，最新年报数据）...
+        """
+        try:
+            results = self.retriever.search_industry(query, top_k=top_k)
+        except Exception as e:
+            logger.error(f"search_industry 异常: {e}")
+            return f"[检索错误] 行业数据检索失败: {str(e)}"
+
+        if not results:
+            return "[检索结果为空] 未找到与查询相关的行业对比数据。"
+
+        lines = [f"找到 {len(results)} 条相关行业数据："]
+        for i, r in enumerate(results):
+            meta = r["metadata"]
+            industry = meta.get("industry", "未知")
+            count = meta.get("company_count", 0)
+            # 行业 chunk 较长，截断到 1000 字符保留核心数据
+            text = _clean_text(r["text"])
+            if len(text) > 1000:
+                last_newline = text[:1000].rfind('\n')
+                if last_newline > 500:
+                    text = text[:last_newline] + "\n..."
+                else:
+                    text = text[:1000] + "..."
+            lines.append(f"{i+1}. [industry | {industry} | {count}家公司]\n{text}")
 
         return "\n".join(lines)
 

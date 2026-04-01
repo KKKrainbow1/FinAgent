@@ -579,6 +579,186 @@ def _dupont_to_text(code: str, name: str, date: str, record: dict,
     return "，".join(parts) + "。"
 
 
+# ============ 行业汇总 Chunk 构建 ============
+
+# 东财细分行业 → 大类映射（130 → ~25 大类）
+INDUSTRY_MAP = {
+    "银行": ["银行", "银行Ⅱ"],
+    "保险": ["保险", "保险Ⅱ"],
+    "证券": ["证券", "证券Ⅱ", "券商信托", "多元金融"],
+    "白酒": ["白酒Ⅱ", "酿酒行业", "非白酒"],
+    "食品饮料": ["食品饮料", "饮料乳品", "食品加工", "调味发酵品Ⅱ"],
+    "医药": ["化学制药", "中药Ⅱ", "中药", "生物制品", "医药制造", "医药商业", "医疗行业"],
+    "医疗": ["医疗器械", "医疗服务", "医疗美容"],
+    "汽车": ["乘用车", "商用车", "汽车整车", "汽车行业", "汽车零部件"],
+    "半导体": ["半导体"],
+    "消费电子": ["消费电子", "元件", "光学光电子", "电子元件", "电子信息"],
+    "光伏": ["光伏设备"],
+    "电池": ["电池", "能源金属"],
+    "电力": ["电力", "电力行业", "电网设备"],
+    "煤炭": ["煤炭开采", "煤炭行业", "煤炭采选"],
+    "钢铁": ["普钢", "特钢Ⅱ", "钢铁行业"],
+    "有色金属": ["工业金属", "小金属", "贵金属", "有色金属", "金属制品"],
+    "化工": ["化学制品", "化学原料", "化工行业", "化纤行业", "化肥行业", "农化制品"],
+    "房地产": ["房地产", "房地产开发"],
+    "建筑建材": ["基础建设", "工程建设", "房屋建设Ⅱ", "专业工程", "水泥", "水泥建材",
+                "装修建材", "玻璃玻纤", "玻璃陶瓷"],
+    "家电": ["白色家电", "小家电", "家电行业", "家电零部件Ⅱ"],
+    "软件": ["软件开发", "软件服务", "IT服务Ⅱ", "计算机设备"],
+    "通信": ["通信设备", "通信服务", "通讯行业", "电信运营"],
+    "传媒": ["数字媒体", "广告营销", "影视院线", "文化传媒"],
+    "交通运输": ["航空机场", "民航机场", "航运港口", "铁路公路", "物流", "物流行业", "交运物流"],
+    "军工": ["航天装备Ⅱ", "航空装备Ⅱ", "航海装备Ⅱ", "军工电子Ⅱ", "船舶制造",
+            "航天航空", "交运设备"],
+    "机械": ["工程机械", "自动化设备", "机械行业", "轨交设备Ⅱ", "仪器仪表"],
+    "农业": ["养殖业", "农产品加工", "农牧饲渔", "饲料"],
+    "石油石化": ["油服工程", "油气开采Ⅱ", "炼化及贸易", "石油行业", "燃气", "燃气Ⅱ"],
+    "纺织服装": ["纺织制造", "纺织服装"],
+    "零售": ["一般零售", "旅游零售Ⅱ", "家居用品"],
+    "安防": ["安防设备"],
+}
+
+# 反向映射：细分行业 → 大类
+_INDUSTRY_REVERSE = {}
+for major, subs in INDUSTRY_MAP.items():
+    for sub in subs:
+        _INDUSTRY_REVERSE[sub] = major
+
+
+def _get_major_industry(sub_industry: str) -> str:
+    """从东财细分行业获取大类行业名"""
+    return _INDUSTRY_REVERSE.get(sub_industry, sub_industry)
+
+
+def build_industry_chunks(financial_path: str, report_path: str = None) -> list[dict]:
+    """
+    构建行业汇总 chunks：按行业聚合多家公司的关键指标对比表
+
+    数据源：从 all_financial.json 中按行业分组聚合
+    行业标签来源：all_reports.csv 中的行业字段（东财分类）
+
+    每个行业生成 1 个 chunk，包含该行业内所有公司的核心指标对比。
+    """
+    # 1. 从研报数据获取 stock_code → industry 映射
+    stock_industry = {}
+    if report_path and os.path.exists(report_path):
+        df = pd.read_csv(report_path, dtype={'股票代码': str})
+        for _, row in df.iterrows():
+            code = str(row.get('股票代码', '')).strip()
+            industry = str(row.get('行业', '')).strip()
+            if code and industry and industry != 'nan':
+                stock_industry[code] = _get_major_industry(industry)
+
+    if not stock_industry:
+        logger.warning("无法获取行业映射（研报数据不存在或为空），跳过行业汇总chunks")
+        return []
+
+    # 2. 加载财务数据，按行业分组聚合
+    with open(financial_path, 'r', encoding='utf-8') as f:
+        all_data = json.load(f)
+
+    # 按行业聚合最新年报数据
+    industry_data = {}  # {industry: [{name, code, roe, net_margin, ...}, ...]}
+
+    for code, data in all_data.items():
+        if code not in stock_industry:
+            continue
+        industry = stock_industry[code]
+        name = data.get("stock_name", code)
+
+        if "financial_indicators" not in data:
+            continue
+
+        # 取最新年报
+        annual_records = [
+            r for r in data["financial_indicators"]
+            if str(r.get("日期", "")).endswith("12-31")
+        ]
+        if not annual_records:
+            continue
+        latest = max(annual_records, key=lambda r: str(r.get("日期", "")))
+        report_date = str(latest.get("日期", ""))
+
+        # 提取关键指标
+        entry = {"name": name, "code": code, "report_date": report_date}
+        for key, label in [
+            ("净资产收益率(%)", "ROE"),
+            ("销售净利率(%)", "净利率"),
+            ("总资产周转率(次)", "周转率"),
+            ("资产负债率(%)", "资产负债率"),
+            ("主营业务收入增长率(%)", "营收增长率"),
+            ("净利润增长率(%)", "净利润增长率"),
+            ("主营业务利润率(%)", "毛利率"),
+        ]:
+            val = latest.get(key)
+            if val is not None:
+                try:
+                    v = float(val)
+                    if not pd.isna(v):
+                        entry[label] = v
+                except (ValueError, TypeError):
+                    pass
+
+        if len(entry) > 3:  # 至少有一个指标
+            if industry not in industry_data:
+                industry_data[industry] = []
+            industry_data[industry].append(entry)
+
+    # 3. 为每个行业生成汇总 chunk
+    chunks = []
+    for industry, companies in sorted(industry_data.items()):
+        if len(companies) < 2:  # 至少2家公司才有对比价值
+            continue
+
+        # 按 ROE 降序排列
+        companies.sort(key=lambda x: x.get("ROE", 0), reverse=True)
+
+        # 标注数据年份范围
+        years = set(c["report_date"][:4] for c in companies if c.get("report_date"))
+        year_label = "/".join(sorted(years)) + "年报" if years else "最新年报"
+
+        parts = [f"{industry}行业对比（{len(companies)}家公司，{year_label}数据）"]
+
+        for comp in companies:
+            line_parts = [f"{comp['name']}({comp['code']})"]
+            for label, suffix in [
+                ("ROE", "%"), ("净利率", "%"), ("毛利率", "%"),
+                ("周转率", "次"), ("资产负债率", "%"),
+                ("营收增长率", "%"), ("净利润增长率", "%"),
+            ]:
+                if label in comp:
+                    line_parts.append(f"{label}{comp[label]:.2f}{suffix}")
+            parts.append("，".join(line_parts))
+
+        # 行业均值
+        avg_parts = ["行业均值"]
+        for label, suffix in [
+            ("ROE", "%"), ("净利率", "%"), ("毛利率", "%"),
+            ("周转率", "次"), ("资产负债率", "%"),
+            ("营收增长率", "%"), ("净利润增长率", "%"),
+        ]:
+            vals = [c[label] for c in companies if label in c]
+            if vals:
+                avg_parts.append(f"{label}{sum(vals)/len(vals):.2f}{suffix}")
+        parts.append("，".join(avg_parts))
+
+        parts.append(f"（数据来源：沪深300成分股中{industry}行业代表性公司）")
+        text = "。\n".join(parts) + ""
+
+        chunks.append({
+            "text": text,
+            "metadata": {
+                "source_type": "industry",
+                "industry": industry,
+                "company_count": len(companies),
+                "stock_codes": [c["code"] for c in companies],
+            }
+        })
+
+    logger.info(f"行业汇总chunks: {len(chunks)} 条（覆盖 {len(industry_data)} 个行业）")
+    return chunks
+
+
 # ============ 主流程 ============
 
 def main():
@@ -613,6 +793,11 @@ def main():
         all_chunks.extend(financial_chunks)
     elif not args.report_only:
         logger.warning(f"财务数据不存在: {financial_path}，跳过")
+
+    # 4. 行业汇总chunks（需要研报的行业标签 + 财务数据）
+    if not args.report_only and os.path.exists(financial_path):
+        industry_chunks = build_industry_chunks(financial_path, report_path)
+        all_chunks.extend(industry_chunks)
 
     # 保存
     if all_chunks:
