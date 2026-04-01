@@ -453,7 +453,7 @@ def judge_single_inline(client: OpenAI, question: str, observations: str,
                 messages=[{"role": "user", "content": prompt}],
                 response_format={"type": "json_object"},
                 temperature=0.1,
-                max_tokens=300,
+                max_tokens=800,
                 extra_body={"enable_thinking": False},
             )
             result = json.loads(response.choices[0].message.content)
