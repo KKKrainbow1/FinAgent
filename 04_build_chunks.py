@@ -232,9 +232,10 @@ def build_financial_chunks(financial_path: str) -> list[dict]:
 
     数据来源：ak.stock_financial_analysis_indicator，每期包含86个字段
 
-    策略：每期数据生成2个chunk（盈利+结构），而不是原来的4个chunk（利润表/资产负债/现金流/指标）。
+    策略：每期数据生成3个chunk（盈利+结构+杜邦），而不是原来的4个chunk（利润表/资产负债/现金流/指标）。
     原因：新接口的数据已经是汇总指标，不需要按报表拆分。合并后每个chunk语义更完整，
     检索时一次就能拿到盈利能力+成长性的全貌。
+    杜邦分析chunk将净利率+周转率+权益乘数聚合在一起，Agent一次检索即可拿全三因子。
 
     面试追问：为什么转成自然语言而不是直接存结构化数据？
     答：因为Agent通过自然语言检索，向量检索对结构化数据不友好。
@@ -252,19 +253,32 @@ def build_financial_chunks(financial_path: str) -> list[dict]:
         if "financial_indicators" not in data:
             continue
 
-        for record in data["financial_indicators"]:
+        # 按日期排序，构建上年同期索引（年报对年报，半年报对半年报）
+        records = sorted(data["financial_indicators"],
+                         key=lambda r: str(r.get("日期", "")))
+        prev_annual = {}    # year -> record（年报）
+        prev_semi = {}      # year -> record（半年报）
+
+        for record in records:
             date = str(record.get("日期", "未知日期"))
 
             # 标注报告期类型，避免Agent混淆年报和半年报
             if date.endswith("12-31"):
                 period_label = "年报"
+                year = date[:4]
+                prev_record = prev_annual.get(str(int(year) - 1))
+                prev_annual[year] = record
             elif date.endswith("06-30"):
                 period_label = "半年报"
+                year = date[:4]
+                prev_record = prev_semi.get(str(int(year) - 1))
+                prev_semi[year] = record
             else:
                 period_label = ""
+                prev_record = None
 
             # Chunk 1: 盈利能力 + 成长性 + 每股指标
-            text = _profitability_to_text(code, name, date, record, period_label)
+            text = _profitability_to_text(code, name, date, record, period_label, prev_record)
             if text:
                 chunks.append({
                     "text": text,
@@ -278,13 +292,27 @@ def build_financial_chunks(financial_path: str) -> list[dict]:
                 })
 
             # Chunk 2: 偿债能力 + 运营效率 + 资产结构
-            text = _structure_to_text(code, name, date, record, period_label)
+            text = _structure_to_text(code, name, date, record, period_label, prev_record)
             if text:
                 chunks.append({
                     "text": text,
                     "metadata": {
                         "source_type": "financial",
                         "data_type": "balance_structure",
+                        "stock_code": code,
+                        "stock_name": name,
+                        "report_date": date,
+                    }
+                })
+
+            # Chunk 3: 杜邦分析专属（净利率+周转率+权益乘数+ROE）
+            text = _dupont_to_text(code, name, date, record, period_label, prev_record)
+            if text:
+                chunks.append({
+                    "text": text,
+                    "metadata": {
+                        "source_type": "financial",
+                        "data_type": "dupont",
                         "stock_code": code,
                         "stock_name": name,
                         "report_date": date,
@@ -326,7 +354,27 @@ def _format_amount(value, unit="元") -> str:
         return f"{v:.2f}{unit}"
 
 
-def _profitability_to_text(code: str, name: str, date: str, record: dict, period_label: str = "") -> str:
+def _fmt_with_prev(record: dict, prev_record: dict | None, key: str, label: str, suffix: str) -> str | None:
+    """格式化指标值，如果有上年同期数据则附加对比"""
+    val = _safe_fmt(record.get(key), suffix)
+    if not val:
+        return None
+    if prev_record is not None:
+        prev_val = _safe_fmt(prev_record.get(key), suffix)
+        if prev_val:
+            return f"{label}{val}（上年同期{prev_val}）"
+    return f"{label}{val}"
+
+
+# 需要附加上年同期对比的核心指标
+_YOY_KEYS = {
+    "净资产收益率(%)", "销售净利率(%)", "资产负债率(%)",
+    "总资产周转率(次)", "主营业务收入增长率(%)", "净利润增长率(%)",
+}
+
+
+def _profitability_to_text(code: str, name: str, date: str, record: dict,
+                           period_label: str = "", prev_record: dict = None) -> str:
     """盈利能力 + 成长性 + 每股指标 → 自然语言"""
     header = f"{name}({code}) {date}"
     if period_label:
@@ -343,9 +391,13 @@ def _profitability_to_text(code: str, name: str, date: str, record: dict, period
         ("总资产利润率(%)", "总资产利润率(ROA)", "%"),
     ]
     for key, label, suffix in fields:
-        val = _safe_fmt(record.get(key), suffix)
-        if val:
-            parts.append(f"{label}{val}")
+        if key in _YOY_KEYS:
+            text = _fmt_with_prev(record, prev_record, key, label, suffix)
+        else:
+            val = _safe_fmt(record.get(key), suffix)
+            text = f"{label}{val}" if val else None
+        if text:
+            parts.append(text)
             valid = True
 
     growth_fields = [
@@ -355,9 +407,13 @@ def _profitability_to_text(code: str, name: str, date: str, record: dict, period
         ("总资产增长率(%)", "总资产增长率", "%"),
     ]
     for key, label, suffix in growth_fields:
-        val = _safe_fmt(record.get(key), suffix)
-        if val:
-            parts.append(f"{label}{val}")
+        if key in _YOY_KEYS:
+            text = _fmt_with_prev(record, prev_record, key, label, suffix)
+        else:
+            val = _safe_fmt(record.get(key), suffix)
+            text = f"{label}{val}" if val else None
+        if text:
+            parts.append(text)
             valid = True
 
     eps_fields = [
@@ -380,7 +436,8 @@ def _profitability_to_text(code: str, name: str, date: str, record: dict, period
     return "，".join(parts) + "。" if valid else None
 
 
-def _structure_to_text(code: str, name: str, date: str, record: dict, period_label: str = "") -> str:
+def _structure_to_text(code: str, name: str, date: str, record: dict,
+                       period_label: str = "", prev_record: dict = None) -> str:
     """偿债能力 + 运营效率 + 资产结构 → 自然语言"""
     header = f"{name}({code}) {date}"
     if period_label:
@@ -397,10 +454,26 @@ def _structure_to_text(code: str, name: str, date: str, record: dict, period_lab
         ("产权比率(%)", "产权比率", "%"),
     ]
     for key, label, suffix in fields:
-        val = _safe_fmt(record.get(key), suffix)
-        if val:
-            parts.append(f"{label}{val}")
+        if key in _YOY_KEYS:
+            text = _fmt_with_prev(record, prev_record, key, label, suffix)
+        else:
+            val = _safe_fmt(record.get(key), suffix)
+            text = f"{label}{val}" if val else None
+        if text:
+            parts.append(text)
             valid = True
+
+    # 从股东权益比率直接计算权益乘数，避免模型心算出错
+    equity_ratio = record.get("股东权益比率(%)")
+    if equity_ratio is not None:
+        try:
+            er = float(equity_ratio)
+            if not pd.isna(er) and er > 0:
+                equity_multiplier = 100 / er
+                parts.append(f"权益乘数{equity_multiplier:.2f}倍")
+                valid = True
+        except (ValueError, TypeError):
+            pass
 
     efficiency_fields = [
         ("总资产周转率(次)", "总资产周转率", "次"),
@@ -410,9 +483,13 @@ def _structure_to_text(code: str, name: str, date: str, record: dict, period_lab
         ("应收账款周转天数(天)", "应收账款周转天数", "天"),
     ]
     for key, label, suffix in efficiency_fields:
-        val = _safe_fmt(record.get(key), suffix)
-        if val:
-            parts.append(f"{label}{val}")
+        if key in _YOY_KEYS:
+            text = _fmt_with_prev(record, prev_record, key, label, suffix)
+        else:
+            val = _safe_fmt(record.get(key), suffix)
+            text = f"{label}{val}" if val else None
+        if text:
+            parts.append(text)
             valid = True
 
     cf_fields = [
@@ -426,6 +503,80 @@ def _structure_to_text(code: str, name: str, date: str, record: dict, period_lab
             valid = True
 
     return "，".join(parts) + "。" if valid else None
+
+
+def _dupont_to_text(code: str, name: str, date: str, record: dict,
+                    period_label: str = "", prev_record: dict = None) -> str:
+    """杜邦分析专属chunk：净利率 + 总资产周转率 + 权益乘数 + ROE，一次检索拿全三因子"""
+    # 三因子必须至少有两个才生成chunk
+    net_margin = record.get("销售净利率(%)")
+    turnover = record.get("总资产周转率(次)")
+    equity_ratio = record.get("股东权益比率(%)")
+    roe = record.get("净资产收益率(%)")
+
+    factors = {}
+    try:
+        if net_margin is not None and not pd.isna(float(net_margin)):
+            factors["net_margin"] = float(net_margin)
+        if turnover is not None and not pd.isna(float(turnover)):
+            factors["turnover"] = float(turnover)
+        if equity_ratio is not None and not pd.isna(float(equity_ratio)) and float(equity_ratio) > 0:
+            factors["equity_multiplier"] = 100 / float(equity_ratio)
+        if roe is not None and not pd.isna(float(roe)):
+            factors["roe"] = float(roe)
+    except (ValueError, TypeError):
+        pass
+
+    # 三因子必须全部有才生成杜邦chunk（ROE是附加信息，可选）
+    if not all(k in factors for k in ("net_margin", "turnover", "equity_multiplier")):
+        return None
+
+    header = f"{name}({code}) {date}"
+    if period_label:
+        header += f"({period_label})"
+    parts = [f"{header}杜邦分析"]
+
+    if "roe" in factors:
+        text = f"净资产收益率(ROE){factors['roe']:.2f}%"
+        if prev_record:
+            prev_val = _safe_fmt(prev_record.get("净资产收益率(%)"), "%")
+            if prev_val:
+                text += f"（上年同期{prev_val}）"
+        parts.append(text)
+
+    if "net_margin" in factors:
+        text = f"销售净利率{factors['net_margin']:.2f}%"
+        if prev_record:
+            prev_val = _safe_fmt(prev_record.get("销售净利率(%)"), "%")
+            if prev_val:
+                text += f"（上年同期{prev_val}）"
+        parts.append(text)
+
+    if "turnover" in factors:
+        text = f"总资产周转率{factors['turnover']:.2f}次"
+        if prev_record:
+            prev_val = _safe_fmt(prev_record.get("总资产周转率(次)"), "次")
+            if prev_val:
+                text += f"（上年同期{prev_val}）"
+        parts.append(text)
+
+    if "equity_multiplier" in factors:
+        text = f"权益乘数{factors['equity_multiplier']:.2f}倍"
+        if prev_record and prev_record.get("股东权益比率(%)"):
+            try:
+                prev_er = float(prev_record["股东权益比率(%)"])
+                if not pd.isna(prev_er) and prev_er > 0:
+                    text += f"（上年同期{100/prev_er:.2f}倍）"
+            except (ValueError, TypeError):
+                pass
+        parts.append(text)
+
+    # 验算：净利率 × 周转率 × 权益乘数
+    if all(k in factors for k in ("net_margin", "turnover", "equity_multiplier")):
+        calc_roe = (factors["net_margin"] / 100) * factors["turnover"] * factors["equity_multiplier"] * 100
+        parts.append(f"杜邦验算ROE≈{calc_roe:.2f}%（净利率×周转率×权益乘数）")
+
+    return "，".join(parts) + "。"
 
 
 # ============ 主流程 ============
