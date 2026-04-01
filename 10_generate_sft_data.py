@@ -88,7 +88,7 @@ MAX_STEPS = {
 MODEL = "qwen3-max"
 JUDGE_MODEL = "qwen3-max"
 JUDGE_THRESHOLD = 4
-MAX_REGEN_ATTEMPTS = 1      # 被 Judge 驳回后最多重新生成几次答案
+MAX_REGEN_ATTEMPTS = 3      # 被 Judge 驳回后最多重新生成几次答案
 VALID_TOOLS = {"search_report", "search_financial", "search_industry", "calculate", "finish"}
 MAX_RETRY = 3
 
