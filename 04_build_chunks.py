@@ -571,10 +571,28 @@ def _dupont_to_text(code: str, name: str, date: str, record: dict,
                 pass
         parts.append(text)
 
-    # 验算：净利率 × 周转率 × 权益乘数
+    # 验算：净利率 × 周转率 × 权益乘数 + 自洽性校验
     if all(k in factors for k in ("net_margin", "turnover", "equity_multiplier")):
         calc_roe = (factors["net_margin"] / 100) * factors["turnover"] * factors["equity_multiplier"] * 100
-        parts.append(f"杜邦验算ROE≈{calc_roe:.2f}%（净利率×周转率×权益乘数）")
+
+        if "roe" in factors:
+            abs_diff = abs(calc_roe - factors["roe"])
+            # 相对偏差：ROE 接近 0 时用绝对阈值保护
+            rel_diff = abs_diff / max(abs(factors["roe"]), 1.0)
+
+            if abs_diff > 3.0 or rel_diff > 0.3:
+                # 🔴 差距过大：数据口径不一致，不生成杜邦chunk
+                return None
+            elif abs_diff > 1.0:
+                # 🟡 有差距：生成但附加说明
+                parts.append(f"杜邦验算ROE≈{calc_roe:.2f}%（净利率×周转率×权益乘数），"
+                             f"与报告ROE（{factors['roe']:.2f}%）存在{abs_diff:.2f}个百分点差异，"
+                             f"可能源于加权平均口径差异")
+            else:
+                # 🟢 差距小：正常生成
+                parts.append(f"杜邦验算ROE≈{calc_roe:.2f}%（净利率×周转率×权益乘数）")
+        else:
+            parts.append(f"杜邦验算ROE≈{calc_roe:.2f}%（净利率×周转率×权益乘数）")
 
     return "，".join(parts) + "。"
 
