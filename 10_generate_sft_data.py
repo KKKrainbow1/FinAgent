@@ -562,9 +562,21 @@ def judge_and_regen(client: OpenAI, plan: dict, seed_grouped: dict,
 
     # 重新生成
     for attempt in range(MAX_REGEN_ATTEMPTS):
-        feedback = "\n".join(f"- {issue}" for issue in score.get("issues", []))
+        # 只传维度级别的问题描述，不传具体数字，避免模型把 feedback 当数据源
+        feedback_parts = []
+        if score.get("d1_accuracy", 5) < 4:
+            feedback_parts.append("- 数字准确性不足：部分数字在检索数据中找不到出处，请只使用检索数据中明确出现的数字")
+        if score.get("d2_coherence", 5) < 4:
+            feedback_parts.append("- 逻辑连贯性不足：分析推理存在矛盾或判断缺乏依据")
+        if score.get("d3_relevance", 5) < 4:
+            feedback_parts.append("- 问题匹配度不足：回答偏离了用户问题，或过度展开了不相关的分析")
+        if score.get("d4_professionalism", 5) < 4:
+            feedback_parts.append("- 分析专业性不足：金融分析方法使用不当或行业知识有误")
+        if score.get("d5_tools", 5) < 4:
+            feedback_parts.append("- 工具使用不当：工具选择或使用策略有问题")
         if score.get("reason"):
-            feedback += f"\n总评：{score['reason']}"
+            feedback_parts.append(f"- 总体问题：{score['reason']}")
+        feedback = "\n".join(feedback_parts) if feedback_parts else "请提高整体分析质量"
 
         if regen_type == "full_trajectory" and tools is None:
             logger.warning(f"    Judge 建议 full_trajectory 但 tools 未传入，放弃")
