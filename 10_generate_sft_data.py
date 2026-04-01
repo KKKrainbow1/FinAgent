@@ -518,13 +518,18 @@ def judge_and_regen(client: OpenAI, plan: dict, seed_grouped: dict) -> dict:
     observations = extract_obs_from_steps(steps)
     answer = extract_answer_from_steps(steps)
 
+    # 记录所有轮次的 Judge 评语
+    all_judge_rounds = []
+
     # 第一次 Judge
     score = judge_single_inline(client, question, observations, answer, qtype)
     total = score.get("total", 0)
     logger.info(f"    Judge: total={total}, issues={score.get('issues', [])}")
+    all_judge_rounds.append(score)
 
     plan["judge_score"] = score
     plan["judge_passed"] = total >= JUDGE_THRESHOLD
+    plan["judge_all_rounds"] = all_judge_rounds
 
     if total >= JUDGE_THRESHOLD:
         return plan
@@ -555,9 +560,11 @@ def judge_and_regen(client: OpenAI, plan: dict, seed_grouped: dict) -> dict:
         score = judge_single_inline(client, question, observations, new_answer, qtype)
         total = score.get("total", 0)
         logger.info(f"    Re-Judge: total={total}, issues={score.get('issues', [])}")
+        all_judge_rounds.append(score)
 
         plan["judge_score"] = score
         plan["judge_passed"] = total >= JUDGE_THRESHOLD
+        plan["judge_all_rounds"] = all_judge_rounds
 
         if total >= JUDGE_THRESHOLD:
             return plan
@@ -1103,6 +1110,9 @@ def main():
     if args.resume:
         results, stats = load_checkpoint()
 
+    # 收集所有 Judge 评语（通过+未通过），用于最终根因分析
+    judge_feedback_log = []  # [{question, type, passed, score, issues, reason}, ...]
+
     start_idx = len(results)
     random.shuffle(questions)
 
@@ -1113,8 +1123,8 @@ def main():
         stats["total"] += 1
 
         if idx % 10 == 0:
-            logger.info(f"--- 进度: {idx}/{len(questions)} | 成功: {stats['success']} | "
-                        f"失败: {stats['failed_react'] + stats['failed_validation']} ---")
+            total_failed = stats['failed_react'] + stats['failed_validation'] + stats.get('failed_rule_check', 0) + stats.get('failed_judge', 0)
+            logger.info(f"--- 进度: {idx}/{len(questions)} | 成功: {stats['success']} | 失败: {total_failed} ---")
 
         try:
             # Phase 0: 预检索
@@ -1136,14 +1146,12 @@ def main():
             if not passed:
                 stats["failed_validation"] += 1
                 logger.warning(f"[{idx}] 验证失败: {validation_errors}")
-                plan["validation_errors"] = validation_errors
-                plan["validation_passed"] = False
-            else:
-                plan["validation_passed"] = True
-                plan["validation_errors"] = []
+                continue  # 验证失败直接跳过
+            plan["validation_passed"] = True
+            plan["validation_errors"] = []
 
             # Phase 2.5: 规则质检（D1-D10，零 API 成本）
-            if plan["validation_passed"]:
+            if plan["validation_passed"]:  # 验证失败已 continue，此处恒为 True
                 rule_passed, rule_issues, rule_score = rule_based_quality_check(plan)
                 plan["rule_check_score"] = rule_score
                 plan["rule_check_issues"] = [i["detail"] for i in rule_issues]
@@ -1180,8 +1188,18 @@ def main():
                 logger.info(f"    规则质检通过(score={plan['rule_check_score']})")
 
             # Phase 2.75: LLM-as-Judge + 重新生成
-            if plan["validation_passed"]:
+            if plan["validation_passed"]:  # 验证/规则质检失败已 continue，此处恒为 True
                 plan = judge_and_regen(client, plan, seed_grouped)
+                # 收集所有轮次的 Judge 评语（包括中间被驳回的）
+                for round_score in plan.get("judge_all_rounds", []):
+                    judge_feedback_log.append({
+                        "question": question,
+                        "type": qtype,
+                        "passed": round_score.get("total", 0) >= JUDGE_THRESHOLD,
+                        "total": round_score.get("total", 0),
+                        "issues": round_score.get("issues", []),
+                        "reason": round_score.get("reason", ""),
+                    })
                 if not plan.get("judge_passed", False):
                     stats["failed_judge"] = stats.get("failed_judge", 0) + 1
                     logger.warning(f"[{idx}] Judge 未通过: {plan.get('judge_score', {}).get('reason', '')}")
@@ -1253,6 +1271,78 @@ def main():
     logger.info(f"步数分布: {step_dist}")
     logger.info(f"输出路径: {FINAL_OUTPUT_PATH}")
     logger.info("=" * 60)
+
+    # ============ Judge 评语根因分析 ============
+    if judge_feedback_log:
+        # 保存原始评语日志
+        feedback_path = os.path.join(OUTPUT_DIR, "judge_feedback_log.json")
+        with open(feedback_path, 'w', encoding='utf-8') as f:
+            json.dump(judge_feedback_log, f, ensure_ascii=False, indent=2)
+        logger.info(f"Judge 评语日志已保存: {feedback_path}")
+
+        # 收集未通过的评语做根因分析
+        failed_feedbacks = [fb for fb in judge_feedback_log if not fb["passed"]]
+        if failed_feedbacks and len(failed_feedbacks) >= 3:
+            logger.info(f"正在对 {len(failed_feedbacks)} 条未通过评语做根因分析...")
+
+            # 按问题类型分组统计
+            type_issues = {}
+            for fb in failed_feedbacks:
+                t = fb["type"]
+                if t not in type_issues:
+                    type_issues[t] = []
+                for issue in fb["issues"]:
+                    type_issues[t].append(issue)
+
+            # 拼接给 LLM 做总结
+            summary_parts = []
+            for t, issues in sorted(type_issues.items()):
+                summary_parts.append(f"### {t}（{len(issues)} 个问题）")
+                for issue in issues[:10]:  # 每类最多10条
+                    summary_parts.append(f"- {issue}")
+            issues_text = "\n".join(summary_parts)
+
+            root_cause_prompt = f"""以下是 SFT 数据生成过程中 LLM-as-Judge 发现的质量问题汇总。
+请分析这些问题的根因，区分以下三类：
+
+1. **Prompt 设计问题**：生成 prompt（STEP_PROMPT / ANSWER_PROMPT）的指令不够明确，导致模型行为偏差
+2. **检索/知识库问题**：检索系统返回的数据不够或不准确，导致答案质量差
+3. **Chunk 设计问题**：chunk 的内容组织方式有缺陷，导致关键信息缺失或混淆
+
+## 未通过的问题按类型分组：
+{issues_text}
+
+请输出 JSON 格式的根因分析：
+```json
+{{"prompt_issues": ["问题1", "问题2"], "retrieval_issues": ["问题1"], "chunk_issues": ["问题1"], "summary": "一段话总结最核心的问题和建议"}}
+```"""
+
+            try:
+                response = client.chat.completions.create(
+                    model=JUDGE_MODEL,
+                    messages=[{"role": "user", "content": root_cause_prompt}],
+                    response_format={"type": "json_object"},
+                    temperature=0.3,
+                    max_tokens=1000,
+                    extra_body={"enable_thinking": False},
+                )
+                root_cause = json.loads(response.choices[0].message.content)
+
+                # 保存根因分析
+                root_cause_path = os.path.join(OUTPUT_DIR, "judge_root_cause_analysis.json")
+                with open(root_cause_path, 'w', encoding='utf-8') as f:
+                    json.dump(root_cause, f, ensure_ascii=False, indent=2)
+
+                logger.info("=" * 60)
+                logger.info("Judge 根因分析：")
+                logger.info(f"  Prompt 问题: {root_cause.get('prompt_issues', [])}")
+                logger.info(f"  检索问题: {root_cause.get('retrieval_issues', [])}")
+                logger.info(f"  Chunk 问题: {root_cause.get('chunk_issues', [])}")
+                logger.info(f"  总结: {root_cause.get('summary', '')}")
+                logger.info(f"  详细报告: {root_cause_path}")
+                logger.info("=" * 60)
+            except Exception as e:
+                logger.warning(f"根因分析调用失败: {e}")
 
 
 if __name__ == "__main__":
