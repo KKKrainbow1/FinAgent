@@ -1142,7 +1142,17 @@ def main():
     parser.add_argument("--type", type=str, default="", help="只生成指定类型")
     parser.add_argument("--resume", action="store_true", help="从断点续传")
     parser.add_argument("--seed", type=int, default=42, help="随机种子")
+    parser.add_argument("--questions", type=str, default="", help="自定义问题文件路径（默认用 QUESTIONS_PATH）")
+    parser.add_argument("--output", type=str, default="", help="自定义输出文件路径（默认用 FINAL_OUTPUT_PATH）")
     args = parser.parse_args()
+
+    # 覆盖全局路径
+    global QUESTIONS_PATH, FINAL_OUTPUT_PATH, CHECKPOINT_PATH
+    if args.questions:
+        QUESTIONS_PATH = args.questions
+    if args.output:
+        FINAL_OUTPUT_PATH = args.output
+        CHECKPOINT_PATH = args.output.replace(".jsonl", "_checkpoint.json")
 
     random.seed(args.seed)
 
@@ -1320,7 +1330,7 @@ def main():
         "timestamp": datetime.now().isoformat(),
     }
 
-    stats_path = os.path.join(OUTPUT_DIR, "generation_stats_final.json")
+    stats_path = os.path.splitext(FINAL_OUTPUT_PATH)[0] + "_stats.json"
     with open(stats_path, 'w', encoding='utf-8') as f:
         json.dump(final_stats, f, ensure_ascii=False, indent=2)
 
@@ -1342,8 +1352,9 @@ def main():
 
     # ============ Judge 评语根因分析 ============
     if judge_feedback_log:
-        # 保存原始评语日志
-        feedback_path = os.path.join(OUTPUT_DIR, "judge_feedback_log.json")
+        # 保存原始评语日志（路径跟随 --output）
+        output_base = os.path.splitext(FINAL_OUTPUT_PATH)[0]
+        feedback_path = output_base + "_judge_feedback.json"
         with open(feedback_path, 'w', encoding='utf-8') as f:
             json.dump(judge_feedback_log, f, ensure_ascii=False, indent=2)
         logger.info(f"Judge 评语日志已保存: {feedback_path}")
@@ -1396,8 +1407,8 @@ def main():
                 )
                 root_cause = json.loads(response.choices[0].message.content)
 
-                # 保存根因分析
-                root_cause_path = os.path.join(OUTPUT_DIR, "judge_root_cause_analysis.json")
+                # 保存根因分析（路径跟随 --output）
+                root_cause_path = output_base + "_root_cause.json"
                 with open(root_cause_path, 'w', encoding='utf-8') as f:
                     json.dump(root_cause, f, ensure_ascii=False, indent=2)
 
