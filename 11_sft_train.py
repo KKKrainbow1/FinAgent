@@ -106,6 +106,21 @@ def get_tools_native():
             {
                 "type": "function",
                 "function": {
+                    "name": "search_industry",
+                    "description": "检索行业对比数据，返回同行业多家公司的关键指标对比表和行业均值",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "query": {"type": "string", "description": "行业检索关键词"},
+                            "top_k": {"type": "integer", "description": "返回结果数量", "default": 3}
+                        },
+                        "required": ["query"]
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
                     "name": "calculate",
                     "description": "计算数学表达式。所有涉及数值计算的场景都必须使用此工具，禁止心算",
                     "parameters": {
