@@ -235,11 +235,26 @@ def run_agent(question: str, model, tokenizer, tools_executor, tools_schema: lis
 
         # 2. 判断是否为最终回答（无 tool_calls）
         if not tool_calls:
-            final_answer = content
+            # 分离 Thought 和 Answer：训练数据中 finish 步格式是 "Thought\n\nAnswer"
+            # 模型学到了这个模式，输出时 content 前半段是 Thought 总结，后半段是正式报告
+            raw_content = content or ""
+            if "\n\n" in raw_content:
+                parts = raw_content.split("\n\n", 1)
+                thought_part = parts[0]
+                answer_part = parts[1]
+                # 验证：如果第一段以 Observation/根据/结合/综合 开头，大概率是 Thought
+                thought_starters = ("Observation", "根据", "结合", "综合", "已获取", "基于",
+                                    "通过", "从", "上述", "以上", "目前", "当前")
+                if any(thought_part.strip().startswith(s) for s in thought_starters):
+                    final_answer = answer_part
+                else:
+                    final_answer = raw_content  # 无法确认，保留完整内容
+            else:
+                final_answer = raw_content
             finished = True
 
-            # 追加到 messages（最终 assistant 消息）
-            messages.append({"role": "assistant", "content": content or ""})
+            # 追加到 messages（保留完整 content 用于轨迹记录）
+            messages.append({"role": "assistant", "content": raw_content})
 
             if verbose:
                 print(f"[完成] Agent 输出最终回答")
