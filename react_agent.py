@@ -155,8 +155,10 @@ def parse_native_output(response: str) -> dict:
     matches = tool_call_pattern.findall(clean)
 
     for i, match in enumerate(matches):
+        # 清理嵌套的 tool_call 标签（模型过拟合时可能重复输出）
+        match_clean = match.replace("<tool_call>", "").replace("</tool_call>", "").strip()
         try:
-            tc = json.loads(match)
+            tc = json.loads(match_clean)
             tool_calls.append({
                 "id": f"call_{i}",
                 "type": "function",
@@ -165,11 +167,34 @@ def parse_native_output(response: str) -> dict:
                     "arguments": json.dumps(tc.get("arguments", {}), ensure_ascii=False),
                 }
             })
+            break  # 只取第一个成功解析的 tool_call
         except json.JSONDecodeError:
-            logger.warning(f"tool_call JSON 解析失败: {match[:200]}")
+            logger.warning(f"tool_call JSON 解析失败: {match_clean[:200]}")
+
+    # 如果正则没匹配到，尝试直接从文本中提取 JSON（兜底）
+    if not tool_calls:
+        json_pattern = re.compile(r'\{"name"\s*:\s*"(\w+)"\s*,\s*"arguments"\s*:\s*(\{[^}]+\})', re.DOTALL)
+        json_match = json_pattern.search(clean)
+        if json_match:
+            try:
+                name = json_match.group(1)
+                args = json.loads(json_match.group(2))
+                tool_calls.append({
+                    "id": "call_0",
+                    "type": "function",
+                    "function": {
+                        "name": name,
+                        "arguments": json.dumps(args, ensure_ascii=False),
+                    }
+                })
+                logger.info(f"  兜底提取 tool_call: {name}")
+            except json.JSONDecodeError:
+                pass
 
     # 提取 content（tool_call 标签之前的文本）
     content = tool_call_pattern.sub("", clean).strip()
+    # 清理残留的 tool_call JSON
+    content = re.sub(r'\{"name"\s*:.*$', '', content, flags=re.DOTALL).strip()
     if not content:
         content = None
 
@@ -227,13 +252,29 @@ def run_agent(question: str, model, tokenizer, tools_executor, tools_schema: lis
         if verbose:
             print(f"\n--- Step {step_idx + 1} ---")
 
-        # 1. 模型生成下一步
-        assistant_output = generate_next_step(model, tokenizer, messages, tools_schema)
+        # 1. 模型生成下一步（最后一步给更多 token 用于生成完整回答）
+        is_last_possible_step = (step_idx == max_steps - 1) or (step_idx >= 2)
+        max_tokens = 1500 if is_last_possible_step else 512
+        assistant_output = generate_next_step(model, tokenizer, messages, tools_schema,
+                                              max_new_tokens=max_tokens)
 
         content = assistant_output.get("content")
         tool_calls = assistant_output.get("tool_calls")
 
         # 2. 判断是否为最终回答（无 tool_calls）
+        # 防止 tool_call 解析失败时把残缺内容当成 final_answer
+        raw_text = content or ""
+        if not tool_calls and ("<tool_call>" in raw_text or '"name": "search_' in raw_text or '"name": "calculate"' in raw_text):
+            logger.warning(f"Step {step_idx+1}: 检测到 tool_call 残留但解析失败，跳过本步")
+            # 构造一个错误步骤让模型重试
+            messages.append({"role": "assistant", "content": raw_text})
+            messages.append({
+                "role": "tool",
+                "tool_call_id": f"error_{step_idx}",
+                "content": "[格式错误] 工具调用格式不正确，请重新生成。",
+            })
+            continue
+
         if not tool_calls:
             # 分离 Thought 和 Answer：训练数据中 finish 步格式是 "Thought\n\nAnswer"
             # 模型学到了这个模式，输出时 content 前半段是 Thought 总结，后半段是正式报告
@@ -268,9 +309,18 @@ def run_agent(question: str, model, tokenizer, tools_executor, tools_schema: lis
         tool_name = tc_func["name"]
         tool_call_id = tc.get("id", f"call_{step_idx}")
 
-        # 解析参数
+        # 解析参数（兜底处理双重转义和字符串类型）
         try:
             tool_arguments = json.loads(tc_func["arguments"])
+            # 双重转义兜底：json.loads 后得到 str 而非 dict，再 loads 一次
+            if isinstance(tool_arguments, str):
+                try:
+                    tool_arguments = json.loads(tool_arguments)
+                except json.JSONDecodeError:
+                    tool_arguments = {"query": tool_arguments}
+            # 最终确保是 dict
+            if not isinstance(tool_arguments, dict):
+                tool_arguments = {"query": str(tool_arguments)}
         except json.JSONDecodeError:
             tool_arguments = {"query": tc_func["arguments"]}
             logger.warning(f"tool arguments JSON 解析失败，回退为字符串: {tc_func['arguments'][:100]}")
