@@ -88,6 +88,7 @@ def load_model(model_path: str = None, use_vllm: bool = False):
                 gpu_memory_utilization=0.85,
                 max_model_len=16384,
                 trust_remote_code=True,
+                enforce_eager=True,  # 禁用 CUDA graph，避免 torch._inductor 兼容问题
             )
             # 存储 LoRA 信息供 generate 时使用
             model._finagent_lora_path = model_path
@@ -99,6 +100,7 @@ def load_model(model_path: str = None, use_vllm: bool = False):
                 gpu_memory_utilization=0.85,
                 max_model_len=16384,
                 trust_remote_code=True,
+                enforce_eager=True,
             )
             model._finagent_lora_request = None
 
