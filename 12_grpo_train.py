@@ -59,7 +59,7 @@ logger = logging.getLogger(__name__)
 DEFAULTS = {
     "model_path": "./models/Qwen2.5-14B-Instruct",
     "adapter_path": "./outputs/sft_lora_v3_native_r32/final",
-    "data_path": "./data/sft/grpo/grpo_questions.jsonl",
+    "data_path": "./data/grpo/grpo_questions.jsonl",
     "output_dir": "./outputs/grpo_v1",
 
     # GRPO 核心参数
