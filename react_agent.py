@@ -41,35 +41,80 @@ MAX_STEPS = 6
 
 # ============ 模型推理（V2 - 原生 Tool Calling） ============
 
-def load_model(model_path: str = None):
+def load_model(model_path: str = None, use_vllm: bool = False):
     """
     加载 Qwen2.5-14B-Instruct 模型（或 LoRA 微调后的版本）
 
-    现阶段用原始 Instruct 模型跑 baseline，
-    SFT 训练后替换为 LoRA adapter 即可。
-
     Args:
         model_path: 模型路径，None 则使用默认路径
+        use_vllm: 是否使用 vLLM 加速推理
 
     Returns:
-        (model, tokenizer)
+        use_vllm=False: (model, tokenizer)
+        use_vllm=True:  (vllm_model, tokenizer)  # vllm_model 是 vllm.LLM 实例
     """
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-    import torch
+    from transformers import AutoTokenizer
 
     if model_path is None:
         model_path = "./models/Qwen2.5-14B-Instruct"
 
-    logger.info(f"加载模型: {model_path}")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_path,
-        torch_dtype=torch.bfloat16,
-        device_map="auto",
-        trust_remote_code=True,
-    )
-    model.eval()
-    logger.info(f"模型加载完成，设备: {model.device}")
+    logger.info(f"加载模型: {model_path} (vLLM={'ON' if use_vllm else 'OFF'})")
+
+    # 统一检测是否为 LoRA adapter（只读一次 config）
+    import os
+    adapter_config_path = os.path.join(model_path, "adapter_config.json")
+    is_lora = os.path.exists(adapter_config_path)
+    base_model = model_path  # 默认 base_model 就是 model_path
+
+    if is_lora:
+        with open(adapter_config_path) as f:
+            adapter_cfg = json.load(f)
+        base_model = adapter_cfg.get("base_model_name_or_path", "./models/Qwen2.5-14B-Instruct")
+        logger.info(f"  LoRA adapter 检测到, base model: {base_model}")
+
+    # tokenizer 从 base model 加载（LoRA adapter 目录的 tokenizer 和 base model 一致）
+    tokenizer = AutoTokenizer.from_pretrained(base_model, trust_remote_code=True)
+
+    if use_vllm:
+        from vllm import LLM
+        from vllm.lora.request import LoRARequest
+
+        if is_lora:
+
+            model = LLM(
+                model=base_model,
+                enable_lora=True,
+                max_lora_rank=64,
+                gpu_memory_utilization=0.85,
+                max_model_len=16384,
+                trust_remote_code=True,
+            )
+            # 存储 LoRA 信息供 generate 时使用
+            model._finagent_lora_path = model_path
+            model._finagent_lora_request = LoRARequest("sft_adapter", 1, model_path)
+        else:
+            # 完整模型（baseline 或 merged）
+            model = LLM(
+                model=model_path,
+                gpu_memory_utilization=0.85,
+                max_model_len=16384,
+                trust_remote_code=True,
+            )
+            model._finagent_lora_request = None
+
+        logger.info(f"vLLM 模型加载完成")
+    else:
+        from transformers import AutoModelForCausalLM
+        import torch
+
+        model = AutoModelForCausalLM.from_pretrained(
+            model_path,
+            torch_dtype=torch.bfloat16,
+            device_map="auto",
+            trust_remote_code=True,
+        )
+        model.eval()
+        logger.info(f"HF 模型加载完成，设备: {model.device}")
 
     return model, tokenizer
 
@@ -83,20 +128,7 @@ def generate_next_step(model, tokenizer, messages: list[dict], tools: list[dict]
     1. 工具调用：content=Thought + tool_calls=Action（继续循环）
     2. 最终回答：content=分析报告，无 tool_calls（结束循环）
 
-    Args:
-        model: 语言模型
-        tokenizer: 分词器
-        messages: 当前完整的 messages 列表
-        tools: TOOLS_NATIVE 工具定义
-        max_new_tokens: 最大生成 token 数
-        temperature: 采样温度
-
-    Returns:
-        解析后的 assistant 消息 dict：
-        {
-            "content": str or None,      # Thought 或最终回答
-            "tool_calls": list or None,   # 工具调用列表
-        }
+    自动判断 model 是 HF 模型还是 vLLM 模型。
     """
     # 使用 chat_template 渲染（传入 tools 参数）
     text = tokenizer.apply_chat_template(
@@ -106,20 +138,42 @@ def generate_next_step(model, tokenizer, messages: list[dict], tools: list[dict]
         add_generation_prompt=True,
     )
 
-    inputs = tokenizer(text, return_tensors="pt").to(model.device)
+    # 判断是否为 vLLM 模型
+    is_vllm = hasattr(model, '_finagent_lora_request')
 
-    outputs = model.generate(
-        **inputs,
-        max_new_tokens=max_new_tokens,
-        temperature=temperature,
-        do_sample=temperature > 0,
-        top_p=0.9,
-        pad_token_id=tokenizer.eos_token_id,
-    )
+    if is_vllm:
+        from vllm import SamplingParams
 
-    # 只取新生成的部分
-    new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
-    response = tokenizer.decode(new_tokens, skip_special_tokens=False)
+        sampling_params = SamplingParams(
+            max_tokens=max_new_tokens,
+            temperature=temperature,
+            top_p=0.9,
+            stop=["<|im_end|>", "<|endoftext|>"],
+        )
+
+        lora_request = model._finagent_lora_request
+        outputs = model.generate(
+            [text],
+            sampling_params=sampling_params,
+            lora_request=lora_request,
+        )
+        response = outputs[0].outputs[0].text
+
+    else:
+        # HF generate
+        inputs = tokenizer(text, return_tensors="pt").to(model.device)
+
+        outputs = model.generate(
+            **inputs,
+            max_new_tokens=max_new_tokens,
+            temperature=temperature,
+            do_sample=temperature > 0,
+            top_p=0.9,
+            pad_token_id=tokenizer.eos_token_id,
+        )
+
+        new_tokens = outputs[0][inputs["input_ids"].shape[1]:]
+        response = tokenizer.decode(new_tokens, skip_special_tokens=False)
 
     # 解析模型输出
     return parse_native_output(response)
@@ -484,6 +538,8 @@ def main():
                         help="批量模式：指定测试集路径（jsonl），如 data/sft/test_questions.jsonl")
     parser.add_argument("--output", type=str, default=None,
                         help="批量模式输出路径（默认在输入文件同目录生成 _results.jsonl）")
+    parser.add_argument("--use_vllm", action="store_true",
+                        help="使用 vLLM 加速推理（需要安装 vllm）")
     args = parser.parse_args()
 
     # 1. 加载检索器
@@ -497,7 +553,7 @@ def main():
     tools_executor = FinAgentTools(retriever)
 
     # 3. 加载模型
-    model, tokenizer = load_model(args.model_path)
+    model, tokenizer = load_model(args.model_path, use_vllm=args.use_vllm)
 
     # 4. 运行
     if args.batch:
