@@ -469,6 +469,24 @@ def run_batch(input_path: str, output_path: str, model, tokenizer, tools_executo
     pending = [item for item in test_items if item["question"] not in done_questions]
     logger.info(f"测试集共 {total} 条，待运行 {len(pending)} 条")
 
+    # 判断是否为 API 模式（可并发）
+    is_api = isinstance(model, dict) and model.get('_finagent_api_mode')
+    num_workers = 4 if is_api else 1  # API 模式并发 4 条，HF 模式串行
+
+    if num_workers > 1:
+        logger.info(f"API 模式：启用 {num_workers} 并发推理")
+        _run_batch_parallel(pending, total, output_path, model, tokenizer,
+                           tools_executor, tools_schema, max_steps, num_workers)
+    else:
+        _run_batch_serial(pending, total, output_path, model, tokenizer,
+                         tools_executor, tools_schema, max_steps)
+
+    logger.info(f"批量运行完成，结果保存至 {output_path}")
+
+
+def _run_batch_serial(pending, total, output_path, model, tokenizer,
+                      tools_executor, tools_schema, max_steps):
+    """串行推理（HF generate 模式）"""
     with open(output_path, "a", encoding="utf-8") as f_out:
         for idx, item in enumerate(pending):
             question = item["question"]
@@ -480,7 +498,6 @@ def run_batch(input_path: str, output_path: str, model, tokenizer, tools_executo
             result = run_agent(question, model, tokenizer, tools_executor,
                                tools_schema, max_steps=max_steps, verbose=False)
 
-            # 写入结果
             output_record = {
                 "question": question,
                 "type": q_type,
@@ -493,14 +510,64 @@ def run_batch(input_path: str, output_path: str, model, tokenizer, tools_executo
             f_out.write(json.dumps(output_record, ensure_ascii=False) + "\n")
             f_out.flush()
 
-            # 打印摘要
             status = "OK" if result["finished"] else "TIMEOUT"
             answer_len = len(result["final_answer"]) if result["final_answer"] else 0
             tools_used = [s["tool_name"] for s in result["steps"]]
             print(f"  {status} | {result['total_steps']}步 | {result['elapsed_seconds']:.1f}s | "
                   f"答案{answer_len}字 | 工具: {tools_used}")
 
-    logger.info(f"批量运行完成，结果保存至 {output_path}")
+
+def _run_batch_parallel(pending, total, output_path, model, tokenizer,
+                        tools_executor, tools_schema, max_steps, num_workers):
+    """并发推理（API 模式，多条问题同时走各自的 ReAct 循环）"""
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    import threading
+
+    write_lock = threading.Lock()
+    completed_count = [total - len(pending)]  # 用 list 方便在闭包中修改
+
+    def _process_one(item):
+        question = item["question"]
+        q_type = item.get("type", "unknown")
+
+        # 每个线程需要独立的 tools_executor（检索器是线程安全的，共享即可）
+        result = run_agent(question, model, tokenizer, tools_executor,
+                           tools_schema, max_steps=max_steps, verbose=False)
+
+        output_record = {
+            "question": question,
+            "type": q_type,
+            "steps": result["steps"],
+            "final_answer": result["final_answer"],
+            "finished": result["finished"],
+            "total_steps": result["total_steps"],
+            "elapsed_seconds": round(result["elapsed_seconds"], 1),
+        }
+        return output_record
+
+    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+        futures = {executor.submit(_process_one, item): item for item in pending}
+
+        with open(output_path, "a", encoding="utf-8") as f_out:
+            for future in as_completed(futures):
+                item = futures[future]
+                try:
+                    record = future.result()
+                    with write_lock:
+                        f_out.write(json.dumps(record, ensure_ascii=False) + "\n")
+                        f_out.flush()
+                        completed_count[0] += 1
+
+                    status = "OK" if record["finished"] else "TIMEOUT"
+                    answer_len = len(record["final_answer"]) if record["final_answer"] else 0
+                    tools_used = [s["tool_name"] for s in record["steps"]]
+                    print(f"  [{completed_count[0]}/{total}] {status} | "
+                          f"{record['total_steps']}步 | {record['elapsed_seconds']:.1f}s | "
+                          f"答案{answer_len}字 | 工具: {tools_used} | {item['question'][:30]}...")
+                except Exception as e:
+                    logger.error(f"推理失败: {item['question'][:50]}... | {e}")
+                    with write_lock:
+                        completed_count[0] += 1
 
 
 # ============ 主函数 ============
