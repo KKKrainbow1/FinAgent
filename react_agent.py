@@ -471,7 +471,7 @@ def run_batch(input_path: str, output_path: str, model, tokenizer, tools_executo
 
     # 判断是否为 API 模式（可并发）
     is_api = isinstance(model, dict) and model.get('_finagent_api_mode')
-    num_workers = 4 if is_api else 1  # API 模式并发 4 条，HF 模式串行
+    num_workers = 8 if is_api else 1  # API 模式并发 8 条，HF 模式串行
 
     if num_workers > 1:
         logger.info(f"API 模式：启用 {num_workers} 并发推理")
