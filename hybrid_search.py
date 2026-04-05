@@ -103,6 +103,9 @@ class FinAgentRetriever:
         # 5. 预计算 source_type → 下标集合（避免每次检索都遍历）
         self._build_source_type_index()
 
+        # 6. 预计算行业名 → chunk 下标的精确映射
+        self._build_industry_index()
+
         logger.info("检索索引加载完成")
 
     def _build_source_type_index(self):
@@ -116,6 +119,130 @@ class FinAgentRetriever:
 
         for st, ids in self._source_type_ids.items():
             logger.info(f"  source_type '{st}': {len(ids)} 条")
+
+    # 东财细分行业 → 大类映射（复制自 04_build_chunks.py 的 INDUSTRY_MAP）
+    # ⚠️ 如果 04_build_chunks.py 的 INDUSTRY_MAP 有更新，这里必须同步修改
+    # 不直接 import 是因为两个文件的使用场景不同（build_chunks 只在数据构建时跑）
+    _INDUSTRY_MAP = {
+        "银行": ["银行", "银行Ⅱ"],
+        "保险": ["保险", "保险Ⅱ"],
+        "证券": ["证券", "证券Ⅱ", "券商信托", "多元金融"],
+        "白酒": ["白酒Ⅱ", "酿酒行业", "非白酒"],
+        "食品饮料": ["食品饮料", "饮料乳品", "食品加工", "调味发酵品Ⅱ"],
+        "医药": ["化学制药", "中药Ⅱ", "中药", "生物制品", "医药制造", "医药商业", "医疗行业"],
+        "医疗": ["医疗器械", "医疗服务", "医疗美容"],
+        "汽车": ["乘用车", "商用车", "汽车整车", "汽车行业", "汽车零部件"],
+        "半导体": ["半导体"],
+        "消费电子": ["消费电子", "元件", "光学光电子", "电子元件", "电子信息"],
+        "光伏": ["光伏设备"],
+        "电池": ["电池", "能源金属"],
+        "电力": ["电力", "电力行业", "电网设备"],
+        "煤炭": ["煤炭开采", "煤炭行业", "煤炭采选"],
+        "钢铁": ["普钢", "特钢Ⅱ", "钢铁行业"],
+        "有色金属": ["工业金属", "小金属", "贵金属", "有色金属", "金属制品"],
+        "化工": ["化学制品", "化学原料", "化工行业", "化纤行业", "化肥行业", "农化制品"],
+        "房地产": ["房地产", "房地产开发"],
+        "建筑建材": ["基础建设", "工程建设", "房屋建设Ⅱ", "专业工程", "水泥", "水泥建材",
+                    "装修建材", "玻璃玻纤", "玻璃陶瓷"],
+        "家电": ["白色家电", "小家电", "家电行业", "家电零部件Ⅱ"],
+        "软件": ["软件开发", "软件服务", "IT服务Ⅱ", "计算机设备"],
+        "通信": ["通信设备", "通信服务", "通讯行业", "电信运营"],
+        "传媒": ["数字媒体", "广告营销", "影视院线", "文化传媒"],
+        "交通运输": ["航空机场", "民航机场", "航运港口", "铁路公路", "物流", "物流行业", "交运物流"],
+        "军工": ["航天装备Ⅱ", "航空装备Ⅱ", "航海装备Ⅱ", "军工电子Ⅱ", "船舶制造",
+                "航天航空", "交运设备"],
+        "机械": ["工程机械", "自动化设备", "机械行业", "轨交设备Ⅱ", "仪器仪表"],
+        "农业": ["养殖业", "农产品加工", "农牧饲渔", "饲料"],
+        "石油石化": ["油服工程", "油气开采Ⅱ", "炼化及贸易", "石油行业", "燃气", "燃气Ⅱ"],
+        "纺织服装": ["纺织制造", "纺织服装"],
+        "零售": ["一般零售", "旅游零售Ⅱ", "家居用品"],
+        "安防": ["安防设备"],
+        "其他电源设备Ⅱ": [],  # 东财没有细分，只有大类自身
+    }
+
+    # 模型口语化别名（东财没有，但模型实际会搜的说法）
+    # 基于 100 条推理结果中 84 次 search_industry 的实际 query 验证
+    _EXTRA_ALIASES = {
+        "白酒": ["白酒", "酒类", "高端白酒"],
+        "银行": ["银行", "商业银行", "金融"],
+        "保险": ["保险", "寿险", "财险"],
+        "证券": ["证券", "券商", "投行"],
+        "半导体": ["半导体", "芯片", "半导体设备", "半导体显示", "集成电路", "IC"],
+        "消费电子": ["消费电子", "面板", "显示", "PCB", "模组", "电子元器件",
+                    "电子制造", "电子行业", "面板显示器件"],
+        "光伏": ["光伏", "太阳能", "硅片", "组件"],
+        "电池": ["电池", "锂电池", "储能", "动力电池", "锂电材料"],
+        "汽车": ["汽车", "新能源汽车", "新能源车", "整车"],
+        "医药": ["医药", "生物医药", "创新药", "制药", "疫苗"],
+        "医疗": ["医疗", "CXO", "体外诊断"],
+        "家电": ["家电", "白电", "空调"],
+        "化工": ["化工", "精细化工", "化纤", "钛白粉"],
+        "煤炭": ["煤炭", "动力煤", "焦煤"],
+        "钢铁": ["钢铁", "特钢", "螺纹钢"],
+        "有色金属": ["有色金属", "铜", "铝", "黄金", "矿业", "黄金采选"],
+        "电力": ["电力", "火电", "水电", "核电", "新能源发电", "新能源行业"],
+        "军工": ["军工", "国防", "航天", "军工电子", "航空装备"],
+        "机械": ["机械", "机器人", "自动化", "工控"],
+        "房地产": ["房地产", "地产", "房企", "楼市"],
+        "建筑建材": ["建筑建材", "建筑", "建材", "水泥", "玻璃"],
+        "食品饮料": ["食品饮料", "食品", "饮料", "乳制品", "调味品", "食品加工"],
+        "软件": ["软件", "IT", "信息技术", "云计算", "SaaS", "计算机", "计算机硬件"],
+        "通信": ["通信", "5G", "光通信", "运营商"],
+        "交通运输": ["交通运输", "物流", "航运", "航空运输", "铁路", "高速公路",
+                    "快递", "货运", "铁路运输"],
+        "传媒": ["传媒", "广告", "游戏", "影视"],
+        "农业": ["农业", "养殖", "种植", "饲料", "畜牧"],
+        "石油石化": ["石油石化", "石油", "石化", "天然气", "油气", "石油化工", "炼化"],
+        "零售": ["零售", "商超", "电商"],
+        "其他电源设备Ⅱ": ["其他电源设备", "电源设备", "电力设备", "发电设备", "电气设备"],
+    }
+
+    def _build_industry_index(self):
+        """
+        预计算行业名 → chunk 下标的精确映射。
+
+        别名来源分两层：
+        1. 东财 INDUSTRY_MAP 的反向映射（130 个细分行业名，官方分类）
+        2. _EXTRA_ALIASES 的口语化别名（基于模型实际 query 验证）
+        3. 标准大类名自身（"银行"→"银行"）
+
+        以后 INDUSTRY_MAP 加了新行业，这里自动跟上。
+        """
+        import re
+        self._industry_name_to_idx = {}   # 标准行业名 → chunk 下标
+        self._alias_to_industry = {}       # 别名 → 标准行业名
+
+        # Step 1: 从 chunk 文本提取标准行业名
+        industry_ids = self._source_type_ids.get("industry", set())
+        for idx in industry_ids:
+            text = self.texts[idx]
+            match = re.match(r'(\S+?)行业对比', text)
+            if match:
+                name = match.group(1)
+                self._industry_name_to_idx[name] = idx
+
+        # Step 2: 从 INDUSTRY_MAP 构建反向映射（东财细分 → 大类）
+        for standard_name, sub_industries in self._INDUSTRY_MAP.items():
+            if standard_name in self._industry_name_to_idx:
+                # 标准大类名自身
+                self._alias_to_industry[standard_name] = standard_name
+                # 东财细分行业名
+                for sub in sub_industries:
+                    # 去掉Ⅱ后缀也作为别名（模型不会打Ⅱ）
+                    self._alias_to_industry[sub] = standard_name
+                    clean = sub.replace("Ⅱ", "").strip()
+                    if clean and clean != sub:
+                        self._alias_to_industry[clean] = standard_name
+
+        # Step 3: 合并口语化别名（不覆盖已有的东财映射）
+        for standard_name, aliases in self._EXTRA_ALIASES.items():
+            if standard_name in self._industry_name_to_idx:
+                for alias in aliases:
+                    if alias not in self._alias_to_industry:
+                        self._alias_to_industry[alias] = standard_name
+
+        logger.info(f"  行业索引: {len(self._industry_name_to_idx)} 个行业, "
+                    f"{len(self._alias_to_industry)} 个别名")
 
     # ================================================================
     #  核心检索方法：供 tools.py 调用
@@ -146,21 +273,61 @@ class FinAgentRetriever:
         """
         检索行业汇总数据
 
-        策略：混合检索（BM25 权重高 alpha=0.4）
-        范围：只返回 source_type == "industry" 的 chunk
+        策略：行业名精确匹配（不走 FAISS/BM25 混合检索）
 
-        为什么 BM25 权重更高？
-        行业 chunk 是结构化的行业名+指标表，BM25 能精确匹配行业名关键词。
+        为什么不用混合检索？
+        行业 chunk 只有 30 条，所有 chunk 都包含相同的指标关键词（ROE、净利率等），
+        BM25 在这 30 条中区分度极差（实测 50% 的查询返回"农业"而非目标行业）。
+        30 条数据不需要向量检索，直接按行业名精确匹配即可。
+
+        匹配逻辑：
+        1. 从 query 中提取行业关键词
+        2. 通过别名映射找到标准行业名
+        3. 直接返回对应的行业 chunk
+        4. 匹配不上则返回空（不返回错误行业）
         """
-        valid_ids = self._source_type_ids.get("industry", set())
-        if not valid_ids:
+        if not self._industry_name_to_idx:
             return []
-        results = self._hybrid_search(
-            query,
-            valid_ids=valid_ids,
-            alpha=0.4,        # BM25 权重高，精确匹配行业名
-            top_k=top_k,
-        )
+
+        # 从 query 中匹配行业名（优先匹配最长的别名，避免"石油石化"被"石油"截断）
+        matched_industries = []
+        sorted_aliases = sorted(self._alias_to_industry.keys(), key=len, reverse=True)
+        for alias in sorted_aliases:
+            if alias in query:
+                standard_name = self._alias_to_industry[alias]
+                if standard_name not in matched_industries:
+                    matched_industries.append(standard_name)
+                if len(matched_industries) >= top_k:
+                    break
+
+        # 如果没有匹配到任何行业，尝试直接匹配标准行业名
+        if not matched_industries:
+            for name in self._industry_name_to_idx:
+                if name in query:
+                    matched_industries.append(name)
+
+        # 构建返回结果
+        results = []
+        for name in matched_industries[:top_k]:
+            idx = self._industry_name_to_idx[name]
+            results.append({
+                "text": self.texts[idx],
+                "metadata": self.metadatas[idx],
+                "score": 1.0,
+            })
+
+        if not results:
+            logger.warning(f"search_industry 未匹配到行业: query='{query}'")
+            available = "、".join(sorted(self._industry_name_to_idx.keys()))
+            return [{
+                "text": (
+                    f"未找到匹配的行业数据。请在 query 中使用以下标准行业名之一：{available}。"
+                    f"例如：search_industry(query='半导体 ROE 盈利能力')。"
+                ),
+                "metadata": {"source_type": "industry", "match_failed": True},
+                "score": 0.0,
+            }]
+
         return results
 
     def search_report(self, query: str, top_k: int = 5) -> list[dict]:
