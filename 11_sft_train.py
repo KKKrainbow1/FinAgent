@@ -207,11 +207,12 @@ class SFTDataset(Dataset):
 
         # 1. 渲染完整序列
         try:
-            # 不传 tools 参数：避免每条数据重复注入 ~1000 token 的工具定义
-            # 模型从数据中的 <tool_call>/<tool_response> 模式学会工具调用
-            # 推理时由 react_agent.py 传入 tools 参数自动注入工具定义
+            # 传入 tools 参数：让 chat_template 注入工具定义（<tools>...</tools>）
+            # 确保训练和推理的输入格式一致，避免模型对 </tool_call> 停止符不稳定
+            # 每条数据多 ~1000 token，但 RTX PRO 6000 96GB 显存足够
             full_text = self.tokenizer.apply_chat_template(
                 messages,
+                tools=self.tools_native,
                 tokenize=False,
                 add_generation_prompt=False,
             )
