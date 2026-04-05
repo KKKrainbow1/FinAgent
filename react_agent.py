@@ -240,7 +240,7 @@ def parse_native_output(response: str) -> dict:
 # ============ ReAct 主循环（V2） ============
 
 def run_agent(question: str, model, tokenizer, tools_executor, tools_schema: list[dict],
-              max_steps: int = MAX_STEPS, verbose: bool = True) -> dict:
+              max_steps: int = MAX_STEPS, verbose: bool = True, temperature: float = 0.1) -> dict:
     """
     运行 ReAct Agent 主循环（V2 - 原生 Tool Calling）
 
@@ -289,7 +289,7 @@ def run_agent(question: str, model, tokenizer, tools_executor, tools_schema: lis
         is_last_possible_step = (step_idx == max_steps - 1) or (step_idx >= 2)
         max_tokens = 1500 if is_last_possible_step else 512
         assistant_output = generate_next_step(model, tokenizer, messages, tools_schema,
-                                              max_new_tokens=max_tokens)
+                                              max_new_tokens=max_tokens, temperature=temperature)
 
         content = assistant_output.get("content")
         tool_calls = assistant_output.get("tool_calls")
