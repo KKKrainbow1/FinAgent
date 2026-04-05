@@ -126,6 +126,13 @@ def generate_next_step(model, tokenizer, messages: list[dict], tools: list[dict]
                     "arguments": tc.function.arguments,
                 }
             } for tc in msg.tool_calls]
+
+        # 兜底：如果 server 没解析出 tool_calls 但 content 中有 <tool_call>，
+        # 用 parse_native_output 从 content 中提取
+        if not result["tool_calls"] and msg.content and "<tool_call>" in msg.content:
+            logger.info("  API 返回 tool_calls 为空但 content 含 <tool_call>，用 parse_native_output 兜底")
+            result = parse_native_output(msg.content)
+
         return result
 
     else:
