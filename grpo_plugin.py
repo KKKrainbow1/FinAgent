@@ -401,7 +401,7 @@ def finagent_reward(completions, environments=None, **kwargs) -> list[float]:
     合并所有 reward 逻辑为一个函数，确保：
     - 格式不合规直接返回 -1.0（不被权重稀释）
     - DAPO overlong penalty 直接从总分扣除
-    - completeness 和 calc_behavior 按 0.6:0.3 加权
+    - completeness 和 calc_behavior 按 0.667:0.333 加权（2:1 比例）
 
     用法：
         trainer = GRPOTrainer(
@@ -676,6 +676,7 @@ def _call_completeness_llm(question: str, question_type: str, tool_steps: list) 
             messages=[{"role": "user", "content": prompt}],
             max_tokens=100,
             temperature=0.1,
+            extra_body={"enable_thinking": False},
         )
         result = response.choices[0].message.content.strip()
         return _parse_completeness_score(result)
@@ -691,6 +692,9 @@ def _parse_completeness_score(result: str) -> float:
 
     V2 输出格式："分数：X\n理由：XXX"
     """
+    # Strip qwen3 thinking tags
+    result = re.sub(r'<think>.*?</think>', '', result, flags=re.DOTALL).strip()
+
     # 优先：匹配 V2 格式 "分数：X" 或 "分数:X"
     match = re.search(r'分数\s*[:：]\s*([1-5])', result)
     if match:
