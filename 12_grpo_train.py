@@ -280,8 +280,8 @@ def main():
     # ---- 跳过 TRL 的 response schema 自动检测 ----
     # TRL v1.0 不认识 Qwen2.5 的 chat template，但 environment_factory
     # 模式下 tool calling 通过环境类处理，不依赖 response schema
-    import trl.chat_template_utils
-    trl.chat_template_utils.add_response_schema = lambda x: x
+    import trl.trainer.grpo_trainer
+    trl.trainer.grpo_trainer.add_response_schema = lambda x: x
 
     # ---- 配置 GRPO ----
     grpo_config = GRPOConfig(
