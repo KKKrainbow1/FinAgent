@@ -277,9 +277,12 @@ def main():
     # ---- 导入 reward 和环境 ----
     from grpo_plugin import FinAgentEnv, finagent_reward
 
-    # ---- 跳过 TRL 的 response schema 自动检测 ----
-    # TRL v1.0 不认识 Qwen2.5 的 chat template，但 environment_factory
-    # 模式下 tool calling 通过环境类处理，不依赖 response schema
+    # ---- 手动设置 Qwen2.5 的 response_schema ----
+    # TRL v1.0 的 environment_factory 只自动识别 Qwen3/3.5 的 chat template。
+    # 但 Qwen2.5 和 Qwen3 用相同的 <tool_call> XML 格式���可以复用 qwen3_schema。
+    # 同时 monkey-patch add_response_schema 防止它覆盖我们手动设置的值。
+    from trl.chat_template_utils import qwen3_schema
+    tokenizer.response_schema = qwen3_schema
     import trl.trainer.grpo_trainer
     trl.trainer.grpo_trainer.add_response_schema = lambda x: x
 
@@ -291,6 +294,7 @@ def main():
         num_generations=args.num_generations,
         temperature=args.temperature,
         max_completion_length=args.max_completion_length,
+        max_tool_calling_iterations=6,  # ReAct 最多 6 轮工具调用（和推理时一致）
         beta=args.beta,
 
         # 训练
