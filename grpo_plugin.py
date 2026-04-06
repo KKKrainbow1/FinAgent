@@ -422,6 +422,9 @@ def finagent_reward(completions, environments=None, **kwargs) -> list[float]:
     if environments is None:
         environments = kwargs.get("environments", kwargs.get("envs", []))
 
+    # TRL environment_factory 模式下 completions 可能是 list[list[dict]]
+    completions = [_completion_to_str(c) for c in completions]
+
     rewards = []
     # 收集需要调 LLM 的任务
     llm_tasks = {}  # idx -> (question, question_type, tool_steps)
@@ -543,6 +546,24 @@ def _apply_overlong_penalty(base_reward: float, length: int) -> float:
 
 
 # ============ 辅助函数 ============
+
+def _completion_to_str(completion) -> str:
+    """将 completion 转为字符串。
+    TRL environment_factory 模式下 completion 可能是 list[dict]（消息列表），
+    而非普通字符串。统一转为字符串供后续处理。
+    """
+    if isinstance(completion, str):
+        return completion
+    if isinstance(completion, list):
+        parts = []
+        for msg in completion:
+            if isinstance(msg, dict):
+                parts.append(msg.get("content", ""))
+            else:
+                parts.append(str(msg))
+        return "\n".join(parts)
+    return str(completion)
+
 
 def _extract_final_answer(completion: str) -> str:
     """
