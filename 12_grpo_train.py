@@ -161,7 +161,7 @@ def load_model_and_tokenizer(model_path: str, adapter_path: str):
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
         torch_dtype=torch.bfloat16,
-        device_map="auto",
+        device_map={"": 0},  # 单卡 96GB 不需要 auto 分片
         trust_remote_code=True,
     )
 
