@@ -61,28 +61,216 @@ MENTAL_MATH_PATTERNS = [
     re.compile(r'[\d.]+\s*[+]\s*[\d.]+\s*[=≈]\s*[\d.]+'),          # 加法 A+B=C
 ]
 
-# 各问题类型的预期工具调用描述（用于 completeness prompt）
-TYPE_EXPECTATIONS = {
-    "financial_query": "通常只需 1 次 search_financial 查询目标指标即可。",
-    "single_company_simple": "通常需要 1 次 search_report 查询研报观点。",
-    "single_company_medium": (
-        "通常需要搜索财务数据（盈利+偿债+运营指标）和研报评价，"
-        "如涉及杜邦分析或数值对比则应调用 calculate。"
-    ),
-    "company_comparison": (
-        "通常需要分别搜索两家公司的财务数据进行对比，"
-        "如涉及数值差异计算应调用 calculate。"
-    ),
-    "risk_analysis": (
-        "通常需要搜索财务数据（偿债+盈利指标）和研报中的风险分析，"
-        "可能需要行业对比数据。"
-    ),
-    "industry_analysis": (
-        "通常需要搜索行业对比数据（search_industry）和个股财务数据，"
-        "可能需要研报中的行业分析观点。"
-    ),
-    "reject": "应识别出问题超出数据库能力范围，不需要或只需少量工具调用即可拒绝。",
+# V2 Checklist：按问题类型的评分标准（替代 V1 的 TYPE_EXPECTATIONS）
+TYPE_CHECKLISTS = {
+    "financial_query": """该类型（财务数据查询）评分标准：
+- 基础分 3 分：调用了 search_financial 查询目标指标
+- +1 分：query 中包含了具体指标名称（如 ROE、净利率）和年份
+- +1 分：query 中包含了公司全称（而非简称或模糊描述）
+- 封顶 5 分
+注意：这是简单查询，1 次 search_financial 即可满足。不应因为没有调用 search_report 或 search_industry 而扣分。""",
+
+    "single_company_simple": """该类型（单公司简单问题）评分标准：
+- 基础分 3 分：调用了 search_report 查询研报观点
+- +1 分：query 精准（包含公司名 + 问题相关关键词）
+- +1 分：同时搜索了 search_financial 补充数据支撑
+- 封顶 5 分
+注意：这是简单问题，1-2 次工具调用即可。不应因为没有调用 calculate 或 search_industry 而扣分。""",
+
+    "single_company_medium": """该类型（单公司中等分析）评分标准：
+- 基础分 1 分：至少调用了一个工具
+- +1 分：调用了 search_financial，query 包含与问题相关的具体指标类别（盈利能力 → ROE/净利率/毛利率；偿债能力 → 资产负债率/流动比率；全面评估 → 至少覆盖两个维度）
+- +1 分：调用了 search_report 获取券商研报观点，或调用了 search_industry 获取行业对比数据（单公司指标与行业均值对比才有分析意义）
+- +1 分：如果问题涉及杜邦分析（ROE 拆解为净利率×周转率×权益乘数）、增长率计算或数值对比，调用了 calculate（如果问题不涉及计算，此项自动满足）
+- +1 分：query 精准（包含具体指标名称、年份、公司全称，而非模糊描述）
+- 封顶 5 分
+注意：不是所有 medium 问题都需要所有工具。请根据具体问题判断哪些条件适用。""",
+
+    "company_comparison": """该类型（公司对比）评分标准：
+- 基础分 1 分：至少调用了一个工具
+- +1 分：搜索了第一家公司的相关数据（search_financial 或 search_report）
+- +1 分：搜索了第二家公司的相关数据（search_financial 或 search_report）
+- +1 分：如果问题涉及数值差异对比，调用了 calculate；或调用了 search_industry 获取行业基准作为对比参照（满足其一即可）
+- +1 分：query 精准且两家公司搜索的指标一致（便于横向对比）
+- 封顶 5 分
+关键：对比类问题必须搜索所有涉及的公司。只搜了一家公司最高 3 分。""",
+
+    "risk_analysis": """该类型（风险分析）评分标准：
+- 基础分 1 分：至少调用了一个工具
+- +1 分：调用了 search_financial 搜索了杠杆/偿债指标（资产负债率、流动比率、速动比率）或盈利指标（ROE、净利率）
+- +1 分：调用了 search_report 获取研报中的风险分析或信用评级观点
+- +1 分：调用了 search_industry 获取行业对比数据，以便判断公司指标是否偏离行业正常水平
+- +1 分：query 精准，偿债搜索包含杠杆指标名称，盈利搜索包含利润指标名称（而非泛泛的"风险"或"财务"）
+- 封顶 5 分""",
+
+    "industry_analysis": """该类型（行业分析）评分标准：
+- 基础分 1 分：至少调用了一个工具
+- +1 分：调用了 search_industry 搜索行业对比数据（行业全景：多家公司的指标排名和均值）
+- +1 分：调用了 search_financial 搜索了具体代表性个股的财务数据（补充行业数据中缺失的细节）
+- +1 分：调用了 search_report 获取行业相关研报观点或行业前景分析
+- +1 分：query 覆盖了问题涉及的核心行业名称和具体指标（如 ROE、净利率、毛利率，而非泛泛的"盈利"）
+- 封顶 5 分""",
+
+    "reject": """该类型（应拒绝的问题）评分标准：
+- 5 分：识别出问题超出数据库能力范围，工具调用 ≤ 1 次后即拒绝
+- 4 分：进行了 1-2 次工具调用后识别出无法回答，合理拒绝
+- 3 分：进行了 3 次以上工具调用才拒绝，浪费了检索资源
+- 2 分：没有拒绝，强行回答了一个超出范围的问题
+- 1 分：大量无效工具调用，且强行回答
+注意：对于 reject 类问题，"少搜"是对的，"多搜"反而扣分。这与其他类型相反。""",
 }
+
+# V2 Few-shot Examples（嵌入 prompt）
+FEW_SHOT_EXAMPLES = {
+    "single_company_medium": """【示例 A】5 分
+问题：全面评估贵州茅台的盈利能力
+工具调用序列：
+  Step 1: search_financial(query="贵州茅台 ROE 净利率 总资产周转率 权益乘数 2024")
+  Step 2: search_industry(query="白酒行业 ROE 净利率 对比")
+  Step 3: search_report(query="贵州茅台 盈利能力 投资评级")
+  Step 4: calculate(query="29.9 / 100 * 0.61 * 5.48")
+理由：搜索了财务数据含杜邦三因子（+1），行业对比提供分析上下文（+1），涉及杜邦拆解调用了 calculate 验证 ROE = 净利率 × 周转率 × 权益乘数（+1），query 精准包含具体指标和年份（+1），基础分 1，合计 5 分。
+
+【示例 B】2 分
+问题：分析格力电器的盈利能力
+工具调用序列：
+  Step 1: search_financial(query="格力电器")
+理由：搜索了财务数据（+1），但 query 无具体指标名和年份（+0）、没搜研报或行业对比（+0）、涉及盈利分析但没调 calculate（+0），基础分 1，合计 2 分。""",
+
+    "company_comparison": """【示例 A】5 分
+问题：宁德时代和比亚迪的盈利能力谁更强？
+工具调用序列：
+  Step 1: search_financial(query="宁德时代 ROE 净利率 毛利率 2024")
+  Step 2: search_financial(query="比亚迪 ROE 净利率 毛利率 2024")
+  Step 3: search_industry(query="新能源行业 ROE 净利率 对比")
+  Step 4: calculate(query="20.5 - 15.3")
+理由：两家公司都搜了且指标一致（+1, +1），调用了 calculate 算差值并有行业基准参照（+1），query 精准且指标一致（+1），基础分 1，合计 5 分。
+
+【示例 B】2 分
+问题：宁德时代和比亚迪的盈利能力谁更强？
+工具调用序列：
+  Step 1: search_financial(query="宁德时代 ROE 2024")
+理由：只搜了宁德时代（+1），没搜比亚迪（+0），无法对比。基础分 1，合计 2 分。""",
+
+    "financial_query": """【示例 A】5 分
+问题：贵州茅台的 ROE 是多少？
+工具调用序列：
+  Step 1: search_financial(query="贵州茅台 ROE 2024")
+理由：调用了 search_financial（基础 3 分），query 包含具体指标和年份（+1），包含公司全称（+1），合计 5 分。
+
+【示例 B】3 分
+问题：贵州茅台的 ROE 是多少？
+工具调用序列：
+  Step 1: search_financial(query="茅台 盈利")
+理由：调用了 search_financial（基础 3 分），但 query 用了简称且没指定 ROE 和年份（+0, +0），合计 3 分。""",
+
+    "industry_analysis": """【示例 A】5 分
+问题：光伏行业主要公司的盈利能力如何？
+工具调用序列：
+  Step 1: search_industry(query="光伏行业 ROE 净利率 毛利率 对比")
+  Step 2: search_financial(query="隆基绿能 ROE 净利率 毛利率 2024")
+  Step 3: search_financial(query="通威股份 ROE 净利率 2024")
+  Step 4: search_report(query="光伏行业 盈利能力 前景 2024")
+理由：调用了 search_industry 获取行业全景（+1），search_financial 搜了多家代表性个股补充细节（+1），search_report 获取行业研报（+1），query 覆盖了核心行业名称和具体指标名（+1），基础分 1，合计 5 分。
+
+【示例 B】2 分
+问题：白酒行业的盈利能力排名如何？
+工具调用序列：
+  Step 1: search_financial(query="贵州茅台 ROE 2024")
+理由：只搜了单个公司的财务数据（+1），没有调用 search_industry 获取行业全景（+0）、没搜研报（+0）、query 只覆盖了一家公司（+0），基础分 1，合计 2 分。""",
+
+    "risk_analysis": """【示例 A】5 分
+问题：分析中国平安的财务风险
+工具调用序列：
+  Step 1: search_financial(query="中国平安 资产负债率 流动比率 速动比率 2024")
+  Step 2: search_financial(query="中国平安 ROE 净利率 2024")
+  Step 3: search_report(query="中国平安 风险分析 信用评级")
+  Step 4: search_industry(query="保险行业 资产负债率 ROE 对比")
+理由：分层搜索偿债指标和盈利指标（+1），研报风险分析和信用评级（+1），行业对比判断指标是否偏离正常水平（+1），query 精准含杠杆指标名和利润指标名（+1），基础分 1，合计 5 分。
+
+【示例 B】2 分
+问题：评估万科的债务风险
+工具调用序列：
+  Step 1: search_financial(query="万科")
+理由：搜索了财务数据（+1），但 query 太模糊无杠杆指标名（+0）、没搜研报风险分析（+0）、没搜行业对比（+0），基础分 1，合计 2 分。""",
+
+    "reject": """【示例 A】5 分
+问题：分析特斯拉 2024 年在中国市场的表现
+工具调用序列：
+  Step 1: search_report(query="特斯拉 中国市场")
+  → Agent 识别出检索结果不相关，拒绝回答
+理由：1 次工具调用后识别出超出范围并拒绝，符合预期。5 分。
+
+【示例 B】2 分
+问题：分析苹果公司的财务状况
+工具调用序列：
+  Step 1: search_financial(query="苹果 财务")
+  Step 2: search_report(query="苹果 评级")
+  Step 3: search_industry(query="消费电子 对比")
+  → Agent 用搜到的不相关数据强行生成了答案
+理由：大量无效搜索且没有拒绝，强行回答了超出范围的问题。2 分。""",
+}
+
+# 默认 few-shot（用于没有专属示例的类型）
+DEFAULT_FEW_SHOT = """【示例 A】高分轨迹
+- 搜索覆盖了问题涉及的核心信息维度
+- query 精准，包含公司全称、具体指标、年份
+- 需要计算时调用了 calculate
+
+【示例 B】低分轨迹
+- 只搜了部分信息，关键维度缺失
+- query 模糊，缺少具体指标或年份
+- 需要计算但没调用 calculate"""
+
+# Completeness Prompt 模板（V2）
+COMPLETENESS_PROMPT_TEMPLATE = """你是一位金融分析 Agent 的工具调用评审专家。你需要评估：对于给定的问题，Agent 的工具调用序列是否收集了足够的信息来回答问题。
+
+你只评价"搜了什么"，不评价"搜到的内容好不好"或"最终答案写得好不好"。
+
+## 任务信息
+
+问题：{question}
+问题类型：{question_type}
+
+## Agent 的工具调用序列
+
+{formatted_steps}
+
+## 可用工具
+
+| 工具 | 功能 | 示例 query |
+|------|------|----------|
+| search_financial | 搜索公司财务数据（ROE、净利率、资产负债率、周转率等） | "贵州茅台 ROE 净利率 2024" |
+| search_report | 搜索券商研报（评级、目标价、EPS预测、深度分析） | "宁德时代 投资评级 目标价" |
+| search_industry | 搜索行业对比数据（同行业公司指标排名和均值） | "白酒行业 ROE 净利率 对比" |
+| calculate | 数学计算（杜邦拆解、增长率计算、差值对比等） | "36.99 / 100 * 0.6 * 2.1" |
+
+## 金融分析参考框架
+
+好的工具调用策略通常遵循以下原则：
+- 盈利能力分析应搜索 ROE、净利率、毛利率等指标，涉及 ROE 拆解时应调用 calculate（杜邦分析：ROE = 净利率 × 总资产周转率 × 权益乘数）
+- 风险/偿债分析应搜索资产负债率、流动比率等杠杆指标，与盈利指标分开搜索更精准
+- 单公司指标应与行业均值对比才有分析意义（search_industry）
+- 对比分析应为两家公司搜索一致的指标，便于横向对比
+- 数值对比、增长率计算（如同比增长率 = (本期-上期)/上期）、比率计算应使用 calculate，不应心算
+
+## 该类型问题的评分标准
+
+{type_checklist}
+
+## 评分示例
+
+{few_shot_examples}
+
+## 输出要求
+
+逐项检查上述评分标准，统计满足的条件数，然后输出：
+1. 分数（1-5）
+2. 一句话理由（说明满足了哪些条件、缺少了什么）
+
+格式：
+分数：X
+理由：XXX"""
 
 VALID_TOOLS = {"search_financial", "search_report", "search_industry", "calculate"}
 
@@ -449,40 +637,29 @@ def _extract_question_and_type(idx: int, kwargs: dict) -> tuple:
 def _call_completeness_llm(question: str, question_type: str, tool_steps: list) -> float:
     """
     调用 LLM 评估工具调用完整性，返回 0-1 的归一化分数。
+    V2：checklist 化评分 + few-shot examples + 按类型拆分标准。
     只传 tool name + query，不传 observation（Planner-focused）。
     """
-    expectation = TYPE_EXPECTATIONS.get(question_type, "")
+    # 格式化工具调用序列
+    if not tool_steps:
+        formatted_steps = "  （无工具调用）"
+    else:
+        formatted_steps = "\n".join(
+            f"  Step {i+1}: {s['tool']}(query=\"{s['query']}\")"
+            for i, s in enumerate(tool_steps)
+        )
 
-    steps_text = "\n".join(
-        f"  Step {i+1}: {s['tool']}(query=\"{s['query']}\")"
-        for i, s in enumerate(tool_steps)
+    # 获取该类型的 checklist 和 few-shot
+    type_checklist = TYPE_CHECKLISTS.get(question_type, TYPE_CHECKLISTS["single_company_medium"])
+    few_shot = FEW_SHOT_EXAMPLES.get(question_type, DEFAULT_FEW_SHOT)
+
+    prompt = COMPLETENESS_PROMPT_TEMPLATE.format(
+        question=question,
+        question_type=question_type,
+        formatted_steps=formatted_steps,
+        type_checklist=type_checklist,
+        few_shot_examples=few_shot,
     )
-
-    prompt = f"""评估以下工具调用序列对于回答问题的完整性。
-
-问题：{question}
-问题类型：{question_type}
-该类型的一般预期：{expectation}
-
-工具调用序列：
-{steps_text}
-
-可用工具说明：
-- search_financial：搜索公司财务数据（ROE、净利率、资产负债率、周转率等）
-- search_report：搜索券商研报（评级、目标价、EPS预测、深度分析）
-- search_industry：搜索行业对比数据（同行业公司指标排名和均值）
-- calculate：数学计算（杜邦拆解、增长率计算、差值对比等）
-
-评分标准（1-5分）：
-- 5分：覆盖了回答问题所需的所有关键信息维度，搜索 query 精准
-- 4分：覆盖了大部分关键维度，有少量可优化空间
-- 3分：覆盖了部分关键维度，有明显遗漏但基本可用
-- 2分：关键维度缺失较多，难以充分回答问题
-- 1分：几乎没有有效的工具调用，或调用与问题无关
-
-特别注意：如果问题涉及数值对比、增长率计算、杜邦分析等需要数学运算的场景，检查是否调用了 calculate 工具。未调用 calculate 而需要计算的，至少扣 1 分。
-
-只输出一个数字（1-5）和一句话理由。"""
 
     try:
         global _llm_client
@@ -512,14 +689,19 @@ def _parse_completeness_score(result: str) -> float:
     """
     从 LLM 输出中解析 1-5 分，归一化到 0-1。
 
-    优先匹配 "X分" / "评分X" 模式，避免误匹配文本中的数字。
+    V2 输出格式："分数：X\n理由：XXX"
     """
-    # 优先：匹配 "X分" 模式
+    # 优先：匹配 V2 格式 "分数：X" 或 "分数:X"
+    match = re.search(r'分数\s*[:：]\s*([1-5])', result)
+    if match:
+        return (int(match.group(1)) - 1) / 4
+
+    # 其次：匹配 "X分" 模式
     match = re.search(r'([1-5])\s*分', result)
     if match:
         return (int(match.group(1)) - 1) / 4
 
-    # 其次：匹配 "评分X" / "给X" / "打X" 模式
+    # 再次：匹配 "评分X" / "给X" / "打X" 模式
     match = re.search(r'(?:评分|给|打|得)\s*[:：]?\s*([1-5])', result)
     if match:
         return (int(match.group(1)) - 1) / 4
