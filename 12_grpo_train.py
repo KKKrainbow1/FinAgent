@@ -44,7 +44,7 @@ from collections import defaultdict
 
 import torch
 from datasets import Dataset
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TrainerCallback
 from peft import PeftModel
 
 logging.basicConfig(
@@ -58,7 +58,7 @@ logger = logging.getLogger(__name__)
 
 DEFAULTS = {
     "model_path": "./models/Qwen2.5-14B-Instruct",
-    "adapter_path": "./outputs/sft_lora_v3_native_r32/final",
+    "adapter_path": "./outputs/sft_lora_v3_native_r32_v3/final",
     "data_path": "./data/grpo/grpo_questions.jsonl",
     "output_dir": "./outputs/grpo_v1",
 
@@ -191,12 +191,14 @@ def load_model_and_tokenizer(model_path: str, adapter_path: str):
 
 # ============ 训练回调 ============
 
-class GRPOMetricsCallback:
+class GRPOMetricsCallback(TrainerCallback):
     """
     自定义回调：定期输出 grpo_plugin 的监控指标。
+    继承 TrainerCallback 以被 Trainer 正确调用。
     """
 
     def __init__(self, log_interval: int = 10):
+        super().__init__()
         self.log_interval = log_interval
         self.step_count = 0
 
@@ -349,6 +351,7 @@ def main():
         reward_funcs=[finagent_reward],
         environment_factory=FinAgentEnv,
         args=grpo_config,
+        callbacks=[GRPOMetricsCallback()],
     )
 
     # ---- 开始训练 ----
