@@ -160,7 +160,7 @@ def load_model_and_tokenizer(model_path: str, adapter_path: str):
     logger.info(f"加载 base model: {model_path}")
     model = AutoModelForCausalLM.from_pretrained(
         model_path,
-        torch_dtype=torch.bfloat16,
+        dtype=torch.bfloat16,
         device_map={"": 0},  # 单卡 96GB 不需要 auto 分片
         trust_remote_code=True,
     )
@@ -293,14 +293,14 @@ def main():
         gradient_accumulation_steps=args.grad_accum,
         num_train_epochs=args.epochs,
         max_grad_norm=args.max_grad_norm,
-        warmup_ratio=args.warmup_ratio,
+        warmup_steps=int(args.warmup_ratio * 123),  # 492问×2epoch/8grad_accum≈123步
 
         # 监控
         logging_steps=args.logging_steps,
         save_steps=args.save_steps,
         report_to="tensorboard",
         log_completions=True,
-        logging_dir=os.path.join(args.output_dir, "logs"),
+        # logging_dir 通过环境变量 TENSORBOARD_LOGGING_DIR 设置
 
         # 其他
         bf16=True,
