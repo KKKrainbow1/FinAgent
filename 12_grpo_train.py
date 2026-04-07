@@ -255,6 +255,8 @@ def main():
     # 其他
     parser.add_argument("--max_prompt_reuse", type=int, default=DEFAULTS["max_prompt_reuse"])
     parser.add_argument("--dry-run", action="store_true", help="只加载模型和数据，不训练")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="从指定 checkpoint 恢复训练，如 ./outputs/grpo_v1/checkpoint-250")
 
     args = parser.parse_args()
 
@@ -279,12 +281,49 @@ def main():
 
     # ---- 手动设置 Qwen2.5 的 response_schema ----
     # TRL v1.0 的 environment_factory 只自动识别 Qwen3/3.5 的 chat template。
-    # 但 Qwen2.5 和 Qwen3 用相同的 <tool_call> XML 格式���可以复用 qwen3_schema。
+    # 但 Qwen2.5 和 Qwen3 用相同的 <tool_call> XML 格式，可以复用 qwen3_schema。
     # 同时 monkey-patch add_response_schema 防止它覆盖我们手动设置的值。
     from trl.chat_template_utils import qwen3_schema
     tokenizer.response_schema = qwen3_schema
     import trl.trainer.grpo_trainer
     trl.trainer.grpo_trainer.add_response_schema = lambda x: x
+
+    # ---- parse_response 超时保护 ----
+    # qwen3_schema 的正则在某些 Qwen2.5 长输出上会触发灾难性回溯，导致 re.search 死循环。
+    # 用 signal.alarm 包一层 10 秒超时，超时返回空 dict（等同于"无 tool_calls"）。
+    import signal
+    import functools
+    import trl.chat_template_utils
+
+    _original_parse_response = trl.chat_template_utils.parse_response
+
+    def _timeout_handler(signum, frame):
+        raise TimeoutError("parse_response regex timeout")
+
+    @functools.wraps(_original_parse_response)
+    def _safe_parse_response(tokenizer_obj, ids):
+        # signal.alarm 只在主线程可用，子线程调用会抛 ValueError
+        # 如果不是主线程，直接调用原函数（退化为无超时保护，但至少不崩）
+        try:
+            old_handler = signal.signal(signal.SIGALRM, _timeout_handler)
+            signal.alarm(10)  # 10 秒超时
+        except ValueError:
+            return _original_parse_response(tokenizer_obj, ids)
+
+        try:
+            return _original_parse_response(tokenizer_obj, ids)
+        except TimeoutError:
+            logger.warning(f"parse_response 超时，返回空 dict (ids len={len(ids) if ids else 0})")
+            return {}
+        finally:
+            try:
+                signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
+            except Exception:
+                pass
+
+    trl.chat_template_utils.parse_response = _safe_parse_response
+    trl.trainer.grpo_trainer.parse_response = _safe_parse_response
 
     # ---- 配置 GRPO ----
     grpo_config = GRPOConfig(
@@ -369,7 +408,11 @@ def main():
     logger.info("开始 GRPO 训练")
     logger.info("=" * 60)
 
-    trainer.train()
+    if args.resume:
+        logger.info(f"从 checkpoint 恢复: {args.resume}")
+        trainer.train(resume_from_checkpoint=args.resume)
+    else:
+        trainer.train()
 
     # ---- 保存最终模型 ----
     final_dir = os.path.join(args.output_dir, "final")
