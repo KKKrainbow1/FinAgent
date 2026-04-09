@@ -553,28 +553,30 @@ def _strategy_industry(tools_used: list) -> float:
 def _strategy_financial_query(queries: List[str]) -> float:
     """financial_query：query 包含公司名+指标名"""
     from reward_knowledge_base import query_has_company_name, query_has_metric
+    best = 0.1
     for q in queries:
         has_company = query_has_company_name(q)
         has_metric = query_has_metric(q)
         if has_company and has_metric:
-            return 0.8
+            return 0.8  # 最高分，early exit
         elif has_company or has_metric:
-            return 0.4
-    return 0.1
+            best = max(best, 0.4)
+    return best
 
 
 def _strategy_simple(queries: List[str]) -> float:
     """single_company_simple：query 包含公司名+关键词"""
     from reward_knowledge_base import extract_company_name
     report_keywords = ["评级", "目标价", "前景", "投资", "研报", "推荐", "买入", "增持"]
+    best = 0.1
     for q in queries:
         has_company = bool(extract_company_name(q))
         has_keyword = any(kw in q for kw in report_keywords)
         if has_company and has_keyword:
-            return 0.8
+            return 0.8  # 最高分，early exit
         elif has_company:
-            return 0.4
-    return 0.1
+            best = max(best, 0.4)
+    return best
 
 
 # ============ Reject 特殊处理 ============
