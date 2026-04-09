@@ -1,33 +1,29 @@
 """
-GRPO Plugin: FinAgent 工具调用环境 + Reward 函数（V2 重写）
+GRPO Plugin: FinAgent 工具调用环境 + Reward 函数
 
 用于 TRL GRPOTrainer 的 environment_factory 和 reward_funcs。
-基于 GRPO Reward Design V5（Planner-focused）。
 
-V2 重写要点（基于 unsloth-buddy review）：
-  1. 合并为单个 reward 函数，格式检查/overlong penalty 不再被权重稀释
-  2. completeness LLM 调用改为并行（ThreadPoolExecutor）
-  3. 工具调用加 try-except 防训练中断
-  4. 共享资源加线程锁
-  5. 分数解析更鲁棒
-  6. FinAgentEnv.__init__ 接受 **kwargs 兼容 TRL
+V4.1 Reward（基于 V3 训练失败的根因分析 + Review 修正）：
+  - 从"LLM-as-Judge 为主"转向"多维度细粒度规则 reward 为主 + 可选轻量 LLM 补充"
+  - 4 个规则维度：tool_coverage + query_quality + calc_behavior + strategy_match
+  - 可选第 5 维度：LLM 二元判断（合理/不合理）作为 anti-hacking 安全网
+  - 继承 V3 的硬约束：格式检查 + 重复 query 惩罚 + DAPO overlong penalty
 
-设计原则：
-  - Reward 评价工具调用策略（Planner），不评价答案质量（Summarizer）
-  - completeness（LLM 判断工具调用序列完整性）+ calc_behavior（规则检测 calculate 使用）
-  - 参考论文：RLTR（EMNLP 2025）、ToolRL（NeurIPS 2025）、DAPO
+设计文档：docs/FinAgent_Reward_V4.1_Design.md
+知识库：reward_knowledge_base.py
 
 依赖：
   - hybrid_search.py（FinAgentRetriever）
   - tools.py（FinAgentTools, TOOLS_NATIVE）
-  - qwen3-max API（completeness 评估）
+  - reward_knowledge_base.py（指标映射、工具需求配置等）
+  - qwen3-max API（维度 5 LLM 二元判断，可选）
 """
 
 import re
 import os
 import logging
 import threading
-from typing import Optional
+from typing import Optional, List, Dict, Set
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
@@ -35,246 +31,45 @@ logger = logging.getLogger(__name__)
 
 # ============ 配置 ============
 
-# completeness LLM 配置
-COMPLETENESS_MODEL = os.environ.get("COMPLETENESS_MODEL", "qwen3-max")
-COMPLETENESS_API_KEY = os.environ.get("COMPLETENESS_API_KEY", "")
-COMPLETENESS_BASE_URL = os.environ.get(
-    "COMPLETENESS_BASE_URL",
+# LLM 二元判断配置（维度 5，可选）
+USE_LLM = os.environ.get("REWARD_USE_LLM", "0") == "1"
+LLM_MODEL = os.environ.get("REWARD_LLM_MODEL", "qwen3-max")
+LLM_API_KEY = os.environ.get("REWARD_LLM_API_KEY",
+                             os.environ.get("COMPLETENESS_API_KEY", ""))
+LLM_BASE_URL = os.environ.get(
+    "REWARD_LLM_BASE_URL",
     "https://dashscope.aliyuncs.com/compatible-mode/v1",
 )
-COMPLETENESS_MAX_WORKERS = int(os.environ.get("COMPLETENESS_MAX_WORKERS", "8"))
+LLM_MAX_WORKERS = int(os.environ.get("REWARD_LLM_MAX_WORKERS", "8"))
 
-# DAPO overlong penalty 参数（基于 sft_v3_r32 推理统计）
-OVERLONG_L_MAX = 8192      # P90 ≈ 8800 token，正常轨迹不惩罚
-OVERLONG_L_CLIP = 12288    # 最长 ≈ 11800 token + 余量
-OVERLONG_C = 0.5           # 最大惩罚幅度
+# DAPO overlong penalty 参数
+OVERLONG_L_MAX = 8192
+OVERLONG_L_CLIP = 12288
+OVERLONG_C = 0.5
 
-# 格式不合规惩罚（Phase 2b 验证：>98% 合规用 -1.0，<95% 改为 -0.5）
+# 格式不合规惩罚
 FORMAT_INVALID_PENALTY = -1.0
 
-# 心算检测正则（检查 Answer，不检查 Thought）
-MENTAL_MATH_PATTERNS = [
-    re.compile(r'[\d.]+%?\s*[×*]\s*[\d.]+%?\s*[×*]\s*[\d.]+'),    # 杜邦三因子乘法
-    re.compile(r'1\s*/\s*[\d.]+%?\s*[=≈]\s*[\d.]+'),               # 权益乘数 1/X%≈Y
-    re.compile(r'[\d.]+\s*[-−]\s*[\d.]+\s*[=≈]\s*[\d.]+'),         # 差值 A-B=C
-    re.compile(r'[\d.]+\s*[/÷]\s*[\d.]+\s*[=≈]\s*[\d.]+'),         # 除法 A/B=C
-    re.compile(r'[\d.]+\s*[+]\s*[\d.]+\s*[=≈]\s*[\d.]+'),          # 加法 A+B=C
-]
+# 重复 query 惩罚阈值（V4.1 从 V3 的 0.7 放松到 0.85）
+REPEAT_QUERY_THRESHOLD = 0.85
 
-# V2 Checklist：按问题类型的评分标准（替代 V1 的 TYPE_EXPECTATIONS）
-TYPE_CHECKLISTS = {
-    "financial_query": """该类型（财务数据查询）评分标准：
-- 基础分 3 分：调用了 search_financial 查询目标指标
-- +1 分：query 中包含了具体指标名称（如 ROE、净利率）和年份
-- +1 分：query 中包含了公司全称（而非简称或模糊描述）
-- 封顶 5 分
-注意：这是简单查询，1 次 search_financial 即可满足。不应因为没有调用 search_report 或 search_industry 而扣分。""",
-
-    "single_company_simple": """该类型（单公司简单问题）评分标准：
-- 基础分 3 分：调用了 search_report 查询研报观点
-- +1 分：query 精准（包含公司名 + 问题相关关键词）
-- +1 分：同时搜索了 search_financial 补充数据支撑
-- 封顶 5 分
-注意：这是简单问题，1-2 次工具调用即可。不应因为没有调用 calculate 或 search_industry 而扣分。""",
-
-    "single_company_medium": """该类型（单公司中等分析）评分标准：
-- 基础分 1 分：至少调用了一个工具
-- +1 分：调用了 search_financial，query 包含与问题相关的具体指标类别（盈利能力 → ROE/净利率/毛利率；偿债能力 → 资产负债率/流动比率；全面评估 → 至少覆盖两个维度）
-- +1 分：调用了 search_report 获取券商研报观点，或调用了 search_industry 获取行业对比数据（单公司指标与行业均值对比才有分析意义）
-- +1 分：如果问题涉及杜邦分析（ROE 拆解为净利率×周转率×权益乘数）、增长率计算或数值对比，调用了 calculate（如果问题不涉及计算，此项自动满足）
-- +1 分：query 精准（包含具体指标名称、年份、公司全称，而非模糊描述）
-- 封顶 5 分
-注意：不是所有 medium 问题都需要所有工具。请根据具体问题判断哪些条件适用。""",
-
-    "company_comparison": """该类型（公司对比）评分标准：
-- 基础分 1 分：至少调用了一个工具
-- +1 分：搜索了第一家公司的相关数据（search_financial 或 search_report）
-- +1 分：搜索了第二家公司的相关数据（search_financial 或 search_report）
-- +1 分：如果问题涉及数值差异对比，调用了 calculate；或调用了 search_industry 获取行业基准作为对比参照（满足其一即可）
-- +1 分：query 精准且两家公司搜索的指标一致（便于横向对比）
-- 封顶 5 分
-关键：对比类问题必须搜索所有涉及的公司。只搜了一家公司最高 3 分。""",
-
-    "risk_analysis": """该类型（风险分析）评分标准：
-- 基础分 1 分：至少调用了一个工具
-- +1 分：调用了 search_financial 搜索了杠杆/偿债指标（资产负债率、流动比率、速动比率）或盈利指标（ROE、净利率）
-- +1 分：调用了 search_report 获取研报中的风险分析或信用评级观点
-- +1 分：调用了 search_industry 获取行业对比数据，以便判断公司指标是否偏离行业正常水平
-- +1 分：query 精准，偿债搜索包含杠杆指标名称，盈利搜索包含利润指标名称（而非泛泛的"风险"或"财务"）
-- 封顶 5 分""",
-
-    "industry_analysis": """该类型（行业分析）评分标准：
-- 基础分 1 分：至少调用了一个工具
-- +1 分：调用了 search_industry 搜索行业对比数据（行业全景：多家公司的指标排名和均值）
-- +1 分：调用了 search_financial 搜索了具体代表性个股的财务数据（补充行业数据中缺失的细节）
-- +1 分：调用了 search_report 获取行业相关研报观点或行业前景分析
-- +1 分：query 覆盖了问题涉及的核心行业名称和具体指标（如 ROE、净利率、毛利率，而非泛泛的"盈利"）
-- 封顶 5 分""",
-
-    "reject": """该类型（应拒绝的问题）评分标准：
-- 5 分：识别出问题超出数据库能力范围，工具调用 ≤ 1 次后即拒绝
-- 4 分：进行了 1-2 次工具调用后识别出无法回答，合理拒绝
-- 3 分：进行了 3 次以上工具调用才拒绝，浪费了检索资源
-- 2 分：没有拒绝，强行回答了一个超出范围的问题
-- 1 分：大量无效工具调用，且强行回答
-注意：对于 reject 类问题，"少搜"是对的，"多搜"反而扣分。这与其他类型相反。""",
-}
-
-# V2 Few-shot Examples（嵌入 prompt）
-FEW_SHOT_EXAMPLES = {
-    "single_company_medium": """【示例 A】5 分
-问题：全面评估贵州茅台的盈利能力
-工具调用序列：
-  Step 1: search_financial(query="贵州茅台 ROE 净利率 总资产周转率 权益乘数 2024")
-  Step 2: search_industry(query="白酒行业 ROE 净利率 对比")
-  Step 3: search_report(query="贵州茅台 盈利能力 投资评级")
-  Step 4: calculate(query="29.9 / 100 * 0.61 * 5.48")
-理由：搜索了财务数据含杜邦三因子（+1），行业对比提供分析上下文（+1），涉及杜邦拆解调用了 calculate 验证 ROE = 净利率 × 周转率 × 权益乘数（+1），query 精准包含具体指标和年份（+1），基础分 1，合计 5 分。
-
-【示例 B】2 分
-问题：分析格力电器的盈利能力
-工具调用序列：
-  Step 1: search_financial(query="格力电器")
-理由：搜索了财务数据（+1），但 query 无具体指标名和年份（+0）、没搜研报或行业对比（+0）、涉及盈利分析但没调 calculate（+0），基础分 1，合计 2 分。""",
-
-    "company_comparison": """【示例 A】5 分
-问题：宁德时代和比亚迪的盈利能力谁更强？
-工具调用序列：
-  Step 1: search_financial(query="宁德时代 ROE 净利率 毛利率 2024")
-  Step 2: search_financial(query="比亚迪 ROE 净利率 毛利率 2024")
-  Step 3: search_industry(query="新能源行业 ROE 净利率 对比")
-  Step 4: calculate(query="20.5 - 15.3")
-理由：两家公司都搜了且指标一致（+1, +1），调用了 calculate 算差值并有行业基准参照（+1），query 精准且指标一致（+1），基础分 1，合计 5 分。
-
-【示例 B】2 分
-问题：宁德时代和比亚迪的盈利能力谁更强？
-工具调用序列：
-  Step 1: search_financial(query="宁德时代 ROE 2024")
-理由：只搜了宁德时代（+1），没搜比亚迪（+0），无法对比。基础分 1，合计 2 分。""",
-
-    "financial_query": """【示例 A】5 分
-问题：贵州茅台的 ROE 是多少？
-工具调用序列：
-  Step 1: search_financial(query="贵州茅台 ROE 2024")
-理由：调用了 search_financial（基础 3 分），query 包含具体指标和年份（+1），包含公司全称（+1），合计 5 分。
-
-【示例 B】3 分
-问题：贵州茅台的 ROE 是多少？
-工具调用序列：
-  Step 1: search_financial(query="茅台 盈利")
-理由：调用了 search_financial（基础 3 分），但 query 用了简称且没指定 ROE 和年份（+0, +0），合计 3 分。""",
-
-    "industry_analysis": """【示例 A】5 分
-问题：光伏行业主要公司的盈利能力如何？
-工具调用序列：
-  Step 1: search_industry(query="光伏行业 ROE 净利率 毛利率 对比")
-  Step 2: search_financial(query="隆基绿能 ROE 净利率 毛利率 2024")
-  Step 3: search_financial(query="通威股份 ROE 净利率 2024")
-  Step 4: search_report(query="光伏行业 盈利能力 前景 2024")
-理由：调用了 search_industry 获取行业全景（+1），search_financial 搜了多家代表性个股补充细节（+1），search_report 获取行业研报（+1），query 覆盖了核心行业名称和具体指标名（+1），基础分 1，合计 5 分。
-
-【示例 B】2 分
-问题：白酒行业的盈利能力排名如何？
-工具调用序列：
-  Step 1: search_financial(query="贵州茅台 ROE 2024")
-理由：只搜了单个公司的财务数据（+1），没有调用 search_industry 获取行业全景（+0）、没搜研报（+0）、query 只覆盖了一家公司（+0），基础分 1，合计 2 分。""",
-
-    "risk_analysis": """【示例 A】5 分
-问题：分析中国平安的财务风险
-工具调用序列：
-  Step 1: search_financial(query="中国平安 资产负债率 流动比率 速动比率 2024")
-  Step 2: search_financial(query="中国平安 ROE 净利率 2024")
-  Step 3: search_report(query="中国平安 风险分析 信用评级")
-  Step 4: search_industry(query="保险行业 资产负债率 ROE 对比")
-理由：分层搜索偿债指标和盈利指标（+1），研报风险分析和信用评级（+1），行业对比判断指标是否偏离正常水平（+1），query 精准含杠杆指标名和利润指标名（+1），基础分 1，合计 5 分。
-
-【示例 B】2 分
-问题：评估万科的债务风险
-工具调用序列：
-  Step 1: search_financial(query="万科")
-理由：搜索了财务数据（+1），但 query 太模糊无杠杆指标名（+0）、没搜研报风险分析（+0）、没搜行业对比（+0），基础分 1，合计 2 分。""",
-
-    "reject": """【示例 A】5 分
-问题：分析特斯拉 2024 年在中国市场的表现
-工具调用序列：
-  Step 1: search_report(query="特斯拉 中国市场")
-  → Agent 识别出检索结果不相关，拒绝回答
-理由：1 次工具调用后识别出超出范围并拒绝，符合预期。5 分。
-
-【示例 B】2 分
-问题：分析苹果公司的财务状况
-工具调用序列：
-  Step 1: search_financial(query="苹果 财务")
-  Step 2: search_report(query="苹果 评级")
-  Step 3: search_industry(query="消费电子 对比")
-  → Agent 用搜到的不相关数据强行生成了答案
-理由：大量无效搜索且没有拒绝，强行回答了超出范围的问题。2 分。""",
-}
-
-# 默认 few-shot（用于没有专属示例的类型）
-DEFAULT_FEW_SHOT = """【示例 A】高分轨迹
-- 搜索覆盖了问题涉及的核心信息维度
-- query 精准，包含公司全称、具体指标、年份
-- 需要计算时调用了 calculate
-
-【示例 B】低分轨迹
-- 只搜了部分信息，关键维度缺失
-- query 模糊，缺少具体指标或年份
-- 需要计算但没调用 calculate"""
-
-# Completeness Prompt 模板（V2）
-COMPLETENESS_PROMPT_TEMPLATE = """你是一位金融分析 Agent 的工具调用评审专家。你需要评估：对于给定的问题，Agent 的工具调用序列是否收集了足够的信息来回答问题。
-
-你只评价"搜了什么"，不评价"搜到的内容好不好"或"最终答案写得好不好"。
-
-## 任务信息
-
-问题：{question}
-问题类型：{question_type}
-
-## Agent 的工具调用序列
-
-{formatted_steps}
-
-## 可用工具
-
-| 工具 | 功能 | 示例 query |
-|------|------|----------|
-| search_financial | 搜索公司财务数据（ROE、净利率、资产负债率、周转率等） | "贵州茅台 ROE 净利率 2024" |
-| search_report | 搜索券商研报（评级、目标价、EPS预测、深度分析） | "宁德时代 投资评级 目标价" |
-| search_industry | 搜索行业对比数据（同行业公司指标排名和均值） | "白酒行业 ROE 净利率 对比" |
-| calculate | 数学计算（杜邦拆解、增长率计算、差值对比等） | "36.99 / 100 * 0.6 * 2.1" |
-
-## 金融分析参考框架
-
-好的工具调用策略通常遵循以下原则：
-- 盈利能力分析应搜索 ROE、净利率、毛利率等指标，涉及 ROE 拆解时应调用 calculate（杜邦分析：ROE = 净利率 × 总资产周转率 × 权益乘数）
-- 风险/偿债分析应搜索资产负债率、流动比率等杠杆指标，与盈利指标分开搜索更精准
-- 单公司指标应与行业均值对比才有分析意义（search_industry）
-- 对比分析应为两家公司搜索一致的指标，便于横向对比
-- 数值对比、增长率计算（如同比增长率 = (本期-上期)/上期）、比率计算应使用 calculate，不应心算
-
-## 该类型问题的评分标准
-
-{type_checklist}
-
-## 评分示例
-
-{few_shot_examples}
-
-## 输出要求
-
-逐项检查上述评分标准，统计满足的条件数，然后输出：
-1. 分数（1-5）
-2. 一句话理由（说明满足了哪些条件、缺少了什么）
-
-格式：
-分数：X
-理由：XXX"""
+# Reward 权重（根据 USE_LLM 切换）
+if USE_LLM:
+    W_TOOL_COVERAGE = 0.30
+    W_QUERY_QUALITY = 0.20
+    W_CALC_BEHAVIOR = 0.15
+    W_STRATEGY_MATCH = 0.15
+    W_LLM_JUDGE = 0.20
+else:
+    W_TOOL_COVERAGE = 0.35
+    W_QUERY_QUALITY = 0.25
+    W_CALC_BEHAVIOR = 0.20
+    W_STRATEGY_MATCH = 0.20
+    W_LLM_JUDGE = 0.0
 
 VALID_TOOLS = {"search_financial", "search_report", "search_industry", "calculate"}
 
-# LLM client（延迟初始化，模块级共享）
+# LLM client（延迟初始化）
 _llm_client = None
 _llm_client_lock = threading.Lock()
 
@@ -392,33 +187,35 @@ class FinAgentEnv:
             return f"计算失败：{str(e)}"
 
 
-# ============ 统一 Reward 函数 ============
+# ============ V4.1 统一 Reward 函数 ============
 
-def finagent_reward(completions, environments=None, **kwargs) -> list[float]:
+def finagent_reward(completions, environments=None, **kwargs) -> list:
     """
-    FinAgent GRPO 统一 reward 函数。
+    FinAgent GRPO V4.1 统一 reward 函数。
 
-    合并所有 reward 逻辑为一个函数，确保：
-    - 格式不合规直接返回 -1.0（不被权重稀释）
-    - DAPO overlong penalty 直接从总分扣除
-    - completeness 和 calc_behavior 按 0.667:0.333 加权（2:1 比例）
+    4 个规则维度 + 可选 LLM 二元判断：
+      0.30/0.35 × tool_coverage    — 工具覆盖完整性
+      0.20/0.25 × query_quality    — query 质量
+      0.15/0.20 × calc_behavior    — 计算行为合理性
+      0.15/0.20 × strategy_match   — 搜索策略匹配度
+      0.20/0.00 × llm_judge        — LLM 二元判断（可选）
 
-    用法：
-        trainer = GRPOTrainer(
-            reward_funcs=[finagent_reward],
-            reward_weights=[1.0],
-            environment_factory=FinAgentEnv,
-            ...
-        )
+    + 格式检查（前置 -1.0）+ 重复 query 惩罚 + DAPO overlong penalty
 
     Args:
-        completions: list[str]，每条轨迹的完整生成文本
-        environments: list[FinAgentEnv]，TRL 通过 kwargs 传入的环境实例列表
-        **kwargs: 包含数据集字段（question, type 等）
-
-    Returns:
-        list[float]，每条轨迹的 reward
+        completions: list，每条轨迹的完整生成（可能是 str 或 list[dict]）
+        environments: list[FinAgentEnv]
+        **kwargs: 包含 question, type 等数据集字段
     """
+    from reward_knowledge_base import (
+        TOOL_REQUIREMENTS, check_needs_calc, extract_dimensions,
+        is_comprehensive, compute_tool_coverage, compute_single_query_score,
+        detect_mental_calc, count_unique_companies,
+        extract_metrics_from_queries, get_dimensions_from_metrics,
+        compute_metric_dimension_match, apply_anti_hacking_penalty,
+        is_reject_response,
+    )
+
     if environments is None:
         environments = kwargs.get("environments", kwargs.get("envs", []))
 
@@ -426,103 +223,487 @@ def finagent_reward(completions, environments=None, **kwargs) -> list[float]:
     completions = [_completion_to_str(c) for c in completions]
 
     rewards = []
-    # 收集需要调 LLM 的任务
     llm_tasks = {}  # idx -> (question, question_type, tool_steps)
 
     for idx, (env, completion) in enumerate(zip(environments, completions)):
-        # ---- Step 1: 格式合规前置检查 ----
-        if not _is_format_valid(completion):
+        question, question_type = _extract_question_and_type(idx, kwargs)
+
+        # ---- Step 0: 前置硬约束 ----
+        if not _is_format_valid(env, completion, question_type):
             rewards.append(FORMAT_INVALID_PENALTY)
             continue
 
-        # 先占位，后面填入真实值
+        # ---- Step 0.5: reject 类型特殊处理 ----
+        if question_type == "reject":
+            answer = _extract_final_answer(completion)
+            reward = _compute_reject_reward(env, answer)
+            rewards.append(reward)
+            continue
+
+        # 占位，后面填真实值
         rewards.append(None)
 
-        # 收集 LLM 任务
+        # 收集 LLM 任务（如果启用）
+        if USE_LLM:
+            llm_tasks[idx] = (question, question_type, env.tool_steps)
+
+    # ---- LLM 二元判断（并行，仅当 USE_LLM=1 时）----
+    llm_scores = {}
+    if USE_LLM and llm_tasks:
+        llm_scores = _batch_llm_binary_judge(llm_tasks)
+
+    # ---- 计算每条轨迹的 V4.1 reward ----
+    for idx, (env, completion) in enumerate(zip(environments, completions)):
+        if rewards[idx] is not None:
+            continue  # 已经处理过（格式不合规 或 reject）
+
         question, question_type = _extract_question_and_type(idx, kwargs)
-        llm_tasks[idx] = (question, question_type, env.tool_steps)
-
-    # ---- Step 2: 并行调用 completeness LLM ----
-    completeness_scores = {}
-    with ThreadPoolExecutor(max_workers=COMPLETENESS_MAX_WORKERS) as executor:
-        futures = {}
-        for idx, (question, question_type, tool_steps) in llm_tasks.items():
-            if not tool_steps:
-                completeness_scores[idx] = 0.0
-                continue
-            future = executor.submit(
-                _call_completeness_llm, question, question_type, tool_steps
-            )
-            futures[future] = idx
-
-        for future in as_completed(futures):
-            idx = futures[future]
-            try:
-                completeness_scores[idx] = future.result()
-            except Exception as e:
-                logger.error(f"completeness LLM 异常 (idx={idx}): {e}")
-                completeness_scores[idx] = 0.5
-                with _metrics_lock:
-                    _metrics["completeness_llm_failures"] += 1
-
-    # ---- Step 3: 计算每条轨迹的最终 reward ----
-    for idx in llm_tasks:
-        env = environments[idx]
-        completion = completions[idx]
         answer = _extract_final_answer(completion)
+        queries = [s["query"] for s in env.tool_steps]
+        needs_calc = check_needs_calc(question, answer)
+        dimensions = extract_dimensions(question)
+        type_config = TOOL_REQUIREMENTS.get(question_type,
+                                            TOOL_REQUIREMENTS.get("single_company_medium"))
 
-        # completeness（权重 0.60）
-        comp = completeness_scores.get(idx, 0.5)
+        # ---- 维度 1: tool_coverage (0.30/0.35) ----
+        tool_cov = compute_tool_coverage(type_config, env.tool_steps, queries, needs_calc)
 
-        # calc_behavior（权重 0.30）
-        calc = _calc_behavior(env, answer)
+        # ---- 维度 2: query_quality (0.20/0.25) ----
+        query_qual = _compute_query_quality(env.tool_steps, dimensions)
 
-        # 加权合并（2:1 比例，和为 1.0）
-        base_reward = 0.667 * comp + 0.333 * calc
+        # ---- 维度 3: calc_behavior (0.15/0.20) ----
+        calc_beh = _compute_calc_behavior(env, answer, needs_calc)
 
-        # 硬约束扣分：重复调用 + 无效工具
+        # ---- 维度 4: strategy_match (0.15/0.20) ----
+        strat = _compute_strategy_match(question_type, question, env.tool_steps, queries)
+
+        # ---- 加权组合 ----
+        base_reward = (
+            W_TOOL_COVERAGE * tool_cov +
+            W_QUERY_QUALITY * query_qual +
+            W_CALC_BEHAVIOR * calc_beh +
+            W_STRATEGY_MATCH * strat
+        )
+
+        # LLM 二元判断（可选）
+        if USE_LLM:
+            llm_score = llm_scores.get(idx, 0.5)
+            base_reward += W_LLM_JUDGE * llm_score
+
+        # ---- 硬约束扣分 ----
         penalty = _call_quality_penalty(env)
-        base_reward = max(base_reward + penalty, 0.0)  # clip 到 >= 0
+        base_reward = max(base_reward + penalty, 0.0)
 
-        # DAPO overlong penalty（直接从总分扣，不被权重稀释）
+        # ---- DAPO overlong penalty ----
         length = _estimate_token_count(completion)
         base_reward = _apply_overlong_penalty(base_reward, length)
 
         rewards[idx] = base_reward
 
+        # 收集各维度分数用于 logging
+        with _metrics_lock:
+            _metrics["tool_coverage_scores"].append(tool_cov)
+            _metrics["query_quality_scores"].append(query_qual)
+            _metrics["calc_behavior_scores"].append(calc_beh)
+            _metrics["strategy_match_scores"].append(strat)
+            if USE_LLM:
+                _metrics["llm_judge_scores"].append(llm_scores.get(idx, 0.5))
+
     # 自定义指标 logging
-    _log_custom_metrics(environments, completions, rewards, completeness_scores, kwargs)
+    _log_custom_metrics(environments, completions, rewards, kwargs)
 
     return rewards
 
 
-# ============ Reward 子函数 ============
+# ============ 维度 2: query_quality ============
 
-def _calc_behavior(env, answer: str) -> float:
+def _compute_query_quality(tool_steps: list, target_dims: Set[str]) -> float:
     """
-    calculate 行为检测（4 档分级）
+    计算轨迹整体的 query 质量得分。
 
-    - 1.0：调了 calculate 且结果被答案引用
-    - 0.7：调了 calculate 但结果没被引用
-    - 0.5：没调也没心算（不需要计算的问题）
-    - 0.0：没调但有心算模式
+    对每条 non-calculate query 独立打分，取平均。
+    包含 anti-hacking 指标-维度匹配检查。
     """
-    if env.has_calculate:
-        cited = any(_result_in_answer(r, answer) for r in env.calc_results)
-        return 1.0 if cited else 0.7
+    from reward_knowledge_base import (
+        compute_single_query_score,
+        compute_metric_dimension_match,
+        apply_anti_hacking_penalty,
+    )
+
+    scores = []
+    for step in tool_steps:
+        tool_name = step.get("tool", "")
+        query = step.get("query", "")
+
+        if tool_name == "calculate":
+            continue  # calculate 的 query 由 calc_behavior 维度评
+
+        # 基础质量评分
+        score = compute_single_query_score(query, tool_name)
+
+        # anti-hacking 指标匹配检查
+        if target_dims:
+            match_rate = compute_metric_dimension_match(query, target_dims)
+            score = apply_anti_hacking_penalty(score, match_rate)
+
+        scores.append(score)
+
+    if not scores:
+        return 0.0
+    return sum(scores) / len(scores)
+
+
+# ============ 维度 3: calc_behavior ============
+
+def _compute_calc_behavior(env, answer: str, needs_calc: bool) -> float:
+    """
+    V4.1 计算行为合理性评分（6 种情况）。
+
+    needs_calc 由双路径判定：question 关键词 OR answer 心算检测。
+    """
+    used_calc = env.has_calculate
+
+    if needs_calc and used_calc:
+        # 需要且用了 → 0.50-1.00（看表达式质量）
+        base = 0.50
+        for calc_query in [s["query"] for s in env.tool_steps if s["tool"] == "calculate"]:
+            # 表达式包含数字和运算符
+            if re.search(r'\d+\.?\d*\s*[-+*/×÷]\s*\d+', calc_query):
+                base += 0.25
+                break
+        # 表达式中数字能在之前 observation 中找到来源
+        # 简化实现：检查 calc_results 是否非空且被答案引用
+        if env.calc_results:
+            for cr in env.calc_results:
+                numbers = re.findall(r'[\d.]+', cr)
+                for num in numbers:
+                    if len(num) >= 3 and re.search(r'(?<!\d)' + re.escape(num) + r'(?!\d)', answer):
+                        base += 0.25
+                        break
+                if base >= 1.0:
+                    break
+        return min(base, 1.0)
+
+    elif needs_calc and not used_calc:
+        # 需要但没用 → 0.00
+        return 0.0
+
+    elif not needs_calc and used_calc:
+        # 不需要但用了 → 检查数据来源
+        has_source = False
+        if env.calc_results:
+            for cr in env.calc_results:
+                numbers = re.findall(r'[\d.]+', cr)
+                for num in numbers:
+                    if len(num) >= 3 and re.search(r'(?<!\d)' + re.escape(num) + r'(?!\d)', answer):
+                        has_source = True
+                        break
+        return 0.50 if has_source else 0.45
+
     else:
-        return 0.0 if _has_mental_math(answer) else 0.5
+        # 不需要且没用 → 0.50（中性值）
+        return 0.50
+
+
+# ============ 维度 4: strategy_match ============
+
+def _compute_strategy_match(question_type: str, question: str,
+                            tool_steps: list, queries: List[str]) -> float:
+    """
+    搜索策略匹配度评分（按 question_type 分别处理）。
+    """
+    from reward_knowledge_base import (
+        extract_dimensions, is_comprehensive,
+        extract_metrics_from_queries, get_dimensions_from_metrics,
+        count_unique_companies, query_has_industry_name,
+        query_has_company_name, extract_company_name,
+    )
+
+    tools_used = [s["tool"] for s in tool_steps]
+
+    if question_type == "company_comparison":
+        return _strategy_comparison(tool_steps, queries)
+    elif question_type == "risk_analysis":
+        return _strategy_risk(queries)
+    elif question_type == "single_company_medium":
+        return _strategy_medium(question, queries)
+    elif question_type == "industry_analysis":
+        return _strategy_industry(tools_used)
+    elif question_type == "financial_query":
+        return _strategy_financial_query(queries)
+    elif question_type == "single_company_simple":
+        return _strategy_simple(queries)
+    elif question_type == "reject":
+        return 1.0  # reject 已在上层处理
+    else:
+        return 0.5  # 未知类型给中间值
+
+
+def _strategy_comparison(tool_steps: list, queries: List[str]) -> float:
+    """company_comparison：两家公司搜索的指标是否一致"""
+    from reward_knowledge_base import (
+        count_unique_companies, extract_metrics_from_queries,
+        extract_company_name,
+    )
+
+    companies = count_unique_companies(tool_steps)
+    if len(companies) < 2:
+        return 0.1  # 只搜了一家
+
+    # 按公司分组 query 中的指标
+    company_list = list(companies)
+    metrics_per_company = {c: set() for c in company_list}
+
+    for step in tool_steps:
+        if step["tool"] in ("search_financial", "search_report"):
+            query = step["query"]
+            company = extract_company_name(query)
+            if company and company in metrics_per_company:
+                query_metrics = extract_metrics_from_queries([query])
+                metrics_per_company[company].update(query_metrics)
+
+    # 计算指标重叠度
+    metric_sets = [v for v in metrics_per_company.values() if v]
+    if len(metric_sets) < 2:
+        return 0.3
+
+    s_a, s_b = metric_sets[0], metric_sets[1]
+    max_size = max(len(s_a), len(s_b))
+    if max_size == 0:
+        return 0.3
+
+    overlap = len(s_a & s_b) / max_size
+
+    if overlap >= 0.8:
+        return 1.0
+    elif overlap >= 0.5:
+        return 0.5 + overlap * 0.5
+    else:
+        return 0.3
+
+
+def _strategy_risk(queries: List[str]) -> float:
+    """risk_analysis：是否同时覆盖偿债和盈利维度"""
+    from reward_knowledge_base import (
+        extract_metrics_from_queries, get_dimensions_from_metrics,
+    )
+    all_metrics = extract_metrics_from_queries(queries)
+    dims = get_dimensions_from_metrics(all_metrics)
+
+    has_leverage = "偿债/杠杆" in dims
+    has_profit = "盈利能力" in dims
+
+    if has_leverage and has_profit:
+        return 1.0
+    elif has_leverage or has_profit:
+        return 0.5
+    else:
+        return 0.0
+
+
+def _strategy_medium(question: str, queries: List[str]) -> float:
+    """single_company_medium：定向 vs 全面两套逻辑"""
+    from reward_knowledge_base import (
+        extract_dimensions, is_comprehensive,
+        extract_metrics_from_queries, get_dimensions_from_metrics,
+    )
+
+    target_dims = extract_dimensions(question)
+    all_metrics = extract_metrics_from_queries(queries)
+    covered_dims = get_dimensions_from_metrics(all_metrics)
+
+    if is_comprehensive(question):
+        # 全面问题：按维度数计分
+        n = len(covered_dims)
+        if n >= 3:
+            return 1.0
+        elif n == 2:
+            return 0.7
+        elif n == 1:
+            return 0.4
+        else:
+            return 0.1
+    else:
+        # 定向问题：检查是否覆盖了目标维度
+        if not target_dims:
+            return 0.5  # 未识别到目标维度，给中间值
+        if target_dims.issubset(covered_dims):
+            return 1.0
+        elif target_dims & covered_dims:
+            return 0.6
+        else:
+            return 0.2
+
+
+def _strategy_industry(tools_used: list) -> float:
+    """industry_analysis：是否从行业和个股两个层面搜索"""
+    has_industry = "search_industry" in tools_used
+    has_financial = "search_financial" in tools_used
+
+    if has_industry and has_financial:
+        return 1.0
+    elif has_industry:
+        return 0.6
+    elif has_financial:
+        return 0.3
+    else:
+        return 0.1
+
+
+def _strategy_financial_query(queries: List[str]) -> float:
+    """financial_query：query 包含公司名+指标名"""
+    from reward_knowledge_base import query_has_company_name, query_has_metric
+    for q in queries:
+        has_company = query_has_company_name(q)
+        has_metric = query_has_metric(q)
+        if has_company and has_metric:
+            return 0.8
+        elif has_company or has_metric:
+            return 0.4
+    return 0.1
+
+
+def _strategy_simple(queries: List[str]) -> float:
+    """single_company_simple：query 包含公司名+关键词"""
+    from reward_knowledge_base import extract_company_name
+    report_keywords = ["评级", "目标价", "前景", "投资", "研报", "推荐", "买入", "增持"]
+    for q in queries:
+        has_company = bool(extract_company_name(q))
+        has_keyword = any(kw in q for kw in report_keywords)
+        if has_company and has_keyword:
+            return 0.8
+        elif has_company:
+            return 0.4
+    return 0.1
+
+
+# ============ Reject 特殊处理 ============
+
+def _compute_reject_reward(env, answer: str) -> float:
+    """reject 类型：少搜是对的"""
+    from reward_knowledge_base import is_reject_response
+
+    n_calls = len(env.tool_steps)
+    rejected = is_reject_response(answer)
+
+    if rejected:
+        if n_calls <= 1:
+            return 1.0
+        elif n_calls == 2:
+            return 0.75
+        elif n_calls == 3:
+            return 0.50
+        else:
+            return 0.25
+    else:
+        return 0.0  # 没拒绝
+
+
+# ============ LLM 二元判断（维度 5，可选）============
+
+LLM_BINARY_PROMPT = """你是金融分析工具调用的评审。请判断以下 Agent 的搜索策略是否合理地覆盖了回答问题所需的信息。
+
+问题：{question}
+问题类型：{question_type}
+
+Agent 的工具调用序列：
+{formatted_steps}
+
+只回答"合理"或"不合理"，然后用一句话说明理由。
+
+格式：
+判断：合理/不合理
+理由：XXX"""
+
+
+def _batch_llm_binary_judge(llm_tasks: dict) -> dict:
+    """并行调用 LLM 二元判断"""
+    scores = {}
+
+    def _call_single(idx, question, question_type, tool_steps):
+        if not tool_steps:
+            return idx, 0.0
+
+        formatted_steps = "\n".join(
+            f"  Step {i+1}: {s['tool']}(query=\"{s['query']}\")"
+            for i, s in enumerate(tool_steps)
+        )
+        prompt = LLM_BINARY_PROMPT.format(
+            question=question,
+            question_type=question_type,
+            formatted_steps=formatted_steps,
+        )
+
+        try:
+            global _llm_client
+            if _llm_client is None:
+                with _llm_client_lock:
+                    if _llm_client is None:
+                        from openai import OpenAI
+                        _llm_client = OpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL)
+
+            response = _llm_client.chat.completions.create(
+                model=LLM_MODEL,
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=50,
+                temperature=0.1,
+                extra_body={"enable_thinking": False},
+            )
+            result = response.choices[0].message.content.strip()
+            # Strip thinking tags
+            result = re.sub(r'<think>.*?</think>', '', result, flags=re.DOTALL).strip()
+
+            # 解析"合理"/"不合理"
+            if "不合理" in result:
+                return idx, 0.0
+            elif "合理" in result:
+                return idx, 1.0
+            else:
+                return idx, 0.5  # 无法解析
+        except Exception as e:
+            logger.error(f"LLM binary judge 失败 (idx={idx}): {e}")
+            return idx, 0.5
+
+    with ThreadPoolExecutor(max_workers=LLM_MAX_WORKERS) as executor:
+        futures = []
+        for idx, (question, question_type, tool_steps) in llm_tasks.items():
+            futures.append(executor.submit(_call_single, idx, question, question_type, tool_steps))
+
+        for future in as_completed(futures):
+            try:
+                idx, score = future.result()
+                scores[idx] = score
+            except Exception as e:
+                logger.error(f"LLM future 异常: {e}")
+
+    return scores
+
+
+# ============ 硬约束（继承自 V3）============
+
+def _is_format_valid(env, completion, question_type: str) -> bool:
+    """
+    V4.1 格式检查（两层）：
+    1. completion 非空
+    2. environment_factory 下有内容但 tool_steps 为空且非 reject → JSON 解析失败
+    """
+    comp_str = str(completion) if completion else ""
+    if not comp_str.strip():
+        return False
+    if not env.tool_steps and question_type != "reject" and len(comp_str) > 100:
+        return False
+    return True
 
 
 def _call_quality_penalty(env) -> float:
-    """硬约束扣分：重复调用 + 无效工具"""
+    """硬约束扣分：重复 query + 无效工具"""
     penalty = 0.0
 
-    # 重复调用惩罚
+    # 重复调用惩罚（V4.1 阈值放松到 0.85）
     queries = [s["query"] for s in env.tool_steps]
     for i, q in enumerate(queries):
         for prev_q in queries[:i]:
-            if _keyword_overlap(q, prev_q) > 0.7:
+            if _keyword_overlap(q, prev_q) > REPEAT_QUERY_THRESHOLD:
                 penalty -= 0.3
                 break
 
@@ -531,7 +712,7 @@ def _call_quality_penalty(env) -> float:
         if s["tool"] not in VALID_TOOLS:
             penalty -= 0.5
 
-    return max(penalty, -1.0)  # clip 到 >= -1.0
+    return max(penalty, -1.0)
 
 
 def _apply_overlong_penalty(base_reward: float, length: int) -> float:
@@ -548,10 +729,7 @@ def _apply_overlong_penalty(base_reward: float, length: int) -> float:
 # ============ 辅助函数 ============
 
 def _completion_to_str(completion) -> str:
-    """将 completion 转为字符串。
-    TRL environment_factory 模式下 completion 可能是 list[dict]（消息列表），
-    而非普通字符串。统一转为字符串供后续处理。
-    """
+    """将 completion 转为字符串（兼容 list[dict] 格式）"""
     if isinstance(completion, str):
         return completion
     if isinstance(completion, list):
@@ -566,12 +744,7 @@ def _completion_to_str(completion) -> str:
 
 
 def _extract_final_answer(completion: str) -> str:
-    """
-    从 completion 中提取最终答案。
-
-    注意：TRL environment_factory 模式下 completion 的具体格式
-    需要在 dry-run 时验证。当前实现基于 Qwen2.5 chat_template 的假设。
-    """
+    """从 completion 中提取最终答案"""
     parts = completion.split("<tool_call>")
     last_part = parts[-1] if parts else completion
 
@@ -585,40 +758,10 @@ def _extract_final_answer(completion: str) -> str:
     return last_part.strip()
 
 
-def _has_mental_math(answer: str) -> bool:
-    """检查答案中是否包含心算模式"""
-    return any(p.search(answer) for p in MENTAL_MATH_PATTERNS)
-
-
-def _result_in_answer(calc_result: str, answer: str) -> bool:
-    """检查 calculate 返回的结果数字是否出现在答案中（完整匹配）"""
-    numbers = re.findall(r'[\d.]+', calc_result)
-    for num in numbers:
-        if len(num) < 3:
-            continue  # 跳过太短的数字
-        if re.search(r'(?<!\d)' + re.escape(num) + r'(?!\d)', answer):
-            return True
-    return False
-
-
-def _is_format_valid(completion: str) -> bool:
-    """检查输出格式是否合规"""
-    if not completion or not completion.strip():
-        return False
-    if "<tool_call>" in completion:
-        if completion.count("<tool_call>") != completion.count("</tool_call>"):
-            return False
-    return True
-
-
 def _keyword_overlap(query1: str, query2: str) -> float:
     """计算两个 query 的关键词重叠率（2-gram 级别）"""
-    words1 = set(query1.split()) if ' ' in query1 else set(
-        query1[i:i+2] for i in range(len(query1)-1)
-    )
-    words2 = set(query2.split()) if ' ' in query2 else set(
-        query2[i:i+2] for i in range(len(query2)-1)
-    )
+    words1 = set(query1[i:i+2] for i in range(len(query1)-1)) if query1 else set()
+    words2 = set(query2[i:i+2] for i in range(len(query2)-1)) if query2 else set()
     if not words1 or not words2:
         return 0.0
     intersection = words1 & words2
@@ -627,7 +770,7 @@ def _keyword_overlap(query1: str, query2: str) -> float:
 
 def _estimate_token_count(text: str) -> int:
     """粗估 token 数量（中文 1 字 ≈ 1.5 token）"""
-    return int(len(text) * 1.5)
+    return int(len(str(text)) * 1.5)
 
 
 def _extract_question_and_type(idx: int, kwargs: dict) -> tuple:
@@ -649,132 +792,50 @@ def _extract_question_and_type(idx: int, kwargs: dict) -> tuple:
         elif isinstance(t_list, str):
             question_type = t_list
 
-    if not question:
-        logger.warning(f"idx={idx}: question 为空，completeness 评估可能不准确")
-
     return question, question_type
-
-
-def _call_completeness_llm(question: str, question_type: str, tool_steps: list) -> float:
-    """
-    调用 LLM 评估工具调用完整性，返回 0-1 的归一化分数。
-    V2：checklist 化评分 + few-shot examples + 按类型拆分标准。
-    只传 tool name + query，不传 observation（Planner-focused）。
-    """
-    # 格式化工具调用序列
-    if not tool_steps:
-        formatted_steps = "  （无工具调用）"
-    else:
-        formatted_steps = "\n".join(
-            f"  Step {i+1}: {s['tool']}(query=\"{s['query']}\")"
-            for i, s in enumerate(tool_steps)
-        )
-
-    # 获取该类型的 checklist 和 few-shot
-    type_checklist = TYPE_CHECKLISTS.get(question_type, TYPE_CHECKLISTS["single_company_medium"])
-    few_shot = FEW_SHOT_EXAMPLES.get(question_type, DEFAULT_FEW_SHOT)
-
-    prompt = COMPLETENESS_PROMPT_TEMPLATE.format(
-        question=question,
-        question_type=question_type,
-        formatted_steps=formatted_steps,
-        type_checklist=type_checklist,
-        few_shot_examples=few_shot,
-    )
-
-    try:
-        global _llm_client
-        if _llm_client is None:
-            with _llm_client_lock:
-                if _llm_client is None:
-                    from openai import OpenAI
-                    _llm_client = OpenAI(
-                        api_key=COMPLETENESS_API_KEY,
-                        base_url=COMPLETENESS_BASE_URL,
-                    )
-        response = _llm_client.chat.completions.create(
-            model=COMPLETENESS_MODEL,
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=100,
-            temperature=0.1,
-            extra_body={"enable_thinking": False},
-        )
-        result = response.choices[0].message.content.strip()
-        return _parse_completeness_score(result)
-
-    except Exception as e:
-        logger.error(f"completeness LLM 调用失败: {e}")
-        return 0.5
-
-
-def _parse_completeness_score(result: str) -> float:
-    """
-    从 LLM 输出中解析 1-5 分，归一化到 0-1。
-
-    V2 输出格式："分数：X\n理由：XXX"
-    """
-    # Strip qwen3 thinking tags
-    result = re.sub(r'<think>.*?</think>', '', result, flags=re.DOTALL).strip()
-
-    # 优先：匹配 V2 格式 "分数：X" 或 "分数:X"
-    match = re.search(r'分数\s*[:：]\s*([1-5])', result)
-    if match:
-        return (int(match.group(1)) - 1) / 4
-
-    # 其次：匹配 "X分" 模式
-    match = re.search(r'([1-5])\s*分', result)
-    if match:
-        return (int(match.group(1)) - 1) / 4
-
-    # 再次：匹配 "评分X" / "给X" / "打X" 模式
-    match = re.search(r'(?:评分|给|打|得)\s*[:：]?\s*([1-5])', result)
-    if match:
-        return (int(match.group(1)) - 1) / 4
-
-    # 兜底：取第一行首个 1-5 数字
-    first_line = result.split('\n')[0]
-    match = re.search(r'([1-5])', first_line)
-    if match:
-        return (int(match.group(1)) - 1) / 4
-
-    logger.warning(f"completeness LLM 无法解析分数: {result}")
-    return 0.5
 
 
 # ============ 自定义监控指标 ============
 
-# 用模块级变量累积指标，由外部定期读取和清零
 _metrics = {
     "calculate_rate": [],
     "mental_math_rate": [],
-    "completeness_scores": [],
     "tool_call_count": [],
-    "completeness_llm_failures": 0,
+    "tool_coverage_scores": [],
+    "query_quality_scores": [],
+    "calc_behavior_scores": [],
+    "strategy_match_scores": [],
+    "llm_judge_scores": [],
+    "llm_judge_failures": 0,
 }
 _metrics_lock = threading.Lock()
 
 
-def _log_custom_metrics(environments, completions, rewards, completeness_scores, kwargs):
+def _log_custom_metrics(environments, completions, rewards, kwargs):
     """记录自定义监控指标"""
+    from reward_knowledge_base import detect_mental_calc
+
     with _metrics_lock:
         for idx, env in enumerate(environments):
             if rewards[idx] == FORMAT_INVALID_PENALTY:
-                continue  # 格式不合规的不计入统计
+                continue
 
-            answer = _extract_final_answer(completions[idx])
+            answer = _extract_final_answer(_completion_to_str(completions[idx]))
             _metrics["calculate_rate"].append(1.0 if env.has_calculate else 0.0)
-            _metrics["mental_math_rate"].append(1.0 if _has_mental_math(answer) else 0.0)
+            _metrics["mental_math_rate"].append(1.0 if detect_mental_calc(answer) else 0.0)
             _metrics["tool_call_count"].append(len(env.tool_steps))
-
-            if idx in completeness_scores:
-                _metrics["completeness_scores"].append(completeness_scores[idx])
 
 
 def get_and_reset_metrics() -> dict:
     """获取并重置自定义指标（由训练脚本定期调用）"""
     with _metrics_lock:
         result = {}
-        for key in ["calculate_rate", "mental_math_rate", "completeness_scores", "tool_call_count"]:
+        for key in [
+            "calculate_rate", "mental_math_rate", "tool_call_count",
+            "tool_coverage_scores", "query_quality_scores",
+            "calc_behavior_scores", "strategy_match_scores",
+            "llm_judge_scores",
+        ]:
             values = _metrics[key]
             if values:
                 result[key] = sum(values) / len(values)
@@ -782,8 +843,8 @@ def get_and_reset_metrics() -> dict:
                 result[key] = 0.0
             _metrics[key] = []
 
-        result["completeness_llm_failures"] = _metrics["completeness_llm_failures"]
-        _metrics["completeness_llm_failures"] = 0
+        result["llm_judge_failures"] = _metrics["llm_judge_failures"]
+        _metrics["llm_judge_failures"] = 0
         return result
 
 

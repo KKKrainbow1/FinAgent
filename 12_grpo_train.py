@@ -203,19 +203,30 @@ class GRPOMetricsCallback(TrainerCallback):
         self.step_count = 0
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        """每次 logging 时输出自定义指标"""
+        """每次 logging 时输出自定义指标 + 注入 TensorBoard"""
         self.step_count += 1
         if self.step_count % self.log_interval == 0:
             try:
                 from grpo_plugin import get_and_reset_metrics
                 metrics = get_and_reset_metrics()
                 if metrics:
-                    logger.info(f"[GRPO 自定义指标] Step {state.global_step}:")
+                    # 打印到终端
+                    logger.info(f"[GRPO V4.1 指标] Step {state.global_step}:")
                     logger.info(f"  calculate_rate: {metrics.get('calculate_rate', 0):.3f}")
                     logger.info(f"  mental_math_rate: {metrics.get('mental_math_rate', 0):.3f}")
-                    logger.info(f"  completeness_scores: {metrics.get('completeness_scores', 0):.3f}")
                     logger.info(f"  tool_call_count: {metrics.get('tool_call_count', 0):.1f}")
-                    logger.info(f"  llm_failures: {metrics.get('completeness_llm_failures', 0)}")
+                    logger.info(f"  tool_coverage: {metrics.get('tool_coverage_scores', 0):.3f}")
+                    logger.info(f"  query_quality: {metrics.get('query_quality_scores', 0):.3f}")
+                    logger.info(f"  calc_behavior: {metrics.get('calc_behavior_scores', 0):.3f}")
+                    logger.info(f"  strategy_match: {metrics.get('strategy_match_scores', 0):.3f}")
+                    if metrics.get('llm_judge_scores', 0) > 0:
+                        logger.info(f"  llm_judge: {metrics['llm_judge_scores']:.3f}")
+
+                    # 注入 logs → TensorBoard 自动写入
+                    if logs is not None:
+                        for key, value in metrics.items():
+                            if isinstance(value, (int, float)):
+                                logs[f"custom/{key}"] = value
             except Exception as e:
                 logger.warning(f"获取自定义指标失败: {e}")
 
