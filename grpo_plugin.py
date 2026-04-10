@@ -184,7 +184,9 @@ class FinAgentEnv:
             return result
         except Exception as e:
             logger.warning(f"calculate 调用失败: {e}")
-            return f"计算失败：{str(e)}"
+            error_result = f"计算失败：{str(e)}"
+            self.calc_results.append(error_result)
+            return error_result
 
 
 # ============ V4.1 统一 Reward 函数 ============
@@ -362,26 +364,25 @@ def _compute_calc_behavior(env, answer: str, needs_calc: bool) -> float:
     needs_calc 由双路径判定：question 关键词 OR answer 心算检测。
     """
     used_calc = env.has_calculate
+    calc_queries = [s["query"] for s in env.tool_steps if s["tool"] == "calculate"]
+    calc_results = getattr(env, "calc_results", []) or []
+    successful_results = [r for r in calc_results if not _is_calc_error_result(r)]
 
     if needs_calc and used_calc:
+        # 需要且用了：只有真正拿到有效结果才给正向 reward
+        if not successful_results:
+            return 0.0
+
         # 需要且用了 → 0.50-1.00（看表达式质量）
         base = 0.50
-        for calc_query in [s["query"] for s in env.tool_steps if s["tool"] == "calculate"]:
+        for calc_query in calc_queries:
             # 表达式包含数字和运算符
             if re.search(r'\d+\.?\d*\s*[-+*/×÷]\s*\d+', calc_query):
                 base += 0.25
                 break
-        # 表达式中数字能在之前 observation 中找到来源
-        # 简化实现：检查 calc_results 是否非空且被答案引用
-        if env.calc_results:
-            for cr in env.calc_results:
-                numbers = re.findall(r'[\d.]+', cr)
-                for num in numbers:
-                    if len(num) >= 3 and re.search(r'(?<!\d)' + re.escape(num) + r'(?!\d)', answer):
-                        base += 0.25
-                        break
-                if base >= 1.0:
-                    break
+        # 有效计算结果被答案引用，说明模型真的用到了 calculate
+        if _answer_reuses_calc_result(answer, successful_results):
+            base += 0.25
         return min(base, 1.0)
 
     elif needs_calc and not used_calc:
@@ -389,20 +390,35 @@ def _compute_calc_behavior(env, answer: str, needs_calc: bool) -> float:
         return 0.0
 
     elif not needs_calc and used_calc:
-        # 不需要但用了 → 检查数据来源
-        has_source = False
-        if env.calc_results:
-            for cr in env.calc_results:
-                numbers = re.findall(r'[\d.]+', cr)
-                for num in numbers:
-                    if len(num) >= 3 and re.search(r'(?<!\d)' + re.escape(num) + r'(?!\d)', answer):
-                        has_source = True
-                        break
+        # 不需要但用了：失败调用不应给正分；成功调用但答案未用到则轻微扣分
+        if not successful_results:
+            return 0.0
+        has_source = _answer_reuses_calc_result(answer, successful_results)
         return 0.50 if has_source else 0.45
 
     else:
         # 不需要且没用 → 0.50（中性值）
         return 0.50
+
+
+def _is_calc_error_result(result: str) -> bool:
+    """判断 calculate 输出是否为错误结果。"""
+    text = str(result or "").strip()
+    if not text:
+        return True
+    return text.startswith("[计算错误]") or text.startswith("计算失败")
+
+
+def _answer_reuses_calc_result(answer: str, calc_results: List[str]) -> bool:
+    """检查答案是否引用了有效 calculate 结果中的数字。"""
+    if not answer:
+        return False
+    for cr in calc_results:
+        numbers = re.findall(r'[\d.]+', cr)
+        for num in numbers:
+            if len(num) >= 3 and re.search(r'(?<!\d)' + re.escape(num) + r'(?!\d)', answer):
+                return True
+    return False
 
 
 # ============ 维度 4: strategy_match ============

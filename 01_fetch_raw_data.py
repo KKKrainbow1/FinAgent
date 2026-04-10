@@ -311,21 +311,54 @@ def _save_financial_checkpoint(results: dict, stats: dict):
 
 # ============ Step 4: 断点续传支持 ============
 
-def load_existing_progress() -> set:
+def load_report_progress() -> set:
     """
-    检查已有数据，返回已完成的股票代码集合
-    避免重复拉取（Colab可能中途断开）
+    返回已完成研报拉取的股票代码集合。
+
+    研报 checkpoint 只会保存实际拉取到的研报记录，因此以 all_reports.csv
+    中出现过的股票代码作为“研报已完成”的判定。
     """
     done_codes = set()
-
-    # 检查研报
     report_path = os.path.join(REPORT_DIR, "all_reports.csv")
-    if os.path.exists(report_path):
-        df = pd.read_csv(report_path, dtype={'股票代码': str})
-        if '股票代码' in df.columns:
-            done_codes.update(df['股票代码'].unique())
-            logger.info(f"[断点续传] 已有 {len(done_codes)} 只股票的研报数据")
+    if not os.path.exists(report_path):
+        return done_codes
 
+    df = pd.read_csv(report_path, dtype={'股票代码': str})
+    if '股票代码' in df.columns:
+        done_codes.update(df['股票代码'].dropna().astype(str).unique())
+        logger.info(f"[断点续传] 已有 {len(done_codes)} 只股票的研报数据")
+
+    return done_codes
+
+
+def load_financial_progress() -> set:
+    """
+    返回已完成财务拉取的股票代码集合。
+
+    财务 checkpoint 会保存成功、失败或增量合并后的结果，因此这里只将
+    “存在 financial_indicators 且没有 financial_error”的股票视为完成，
+    避免把失败/异常的股票也在 resume 时跳过。
+    """
+    done_codes = set()
+    financial_path = os.path.join(FINANCIAL_DIR, "all_financial.json")
+    if not os.path.exists(financial_path):
+        return done_codes
+
+    with open(financial_path, 'r', encoding='utf-8') as f:
+        data = json.load(f)
+
+    if not isinstance(data, dict):
+        return done_codes
+
+    for stock_code, item in data.items():
+        if not isinstance(item, dict):
+            continue
+        indicators = item.get("financial_indicators") or []
+        has_error = bool(item.get("financial_error"))
+        if indicators and not has_error:
+            done_codes.add(str(stock_code))
+
+    logger.info(f"[断点续传] 已有 {len(done_codes)} 只股票的财务数据")
     return done_codes
 
 
@@ -380,25 +413,34 @@ def main():
         stocks.to_csv(os.path.join(OUTPUT_DIR, "hs300_stocks.csv"), index=False, encoding='utf-8-sig')
         logger.info(f"沪深300成分股: {len(stocks)} 只")
 
-    # 2. 断点续传：过滤已完成的
+    report_stocks = stocks
+    financial_stocks = stocks
+
+    # 2. 断点续传：按任务类型分别过滤已完成的股票
     if args.resume:
-        done = load_existing_progress()
-        stocks = stocks[~stocks['stock_code'].isin(done)].reset_index(drop=True)
-        logger.info(f"断点续传: 跳过 {len(done)} 只, 剩余 {len(stocks)} 只")
+        if not args.skip_reports:
+            report_done = load_report_progress()
+            report_stocks = stocks[~stocks['stock_code'].isin(report_done)].reset_index(drop=True)
+            logger.info(f"断点续传[研报]: 跳过 {len(report_done)} 只, 剩余 {len(report_stocks)} 只")
+        if not args.skip_financial:
+            financial_done = load_financial_progress()
+            financial_stocks = stocks[~stocks['stock_code'].isin(financial_done)].reset_index(drop=True)
+            logger.info(f"断点续传[财务]: 跳过 {len(financial_done)} 只, 剩余 {len(financial_stocks)} 只")
 
     # 3. 限制数量（测试用）
     if args.max_stocks > 0:
-        stocks = stocks.head(args.max_stocks)
-        logger.info(f"测试模式: 只拉取前 {args.max_stocks} 只")
+        report_stocks = report_stocks.head(args.max_stocks)
+        financial_stocks = financial_stocks.head(args.max_stocks)
+        logger.info(f"测试模式: 每类任务最多拉取前 {args.max_stocks} 只")
 
     # 4. 拉取研报
     if not args.skip_reports:
-        report_results = batch_fetch_reports(stocks)
+        report_results = batch_fetch_reports(report_stocks)
 
     # 5. 拉取财务数据
     if not args.skip_financial:
         financial_results = batch_fetch_financial(
-            stocks,
+            financial_stocks,
             start_year=args.start_year,
             update_mode=args.update,
         )

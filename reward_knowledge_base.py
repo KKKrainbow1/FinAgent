@@ -7,7 +7,10 @@ FinAgent Reward V4.1 知识库
 设计文档：docs/FinAgent_Reward_V4.1_Design.md
 """
 
+import csv
 import re
+from functools import lru_cache
+from pathlib import Path
 from typing import Set, List, Dict, Optional, Tuple
 
 
@@ -291,15 +294,117 @@ def query_has_year(query: str) -> bool:
     return bool(re.search(r'20[2]\d', query))
 
 
+# 常见非公司名前缀（分析动词、描述词等，不应被识别为公司名）
+_NON_COMPANY_PREFIXES = [
+    "分析", "评估", "对比", "比较", "查询", "搜索", "投资", "全面",
+    "综合", "深度", "简要", "详细", "最新", "目前", "当前", "如何",
+    "怎么", "价值", "风险", "盈利", "偿债", "成长", "估值",
+]
+
+_NON_COMPANY_WORDS = [
+    "盈利能力", "偿债能力", "营运效率", "成长性", "财务状况",
+    "投资价值", "风险分析", "行业分析", "价值分析", "能力指标",
+    "能力", "分析", "指标", "数据", "评估", "状况", "趋势",
+]
+
+
+@lru_cache(maxsize=1)
+def _load_known_stock_names() -> Tuple[str, ...]:
+    """
+    加载已知股票名列表，优先用真实股票名做公司识别。
+
+    当前仓库是沪深300数据管线，优先读取本地 hs300 股票池。
+    文件缺失时退化为空列表，继续走规则兜底。
+    """
+    csv_path = Path(__file__).resolve().parent / "data/raw/hs300_stocks.csv"
+    if not csv_path.exists():
+        return tuple()
+
+    names = set()
+    with csv_path.open(encoding="utf-8-sig") as f:
+        for row in csv.DictReader(f):
+            name = (row.get("stock_name") or "").strip()
+            if name:
+                names.add(name)
+
+    return tuple(sorted(names, key=lambda x: (-len(x), x)))
+
+
 def query_has_company_name(query: str) -> bool:
-    """query 是否包含公司全称（≥4 字连续中文）"""
-    return bool(re.search(r'[\u4e00-\u9fa5]{4,}', query))
+    """
+    query 是否包含公司名。
+
+    比 ≥4 字连续中文更严格：排除常见非公司名前缀。
+    """
+    name = extract_company_name(query)
+    if not name:
+        return False
+
+    known_names = set(_load_known_stock_names())
+    if name in known_names:
+        return True
+
+    # 规则兜底时放宽到 3 字，兼容"比亚迪"这类三字公司名
+    return len(name) >= 3
 
 
 def extract_company_name(query: str) -> Optional[str]:
-    """从 query 开头提取公司名（取前 2-8 个连续汉字）"""
-    match = re.match(r'([\u4e00-\u9fa5]{2,8})', query.strip())
-    return match.group(1) if match else None
+    """
+    从 query 开头提取公司名（取前 2-8 个连续汉字）。
+
+    排除常见分析动词开头的情况：
+    - "分析贵州茅台盈利能力" → 跳过"分析"，提取"贵州茅台"
+    - "格力电器 ROE 2024" → 提取"格力电器"
+    - "投资价值分析" → 跳过"投资"，剩余"价值分析"不是公司名 → None
+    """
+    text = query.strip()
+
+    # 循环去掉开头的非公司名前缀（可能叠加："全面评估" → 去"全面" → 去"评估"）
+    changed = True
+    while changed:
+        changed = False
+        for prefix in _NON_COMPANY_PREFIXES:
+            if text.startswith(prefix):
+                text = text[len(prefix):].strip()
+                changed = True
+                break
+
+    if not text:
+        return None
+
+    # 先用已知股票名精确匹配，避免"招商银行"这类真实公司被行业词规则误伤
+    for stock_name in _load_known_stock_names():
+        if text.startswith(stock_name):
+            return stock_name
+
+    match = re.match(r'([\u4e00-\u9fa5]{2,8})', text)
+    if not match:
+        return None
+
+    name = match.group(1)
+
+    # 如果提取的"名字"包含分析维度词或常见非公司词，截断或排除
+    # 尝试在 name 中找到非公司词的位置并截断
+    for nw in _NON_COMPANY_WORDS:
+        pos = name.find(nw)
+        if pos >= 0:
+            name = name[:pos]
+            break
+
+    # 截断后如果剩余 < 2 字，认为不是公司名
+    if len(name) < 2:
+        return None
+
+    # 只排除"行业短语本身"，不要误杀"招商银行"这类包含行业词的真实公司名
+    if name in INDUSTRY_NAMES or name.endswith(("行业", "板块")):
+        return None
+    if text.startswith(name + "行业") or text.startswith(name + "板块"):
+        return None
+
+    if name in _NON_COMPANY_PREFIXES or name in _NON_COMPANY_WORDS:
+        return None
+
+    return name
 
 
 def count_unique_companies(tool_steps: list) -> set:
@@ -347,18 +452,38 @@ def query_has_leverage_metric(query: str) -> bool:
 # 六、行业名称库
 # ============================================================
 
-# 标准行业名（30 个行业 + 常见别名）
-INDUSTRY_NAMES = [
-    # 标准 30 大类
-    "半导体", "白酒", "电力设备", "电子", "房地产", "纺织服装",
-    "钢铁", "公用事业", "航空", "化工", "机械设备", "家电",
-    "计算机", "建材", "建筑", "交通运输", "金融", "军工",
-    "煤炭", "农业", "汽车", "轻工制造", "商贸零售", "生物医药",
-    "食品", "通信", "有色金属", "造纸", "综合", "保险",
-    # 常见别名 / 细分行业
-    "新能源", "光伏", "锂电", "储能", "银行", "证券",
-    "医药", "消费电子", "互联网", "人工智能", "芯片",
-]
+@lru_cache(maxsize=1)
+def _build_industry_names() -> Tuple[str, ...]:
+    """
+    从 hybrid_search.py 的真实 alias 源自动生成行业名称集合。
+
+    这样 reward 和检索器永远共用同一套行业支持范围，避免手写列表漂移。
+    """
+    from hybrid_search import FinAgentRetriever
+
+    names = set()
+
+    for standard_name, sub_industries in FinAgentRetriever._INDUSTRY_MAP.items():
+        names.add(standard_name)
+        for sub in sub_industries:
+            sub = sub.strip()
+            if not sub:
+                continue
+            names.add(sub)
+            clean = sub.replace("Ⅱ", "").strip()
+            if clean:
+                names.add(clean)
+
+    for aliases in FinAgentRetriever._EXTRA_ALIASES.values():
+        for alias in aliases:
+            alias = alias.strip()
+            if alias:
+                names.add(alias)
+
+    return tuple(sorted(names, key=lambda x: (-len(x), x)))
+
+
+INDUSTRY_NAMES = _build_industry_names()
 
 
 def query_has_industry_name(query: str) -> bool:

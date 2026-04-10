@@ -457,10 +457,7 @@ def check_mental_math(steps: list) -> list:
     """用 LLM 检测答案中是否存在心算（对照检索数据判断）"""
     global _mental_math_client
 
-    # 已用 calculate 则跳过
     used_calculate = any(s.get("action") == "calculate" for s in steps)
-    if used_calculate:
-        return []
 
     # 提取 finish 步的答案
     answer = ""
@@ -496,10 +493,17 @@ def check_mental_math(steps: list) -> list:
         result = json.loads(response.choices[0].message.content)
         if result.get("has_mental_math", False):
             evidence = result.get("evidence", "")
+            if used_calculate:
+                detail = (
+                    f"答案中存在无法从检索结果或 calculate 结果直接溯源的数字"
+                    f"（{evidence}），应重新生成完整轨迹"
+                )
+            else:
+                detail = f"答案中存在心算但未使用 calculate 工具（{evidence}），应重新生成完整轨迹"
             return [{
                 "type": "mental_math",
                 "severity": "critical",
-                "detail": f"答案中存在心算但未使用 calculate 工具（{evidence}），应重新生成完整轨迹",
+                "detail": detail,
             }]
     except Exception as e:
         logger.warning(f"心算检测 LLM 调用失败: {e}")
@@ -785,6 +789,9 @@ def pre_retrieve(question: str, retriever: FinAgentRetriever,
             if question_type in ("industry_analysis", "company_comparison"):
                 results_i = retriever.search_industry(query, top_k=1)
                 for r in results_i:
+                    # 过滤 match_failed 的伪结果（"未找到匹配行业"的提示信息）
+                    if r.get("metadata", {}).get("match_failed"):
+                        continue
                     industry = r["metadata"].get("industry", "未知")
                     text_preview = r["text"][:300]
                     available_info.append(f"- [industry | {industry}] {text_preview}...")
@@ -903,9 +910,14 @@ def fill_calculate(client: OpenAI, question: str, history: list, thought: str) -
         return None
 
     expr = expr.replace("`", "").strip()
+    wrapper_match = re.match(r'^calculate\((.*)\)$', expr, flags=re.DOTALL)
+    if wrapper_match:
+        expr = wrapper_match.group(1).strip().strip("'\"")
+    else:
+        expr = expr.strip("'\"")
 
     # 兜底：如果模型输出了多个表达式（逗号或换行分隔），只取第一个
-    if "," in expr and not re.match(r'^[\d\s\.\+\-\*/\(\)]+$', expr):
+    if "," in expr and not re.match(r'^[\d\s\.\+\-\*/\(\)×÷%－−]+$', expr):
         # 逗号不在括号内，说明是多表达式分隔
         parts = [p.strip() for p in expr.split(",") if p.strip()]
         if parts:
@@ -917,12 +929,20 @@ def fill_calculate(client: OpenAI, question: str, history: list, thought: str) -
             expr = parts[0]
             logger.info(f"  calculate 多行表达式，取第一行: {expr}")
 
+    # 兼容 Unicode 运算符（和 tools.py 的 _calculate 对齐）
+    expr = expr.translate(str.maketrans({
+        "×": "*", "÷": "/", "−": "-", "－": "-",
+        "（": "(", "）": ")",
+    }))
+    # 处理百分号：5% → (5/100)
+    expr = re.sub(r'(\d+\.?\d*)%', r'(\1/100)', expr)
+
     if not re.match(r'^[\d\s\.\+\-\*/\(\)]+$', expr):
         logger.warning(f"calculate 表达式格式异常: {expr}")
         return None
 
     try:
-        result = eval(expr)
+        result = eval(expr, {"__builtins__": {}}, {})
         return expr, f"计算结果: {result}"
     except Exception:
         logger.warning(f"calculate 执行失败: {expr}")
@@ -1242,19 +1262,35 @@ def validate_sample(sample: dict) -> tuple:
 
 # ============ 断点续传 ============
 
-def save_checkpoint(results: list, stats: dict):
+def save_checkpoint(results: list, stats: dict, processed_count: int):
     with open(CHECKPOINT_PATH, 'w', encoding='utf-8') as f:
-        json.dump({"results": results, "stats": stats}, f, ensure_ascii=False, indent=2)
-    logger.info(f"[checkpoint] 已保存 {len(results)} 条数据")
+        json.dump(
+            {
+                "results": results,
+                "stats": stats,
+                "processed_count": processed_count,
+            },
+            f,
+            ensure_ascii=False,
+            indent=2,
+        )
+    logger.info(f"[checkpoint] 已保存 {len(results)} 条成功样本，已处理 {processed_count} 条问题")
 
 
 def load_checkpoint() -> tuple:
     if os.path.exists(CHECKPOINT_PATH):
         with open(CHECKPOINT_PATH, 'r', encoding='utf-8') as f:
             data = json.load(f)
-        logger.info(f"[断点续传] 已有 {len(data['results'])} 条数据")
-        return data["results"], data["stats"]
-    return [], {}
+        processed_count = data.get(
+            "processed_count",
+            data.get("stats", {}).get("total", len(data.get("results", []))),
+        )
+        logger.info(
+            f"[断点续传] 已有 {len(data['results'])} 条成功数据，"
+            f"累计处理 {processed_count} 条问题"
+        )
+        return data["results"], data["stats"], processed_count
+    return [], {}, 0
 
 
 # ============ 主流程 ============
@@ -1310,14 +1346,15 @@ def main():
     stats = {"total": 0, "success": 0, "failed_react": 0,
              "failed_validation": 0, "failed_rule_check": 0,
              "failed_judge": 0, "low_retrieval": 0}
+    processed_count = 0
     if args.resume:
-        results, stats = load_checkpoint()
+        results, stats, processed_count = load_checkpoint()
 
     # 收集所有 Judge 评语（通过+未通过），用于最终根因分析
     judge_feedback_log = []  # [{question, type, passed, score, issues, reason}, ...]
 
-    start_idx = len(results)
     random.shuffle(questions)
+    start_idx = min(processed_count, len(questions))
 
     # 主循环
     for idx, task in enumerate(questions[start_idx:], start=start_idx):
@@ -1390,7 +1427,7 @@ def main():
 
                 logger.info(f"    规则质检通过(score={plan['rule_check_score']})")
 
-            # Phase 2.6: 心算检测（LLM 判断，未用 calculate 时触发）
+            # Phase 2.6: 心算检测（LLM 判断，检查最终答案是否可从 Observation/calculate 结果溯源）
             mental_math_issues = check_mental_math(plan["steps"])
             if mental_math_issues:
                 evidence = mental_math_issues[0].get('detail', '')
@@ -1451,6 +1488,32 @@ def main():
                     logger.warning(f"[{idx}] Judge 未通过: {plan.get('judge_score', {}).get('reason', '')}")
                     continue  # 丢弃该条
 
+                # Judge 可能重写答案或整条轨迹，需重新走硬验证
+                passed_after_judge, validation_errors_after_judge = validate_sample(plan)
+                plan["validation_passed"] = passed_after_judge
+                plan["validation_errors"] = validation_errors_after_judge
+                if not passed_after_judge:
+                    stats["failed_validation"] += 1
+                    logger.warning(f"[{idx}] Judge 重生成后验证失败: {validation_errors_after_judge}")
+                    continue
+
+                rule_passed3, rule_issues3, rule_score3 = rule_based_quality_check(plan)
+                plan["rule_check_score"] = rule_score3
+                plan["rule_check_issues"] = [i["detail"] for i in rule_issues3]
+                if not rule_passed3:
+                    stats["failed_rule_check"] = stats.get("failed_rule_check", 0) + 1
+                    logger.warning(
+                        f"[{idx}] Judge 重生成后规则质检未通过(score={rule_score3}): "
+                        f"{[i['detail'] for i in rule_issues3[:2]]}"
+                    )
+                    continue
+
+                mental_math_issues3 = check_mental_math(plan["steps"])
+                if mental_math_issues3:
+                    stats["failed_rule_check"] = stats.get("failed_rule_check", 0) + 1
+                    logger.warning(f"[{idx}] Judge 重生成后仍存在心算: {mental_math_issues3[0]['detail']}")
+                    continue
+
             # Phase 3: V2 格式转换
             sft_sample = format_as_sft_sample(plan)
             sft_sample["validation_passed"] = plan["validation_passed"]
@@ -1460,17 +1523,19 @@ def main():
             results.append(sft_sample)
             stats["success"] += 1
 
-            if len(results) % 20 == 0:
-                save_checkpoint(results, stats)
-
             time.sleep(0.3)
 
         except Exception as e:
             logger.error(f"[{idx}] 未预期错误: {e}")
             stats["failed_react"] += 1
             continue
+        finally:
+            if stats["total"] > 0 and stats["total"] % 20 == 0:
+                save_checkpoint(results, stats, processed_count=stats["total"])
 
     # 最终保存
+    save_checkpoint(results, stats, processed_count=stats["total"])
+
     with open(FINAL_OUTPUT_PATH, 'w', encoding='utf-8') as f:
         for sample in results:
             f.write(json.dumps(sample, ensure_ascii=False) + '\n')

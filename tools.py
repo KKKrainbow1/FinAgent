@@ -381,6 +381,9 @@ class FinAgentTools:
         if not results:
             return "[检索结果为空] 未找到与查询相关的行业对比数据。"
 
+        if len(results) == 1 and results[0]["metadata"].get("match_failed"):
+            return f"[检索结果为空] {_clean_text(results[0]['text'])}"
+
         lines = [f"找到 {len(results)} 条相关行业数据："]
         for i, r in enumerate(results):
             meta = r["metadata"]
@@ -412,8 +415,19 @@ class FinAgentTools:
         答：直接 eval 有代码注入风险（虽然在离线训练场景下风险低）。
         我用正则白名单过滤，只允许数字、运算符和括号。
         """
-        # 清理输入：去掉引号、空格
+        # 清理输入：去掉引号、空格，并兼容模型常见的 Unicode 运算符
         expr = expression.strip().strip("'\"")
+        wrapper_match = re.match(r'^calculate\((.*)\)$', expr, flags=re.DOTALL)
+        if wrapper_match:
+            expr = wrapper_match.group(1).strip().strip("'\"")
+        expr = expr.translate(str.maketrans({
+            "×": "*",
+            "÷": "/",
+            "−": "-",
+            "－": "-",
+            "（": "(",
+            "）": ")",
+        }))
 
         # 安全检查：只允许数字、运算符、括号、小数点
         if not re.match(r'^[\d\s\+\-\*/\(\)\.\,%]+$', expr):
@@ -423,7 +437,7 @@ class FinAgentTools:
         expr = re.sub(r'(\d+\.?\d*)%', r'(\1/100)', expr)
 
         try:
-            result = eval(expr)
+            result = eval(expr, {"__builtins__": {}}, {})
             # 格式化输出
             if isinstance(result, float):
                 if abs(result) >= 1e8:

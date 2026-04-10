@@ -5,12 +5,12 @@ FinAgent Step 12: GRPO 训练脚本
 基于 TRL v1.0 GRPOTrainer + environment_factory，
 在 SFT v3_native_r32 基础上进行 GRPO 训练。
 
-Reward 设计：V5（Planner-focused）
-  - completeness（LLM 评价工具调用序列完整性）× 0.667
-  - calc_behavior（规则检测 calculate 使用）× 0.333
+Reward 设计：V4.1
+  - tool_coverage / query_quality / calc_behavior / strategy_match
+  - 可选 llm_judge（二元判断）
   - 格式不合规 → -1.0（前置硬约束）
   - DAPO overlong penalty（后处理）
-  - 详见 docs/GRPO_Reward_Design_V3.md（V5 部分）
+  - 实现见 grpo_plugin.py
 
 用法：
     # 正式训练
@@ -92,7 +92,7 @@ DEFAULTS = {
 
 # ============ 数据加载 ============
 
-def load_grpo_dataset(data_path: str, max_prompt_reuse: int = 3) -> Dataset:
+def load_grpo_dataset(data_path: str) -> Dataset:
     """
     加载 GRPO 训练问题集。
 
@@ -104,7 +104,6 @@ def load_grpo_dataset(data_path: str, max_prompt_reuse: int = 3) -> Dataset:
 
     Args:
         data_path: grpo_questions.jsonl 路径
-        max_prompt_reuse: 每个 prompt 最多使用次数（跨 epoch 累计）
     """
     raw_data = []
     with open(data_path, 'r', encoding='utf-8') as f:
@@ -282,7 +281,19 @@ def main():
         sys.exit(1)
 
     # ---- 加载数据 ----
-    dataset = load_grpo_dataset(args.data_path, args.max_prompt_reuse)
+    if args.max_prompt_reuse < 1:
+        logger.error("--max_prompt_reuse 必须 >= 1")
+        sys.exit(1)
+
+    effective_epochs = min(args.epochs, args.max_prompt_reuse)
+    if effective_epochs < args.epochs:
+        logger.warning(
+            "epochs=%s 超过 max_prompt_reuse=%s，"
+            "为保证每个 prompt 的累计使用次数不超过上限，训练轮数将按 %s 执行",
+            args.epochs, args.max_prompt_reuse, effective_epochs,
+        )
+
+    dataset = load_grpo_dataset(args.data_path)
 
     # ---- 加载模型 ----
     model, tokenizer = load_model_and_tokenizer(args.model_path, args.adapter_path)
@@ -337,6 +348,13 @@ def main():
     trl.trainer.grpo_trainer.parse_response = _safe_parse_response
 
     # ---- 配置 GRPO ----
+    effective_batch_size = max(args.batch_size * args.grad_accum, 1)
+    steps_per_epoch = max((len(dataset) + effective_batch_size - 1) // effective_batch_size, 1)
+    total_train_steps = max(steps_per_epoch * effective_epochs, 1)
+    warmup_steps = int(args.warmup_ratio * total_train_steps)
+    if args.warmup_ratio > 0 and warmup_steps == 0:
+        warmup_steps = 1
+
     grpo_config = GRPOConfig(
         output_dir=args.output_dir,
 
@@ -351,9 +369,9 @@ def main():
         learning_rate=args.lr,
         per_device_train_batch_size=args.batch_size,
         gradient_accumulation_steps=args.grad_accum,
-        num_train_epochs=args.epochs,
+        num_train_epochs=effective_epochs,
         max_grad_norm=args.max_grad_norm,
-        warmup_steps=int(args.warmup_ratio * 123),  # 492问×2epoch/8grad_accum≈123步
+        warmup_steps=warmup_steps,
 
         # 监控
         logging_steps=args.logging_steps,
@@ -374,7 +392,8 @@ def main():
     logger.info(f"  beta: {args.beta}")
     logger.info(f"  learning_rate: {args.lr}")
     logger.info(f"  effective_batch_size: {args.batch_size * args.grad_accum}")
-    logger.info(f"  epochs: {args.epochs}")
+    logger.info(f"  epochs: {effective_epochs}")
+    logger.info(f"  warmup_steps: {warmup_steps}")
     logger.info(f"  output_dir: {args.output_dir}")
 
     if args.dry_run:
