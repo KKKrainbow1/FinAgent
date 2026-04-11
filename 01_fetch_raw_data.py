@@ -113,13 +113,57 @@ def fetch_reports_for_stock(stock_code: str) -> pd.DataFrame:
                 return pd.DataFrame()
 
 
-def batch_fetch_reports(stocks: pd.DataFrame) -> dict:
+def _load_report_checkpoint() -> tuple[dict, dict]:
+    """
+    加载已有研报 checkpoint，供 resume 时继续追加保存。
+
+    Returns:
+        (
+            {stock_code: DataFrame},
+            {"success": int, "empty": int, "failed": int, "total_reports": int}
+        )
+    """
+    results = {}
+    stats = {"success": 0, "empty": 0, "failed": 0, "total_reports": 0}
+
+    report_path = os.path.join(REPORT_DIR, "all_reports.csv")
+    if os.path.exists(report_path):
+        df = pd.read_csv(report_path, dtype={'股票代码': str})
+        if len(df) > 0 and '股票代码' in df.columns:
+            for code, group in df.groupby('股票代码', sort=False):
+                if pd.isna(code):
+                    continue
+                results[str(code)] = group.reset_index(drop=True)
+            stats["success"] = len(results)
+            stats["total_reports"] = len(df)
+            logger.info(f"[断点续传] 已加载 {stats['success']} 只股票的历史研报，共 {stats['total_reports']} 篇")
+
+    stats_path = os.path.join(REPORT_DIR, "fetch_stats.json")
+    if os.path.exists(stats_path):
+        try:
+            with open(stats_path, 'r', encoding='utf-8') as f:
+                old_stats = json.load(f)
+            stats["empty"] = int(old_stats.get("empty", 0))
+            stats["failed"] = int(old_stats.get("failed", 0))
+        except Exception as e:
+            logger.warning(f"[断点续传] 读取历史研报统计失败: {e}")
+
+    return results, stats
+
+
+def batch_fetch_reports(stocks: pd.DataFrame, existing_results: dict = None,
+                        existing_stats: dict = None) -> dict:
     """
     批量拉取研报数据
     返回: {stock_code: DataFrame} 的字典
     """
     results = {}
+    if existing_results:
+        results.update({code: df.copy() for code, df in existing_results.items()})
+
     stats = {"success": 0, "empty": 0, "failed": 0, "total_reports": 0}
+    if existing_stats:
+        stats.update(existing_stats)
 
     logger.info(f"===== 开始拉取研报数据，共 {len(stocks)} 只股票 =====")
 
@@ -133,8 +177,12 @@ def batch_fetch_reports(stocks: pd.DataFrame) -> dict:
             # 添加股票名称（原始数据可能没有）
             if '股票简称' not in df.columns:
                 df['股票简称'] = name
+            old_df = results.get(code)
+            if old_df is None:
+                stats["success"] += 1
+            else:
+                stats["total_reports"] -= len(old_df)
             results[code] = df
-            stats["success"] += 1
             stats["total_reports"] += len(df)
             logger.info(f"  [{code} {name}] 获取 {len(df)} 篇研报")
         else:
@@ -415,10 +463,13 @@ def main():
 
     report_stocks = stocks
     financial_stocks = stocks
+    existing_report_results = None
+    existing_report_stats = None
 
     # 2. 断点续传：按任务类型分别过滤已完成的股票
     if args.resume:
         if not args.skip_reports:
+            existing_report_results, existing_report_stats = _load_report_checkpoint()
             report_done = load_report_progress()
             report_stocks = stocks[~stocks['stock_code'].isin(report_done)].reset_index(drop=True)
             logger.info(f"断点续传[研报]: 跳过 {len(report_done)} 只, 剩余 {len(report_stocks)} 只")
@@ -435,7 +486,11 @@ def main():
 
     # 4. 拉取研报
     if not args.skip_reports:
-        report_results = batch_fetch_reports(report_stocks)
+        report_results = batch_fetch_reports(
+            report_stocks,
+            existing_results=existing_report_results,
+            existing_stats=existing_report_stats,
+        )
 
     # 5. 拉取财务数据
     if not args.skip_financial:
