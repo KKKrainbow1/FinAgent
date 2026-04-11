@@ -71,10 +71,11 @@ DEFAULTS = {
 
     # 训练参数
     # V2: lr 从 5e-7 提到 1e-6（V1 太低几乎不更新，Qwen2.5 DPO 用 7e-7，LoRA 需稍高）
-    # V2: grad_accum 8→4（配合 gen=8 保持 effective batch=32 不变）
+    # V2: grad_accum 保持 8（TRL 要求 generation_batch_size 能被 num_generations 整除）
+    # effective batch = 1 × 8 = 8 questions × 8 rollouts = 64 samples/step
     "learning_rate": 1e-6,
     "per_device_train_batch_size": 1,
-    "gradient_accumulation_steps": 4,
+    "gradient_accumulation_steps": 8,
     "num_train_epochs": 2,
     "max_grad_norm": 0.5,
     "warmup_ratio": 0.05,
