@@ -54,17 +54,19 @@ FORMAT_INVALID_PENALTY = -1.0
 REPEAT_QUERY_THRESHOLD = 0.85
 
 # Reward 权重（根据 USE_LLM 切换）
+# V4.1.2: calc_behavior 从 0.20 降到 0.10（95% 问题零 variance，留给 SFT 阶段优化）
+#          腾出的权重分给有 variance 的维度
 if USE_LLM:
-    W_TOOL_COVERAGE = 0.30
-    W_QUERY_QUALITY = 0.20
-    W_CALC_BEHAVIOR = 0.15
+    W_TOOL_COVERAGE = 0.32
+    W_QUERY_QUALITY = 0.23
+    W_CALC_BEHAVIOR = 0.10
     W_STRATEGY_MATCH = 0.15
     W_LLM_JUDGE = 0.20
 else:
-    W_TOOL_COVERAGE = 0.35
-    W_QUERY_QUALITY = 0.25
-    W_CALC_BEHAVIOR = 0.20
-    W_STRATEGY_MATCH = 0.20
+    W_TOOL_COVERAGE = 0.37
+    W_QUERY_QUALITY = 0.28
+    W_CALC_BEHAVIOR = 0.10
+    W_STRATEGY_MATCH = 0.25
     W_LLM_JUDGE = 0.0
 
 VALID_TOOLS = {"search_financial", "search_report", "search_industry", "calculate"}
@@ -440,7 +442,7 @@ def _compute_strategy_match(question_type: str, question: str,
     if question_type == "company_comparison":
         return _strategy_comparison(tool_steps, queries)
     elif question_type == "risk_analysis":
-        return _strategy_risk(queries)
+        return _strategy_risk(queries, question)
     elif question_type == "single_company_medium":
         return _strategy_medium(question, queries)
     elif question_type == "industry_analysis":
@@ -498,23 +500,44 @@ def _strategy_comparison(tool_steps: list, queries: List[str]) -> float:
         return 0.3
 
 
-def _strategy_risk(queries: List[str]) -> float:
-    """risk_analysis：是否同时覆盖偿债和盈利维度"""
+def _strategy_risk(queries: List[str], question: str = "") -> float:
+    """
+    risk_analysis：搜索维度是否匹配问题需求。
+
+    V4.1.2 修正：不再一刀切要求双维度。
+    - 如果问题明确只问偿债或只问盈利 → 覆盖对应维度即满分
+    - 如果问题是通用风险（未指定维度）→ 仍要求双维度
+    - 保留"至少覆盖一个维度"的底线
+    """
     from reward_knowledge_base import (
         extract_metrics_from_queries, get_dimensions_from_metrics,
+        extract_dimensions,
     )
     all_metrics = extract_metrics_from_queries(queries)
-    dims = get_dimensions_from_metrics(all_metrics)
+    covered_dims = get_dimensions_from_metrics(all_metrics)
 
-    has_leverage = "偿债/杠杆" in dims
-    has_profit = "盈利能力" in dims
+    has_leverage = "偿债/杠杆" in covered_dims
+    has_profit = "盈利能力" in covered_dims
 
-    if has_leverage and has_profit:
-        return 1.0
-    elif has_leverage or has_profit:
-        return 0.5
+    # 从问题中提取目标维度
+    target_dims = extract_dimensions(question) if question else set()
+
+    if target_dims:
+        # 问题指定了维度 → 按覆盖比例打分
+        if target_dims.issubset(covered_dims):
+            return 1.0
+        elif target_dims & covered_dims:
+            return 0.6
+        else:
+            return 0.1
     else:
-        return 0.0
+        # 通用风险问题（未指定维度）→ 默认要求偿债+盈利双维度
+        if has_leverage and has_profit:
+            return 1.0
+        elif has_leverage or has_profit:
+            return 0.5
+        else:
+            return 0.0
 
 
 def _strategy_medium(question: str, queries: List[str]) -> float:
@@ -619,7 +642,24 @@ def _compute_reject_reward(env, answer: str) -> float:
 
 # ============ LLM 二元判断（维度 5，可选）============
 
-LLM_BINARY_PROMPT = """你是金融分析工具调用的评审。请判断以下 Agent 的搜索策略是否合理地覆盖了回答问题所需的信息。
+LLM_BINARY_PROMPT = """你是一个金融分析 Agent 工具调用策略的评审。
+
+## Agent 的能力范围
+Agent **仅有**以下 4 个工具，没有其他信息来源：
+1. **search_financial(query)**：搜索公司财务数据（ROE、净利率、资产负债率等），每次返回 top-3 条
+2. **search_report(query)**：搜索券商研报（目标价、评级、EPS 预测），每次返回 top-3 条
+3. **search_industry(query)**：搜索行业对比数据（同行业公司指标均值和排名）
+4. **calculate(expression)**：计算数学表达式
+
+数据库覆盖：沪深300公司的财务指标 + 券商研报 + 30个行业对比数据。
+**不包含**：现金流明细、费用率、股价K线、管理层信息、政策原文。
+
+## 评判标准
+请判断 Agent 的搜索策略在**上述工具能力范围内**是否合理：
+- **合理**：在有限的工具内，做出了基本正确的工具选择和搜索顺序。不要求完美，只要主要信息覆盖到即可。为获取不同维度的数据而分多次搜索是合理的，但用相似的 query 重复搜索同一类信息算冗余。
+- **不合理**：明显的工具选择错误（如该搜财务数据却只搜了研报），或完全遗漏了关键信息维度（如对比两家公司只搜了一家）。
+
+## 待评审的问题和工具调用
 
 问题：{question}
 问题类型：{question_type}

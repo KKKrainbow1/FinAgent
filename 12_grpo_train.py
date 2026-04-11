@@ -60,7 +60,7 @@ DEFAULTS = {
     "model_path": "./models/Qwen2.5-14B-Instruct",
     "adapter_path": "./outputs/sft_lora_v3_native_r32_v3/final",
     "data_path": "./data/grpo/grpo_questions.jsonl",
-    "output_dir": "./outputs/grpo_v1",
+    "output_dir": "./outputs/grpo_v2",
 
     # GRPO 核心参数
     "num_generations": 4,
@@ -69,7 +69,8 @@ DEFAULTS = {
     "beta": 0.0,            # 不使用 KL 正则化（参考 ToolRL）
 
     # 训练参数
-    "learning_rate": 5e-7,
+    # V2: lr 从 5e-7 提到 1e-6（V1 太低几乎不更新，Qwen2.5 DPO 用 7e-7，LoRA 需稍高）
+    "learning_rate": 1e-6,
     "per_device_train_batch_size": 1,
     "gradient_accumulation_steps": 8,
     "num_train_epochs": 2,

@@ -89,13 +89,17 @@ VALID_TOOLS = {"search_financial", "search_report", "search_industry", "calculat
 #   tool / tools: 工具名（部分 check 类型需要）
 #   condition: 触发条件（conditional 级别才有，如 "needs_calc"）
 
+# V4.1.2 修正：
+#   - industry_analysis: search_financial 从 should 升为 must（行业分析必须搜个股数据验证）
+#   - risk_analysis: search_report/search_industry 权重提高（GPT 56/87 认为是 must，但保留为 should 留探索空间）
+#   - single_company_medium: search_industry 权重从 0.20 提到 0.25（GPT 32/85 认为 must）
 TOOL_REQUIREMENTS = {
     "single_company_medium": {
         "must": [
-            {"check": "has_tool", "tool": "search_financial", "weight": 0.40},
+            {"check": "has_tool", "tool": "search_financial", "weight": 0.35},
         ],
         "should": [
-            {"check": "has_any_tool", "tools": ["search_report", "search_industry"], "weight": 0.20},
+            {"check": "has_any_tool", "tools": ["search_report", "search_industry"], "weight": 0.25},
             {"check": "query_has_metric", "weight": 0.10},
         ],
         "conditional": [
@@ -115,10 +119,10 @@ TOOL_REQUIREMENTS = {
     },
     "risk_analysis": {
         "must": [
-            {"check": "has_tool", "tool": "search_financial", "weight": 0.40},
+            {"check": "has_tool", "tool": "search_financial", "weight": 0.35},
         ],
         "should": [
-            {"check": "has_any_tool", "tools": ["search_report", "search_industry"], "weight": 0.20},
+            {"check": "has_any_tool", "tools": ["search_report", "search_industry"], "weight": 0.25},
             {"check": "query_has_leverage_metric", "weight": 0.20},
         ],
         "conditional": [
@@ -127,10 +131,10 @@ TOOL_REQUIREMENTS = {
     },
     "industry_analysis": {
         "must": [
-            {"check": "has_tool", "tool": "search_industry", "weight": 0.40},
+            {"check": "has_tool", "tool": "search_industry", "weight": 0.35},
+            {"check": "has_tool", "tool": "search_financial", "weight": 0.25},
         ],
         "should": [
-            {"check": "has_tool", "tool": "search_financial", "weight": 0.20},
             {"check": "has_tool", "tool": "search_report", "weight": 0.20},
             {"check": "query_has_industry_name", "weight": 0.20},
         ],
@@ -165,14 +169,19 @@ TOOL_REQUIREMENTS = {
 # ============================================================
 
 # 强触发：单独出现即判定 needs_calc = True
+# V4.1.2 修正：
+#   - 移除数据库已预算的（杜邦/增长率/比率）
+#   - 新增量化差异类词（偏离/拖累/高出/低出）
 CALC_STRONG_TRIGGERS = [
-    "杜邦", "拆解", "分解",
-    "增长率", "同比增长", "环比增长",
-    "差值", "差距",
-    "比率", "比值",
+    "差值", "差距", "差多少",
+    "偏离", "拖累",
+    "高出", "低出",
     "加权", "平均",
     "复合增长", "CAGR",
 ]
+
+# 弱触发：company_comparison + 显式量化对比词（不再用"谁/哪家"，太宽）
+_WEAK_COMPARISON_KEYWORDS = re.compile(r'差距|差值|差多少|高出|低出|量化|计算|测算')
 
 # 心算检测正则（只检查涉及运算符+等号的模式，避免误匹配引用数据）
 MENTAL_CALC_PATTERNS = [
@@ -184,13 +193,20 @@ MENTAL_CALC_PATTERNS = [
 ]
 
 
-def check_needs_calc(question: str, answer: str = "") -> bool:
+def check_needs_calc(question: str, answer: str = "",
+                     question_type: str = "") -> bool:
     """
-    判断是否需要 calculate（双路径）。
+    判断是否需要 calculate（三路径）。
 
-    路径 1a：question 中有强触发关键词
+    路径 1a：question 中有强触发关键词（差值/差距/加权/平均/CAGR）
+    路径 1b：弱触发 — company_comparison + "谁/哪家"（隐含需要量化差距）
     路径 2：answer 中检测到心算模式
-    路径 1b（弱触发）：暂不启用，后续补充
+
+    V4.1.1 修正：
+    - 移除"杜邦/拆解/分解"（杜邦 chunk 已预算三因子）
+    - 移除"增长率/同比增长/环比增长"（数据库直接有增长率）
+    - 移除"比率/比值"（通常是查询不是计算）
+    - 新增弱触发：company_comparison + "谁/哪家" → 隐含需要减法量化
 
     Returns:
         True 如果判定"需要计算"
@@ -200,8 +216,9 @@ def check_needs_calc(question: str, answer: str = "") -> bool:
         if keyword in question:
             return True
 
-    # 路径 1b：弱触发（实验 1 阶段暂不启用）
-    # TODO: 补充 requires_two_entities / requires_time_range / requires_numeric_context
+    # 路径 1b：弱触发 — 对比类问题含"谁/哪家"隐含需要量化差距
+    if question_type == "company_comparison" and _WEAK_COMPARISON_KEYWORDS.search(question):
+        return True
 
     # 路径 2：answer 心算检测
     if answer:
@@ -223,10 +240,24 @@ def detect_mental_calc(answer: str) -> bool:
 # 四、维度提取（V4.1 Section 3.4）
 # ============================================================
 
+# V4.1.2 修正：
+#   - "杜邦" 加入 comprehensive（GPT 认为杜邦涉及净利率+周转+杠杆=3维度=全面）
+#   - 新增"经营表现/财务健康/多维/综合评估"触发 comprehensive
 COMPREHENSIVE_KEYWORDS = [
     "全面评估", "综合分析", "财务状况", "投资价值",
     "整体", "全方位", "全面分析",
+    "杜邦", "ROE拆解", "ROE 拆解",
+    "经营表现", "财务健康", "综合评估", "多维",
 ]
+
+# V4.1.2 修正：补充高频漏提取的维度关键词（基于 GPT-5.4 验证）
+# 保留适度间隙——不穷举，让 GRPO 有探索空间
+_EXTRA_DIMENSION_KEYWORDS = {
+    "成长性": ["营收", "收入增长", "利润增", "EPS", "eps", "业绩增长", "高增长"],
+    "盈利能力": ["ROE变化", "盈利质量", "盈利修复", "盈利改善", "盈利韧性", "利润率"],
+    "估值": ["目标价", "评级", "估值水平", "PE倍数"],
+    "营运效率": ["资产运营", "资产运转", "经营效率"],
+}
 
 
 def extract_dimensions(question: str) -> Set[str]:
@@ -237,22 +268,26 @@ def extract_dimensions(question: str) -> Set[str]:
     - 路径 1：匹配维度关键词（如"盈利"→盈利能力）
     - 路径 2：匹配具体指标名，反查维度（如"ROE"→盈利能力）
 
-    特殊规则：
-    - "全面评估"等 → 扩展为 {盈利能力, 偿债/杠杆, 营运效率}
-    - "杜邦"/"ROE 拆解" → {盈利能力, 营运效率, 偿债/杠杆}
+    V4.1.2 修正：
+    - "杜邦" 移入 comprehensive（涉及 3 个维度）
+    - 补充高频漏提取关键词（成长性、盈利能力、估值、营运效率）
     - 未匹配到 → 返回空集（调用方跳过匹配检查）
     """
-    # 特殊规则优先
+    # 特殊规则优先：comprehensive 类关键词 → 三维度
     if any(kw in question for kw in COMPREHENSIVE_KEYWORDS):
         return {"盈利能力", "偿债/杠杆", "营运效率"}
-    if "杜邦" in question or "ROE拆解" in question or "ROE 拆解" in question:
-        return {"盈利能力", "营运效率", "偿债/杠杆"}
 
     dims = set()
 
-    # 路径 1：维度关键词
+    # 路径 1：维度关键词（原始）
     for dim_name, config in DIMENSION_CONFIG.items():
         for kw in config["keywords"]:
+            if kw in question:
+                dims.add(dim_name)
+
+    # 路径 1b：补充的维度关键词（V4.1.2 新增）
+    for dim_name, keywords in _EXTRA_DIMENSION_KEYWORDS.items():
+        for kw in keywords:
             if kw in question:
                 dims.add(dim_name)
 
