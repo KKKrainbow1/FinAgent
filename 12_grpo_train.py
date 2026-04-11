@@ -63,16 +63,18 @@ DEFAULTS = {
     "output_dir": "./outputs/grpo_v2",
 
     # GRPO 核心参数
-    "num_generations": 4,
+    # V2: num_generations 4→8（C(8,2)=28 对 vs C(4,2)=6 对，GRPO 信号更准确）
+    "num_generations": 8,
     "temperature": 0.9,
     "max_completion_length": 12288,
     "beta": 0.0,            # 不使用 KL 正则化（参考 ToolRL）
 
     # 训练参数
     # V2: lr 从 5e-7 提到 1e-6（V1 太低几乎不更新，Qwen2.5 DPO 用 7e-7，LoRA 需稍高）
+    # V2: grad_accum 8→4（配合 gen=8 保持 effective batch=32 不变）
     "learning_rate": 1e-6,
     "per_device_train_batch_size": 1,
-    "gradient_accumulation_steps": 8,
+    "gradient_accumulation_steps": 4,
     "num_train_epochs": 2,
     "max_grad_norm": 0.5,
     "warmup_ratio": 0.05,
