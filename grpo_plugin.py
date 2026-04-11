@@ -264,7 +264,7 @@ def finagent_reward(completions, environments=None, **kwargs) -> list:
         question, question_type = _extract_question_and_type(idx, kwargs)
         answer = _extract_final_answer(completion)
         queries = [s["query"] for s in env.tool_steps]
-        needs_calc = check_needs_calc(question, answer)
+        needs_calc = check_needs_calc(question, answer, question_type)
         dimensions = extract_dimensions(question)
         type_config = TOOL_REQUIREMENTS.get(question_type,
                                             TOOL_REQUIREMENTS.get("single_company_medium"))
