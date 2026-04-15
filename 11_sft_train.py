@@ -57,7 +57,7 @@ from transformers import (
     Trainer,
     DataCollatorForSeq2Seq,
 )
-from peft import LoraConfig, get_peft_model, TaskType
+from peft import LoraConfig, get_peft_model, PeftModel, TaskType
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
@@ -393,15 +393,25 @@ def train(args):
     )
     model.enable_input_require_grads()  # LoRA 需要
 
-    lora_config = LoraConfig(
-        task_type=TaskType.CAUSAL_LM,
-        r=args.lora_rank,
-        lora_alpha=args.lora_alpha,
-        lora_dropout=0.05,
-        target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
-                         "gate_proj", "up_proj", "down_proj"],
-    )
-    model = get_peft_model(model, lora_config)
+    if args.adapter_path:
+        # 加载已有 adapter 继续训（用于 post-GRPO SFT 修补等场景）
+        logger.info(f"  加载已有 adapter: {args.adapter_path}")
+        model = PeftModel.from_pretrained(
+            model,
+            args.adapter_path,
+            is_trainable=True,
+        )
+    else:
+        # 从零创建新 LoRA
+        lora_config = LoraConfig(
+            task_type=TaskType.CAUSAL_LM,
+            r=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=0.05,
+            target_modules=["q_proj", "k_proj", "v_proj", "o_proj",
+                             "gate_proj", "up_proj", "down_proj"],
+        )
+        model = get_peft_model(model, lora_config)
     model.print_trainable_parameters()
 
     # 5. 训练
@@ -475,6 +485,8 @@ def main():
                         help="LoRA rank")
     parser.add_argument("--lora_alpha", type=int, default=128,
                         help="LoRA alpha（通常为 2*rank）")
+    parser.add_argument("--adapter_path", type=str, default=None,
+                        help="已有 LoRA adapter 路径（加载后继续训，用于 post-GRPO SFT 修补）")
     parser.add_argument("--dry-run", action="store_true",
                         help="只做数据预处理检查，不训练")
 
