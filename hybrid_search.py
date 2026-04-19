@@ -1,128 +1,61 @@
 """
-FinAgent Step 6: 统一检索模块
-用途：封装 FAISS + BM25 检索逻辑，供 Agent 工具层调用
-依赖：pip install sentence-transformers faiss-gpu rank_bm25 jieba numpy
+FinAgent Retriever (V3 · Milvus 版)
 
-设计要点：
-    1. search_financial: 混合检索（FAISS 为主），只搜 financial chunks
-       - 你的实验已证明：纯 BM25 对 financial 有系统性偏差（总返回偿债 chunk）
-       - FAISS 能正确区分"盈利能力"和"偿债能力"的语义
-       - BM25 辅助精确匹配公司名和指标名
-    2. search_report: 两路合并
-       - 研报元数据（report）→ BM25 为主（结构化短文本，关键词精确匹配）
-       - PDF 正文（report_fulltext）→ FAISS 为主（自由文本，需要语义理解）
-       - 两路各取 top-K，交替合并返回
+架构对照: docs/Finagent项目介绍.md 第 4 节 / docs/Chunk_Alignment_20260420.md 第 14 节
 
-面试追问：为什么 search_financial 不用纯 BM25？
-答：最初假设结构化数据用 BM25 就够了，但实验发现 BM25 对文档长度有偏置——
-偿债 chunk 字段更多、文本更长，BM25 的 TF-IDF 打分倾向给长文档更高分。
-搜"贵州茅台盈利能力"时 BM25 top-3 全是偿债指标，而 FAISS 能正确返回盈利指标。
-所以 financial 也改用了混合检索，FAISS 权重调高（alpha=0.7）以语义匹配为主。
+对外 API 保持不变(grpo_plugin / react_agent / tools / sft_data 等无需改):
+    retriever = FinAgentRetriever()
+    retriever.search_financial(query, top_k=5)  -> list[dict]
+    retriever.search_industry(query, top_k=5)   -> list[dict]
+    retriever.search_report(query, top_k=10)    -> list[dict]
 
-面试追问：search_report 为什么用两路合并而不是统一混合？
-答：研报元数据和 PDF 正文的文本特征差异太大。元数据是结构化短文本（标题+评级+EPS），
-PDF 正文是自由长文本（分析论证）。统一混合时 PDF 正文的 chunk 数量远多于元数据（14,684 vs 39,044），
-但元数据里的评级、EPS 预测等信息是高价值的。两路分别检索再合并，保证两种数据都能被召回。
+每个 dict 格式:{text, metadata, score},和 V2 保持一致。
+
+内部实现(全部从 FAISS/BM25 双轨 + 应用层 RRF + enrich_with_parent 迁移到 Milvus):
+  - 所有 chunk 在一个 Milvus collection,scalar filter 路由 3 工具
+  - dense (BGE 768) + sparse (BM25 via pymilvus) 两路 hybrid_search
+  - RRFRanker 融合 dense/sparse 两路(search_report 元数据路仍用 WeightedRanker)
+  - Parent-Child dedup 在应用层做(enrich_with_parent,Lite 不支持 group_by_field,
+    且 NULL 字段分组陷阱,统一应用层处理更稳)
+  - Parent 数据全部冗余在 Child metadata,1 次 search 拿完
+  - search_industry 走 V3 Parent-Child 复用(255 别名 Child + industry Parent)
+
+依赖:
+  pip install pymilvus sentence-transformers
+
+V1 FAISS 版本备份在 hybrid_search_legacy_faiss.py,不建议继续使用。
 """
-
-import json
-import os
-import pickle
 import logging
-import numpy as np
+from collections import OrderedDict
+from pathlib import Path
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-# ============ 配置 ============
-INDEX_DIR = "./data/index"
-EMBEDDING_MODEL = "./models/BAAI/bge-base-zh-v1___5"
+ROOT = Path(__file__).resolve().parent.parent
+
+# ============ 默认路径配置 ============
+DEFAULT_COLLECTION = "finagent"
+DEFAULT_DB_PATH = ROOT / "data/processed/milvus_finagent.db"
+DEFAULT_BM25_PATH = ROOT / "data/processed/bm25_ef.pkl"
+DEFAULT_ENCODER = "./models/bge-base-zh-v1.5"
 
 
 class FinAgentRetriever:
     """
-    FinAgent 统一检索器
+    V3 Milvus 版统一检索器。无参构造自动加载默认 DB + BM25 + BGE。
 
-    加载一套索引（FAISS + BM25 + 元数据），
-    根据工具类型选择不同的检索策略和 source_type 过滤。
-
-    用法：
-        retriever = FinAgentRetriever()
-        retriever.load_index()
-
-        # Agent 工具调用
-        results = retriever.search_financial("贵州茅台 ROE 2024")
-        results = retriever.search_report("宁德时代 投资评级 目标价")
+    三种部署:
+        Lite (默认):    MilvusClient("./data/processed/milvus_finagent.db")
+        Standalone:     MilvusClient(uri="http://localhost:19530") — 传 uri 参数
     """
 
-    def __init__(self, index_dir: str = INDEX_DIR, model_path: str = EMBEDDING_MODEL):
-        self.index_dir = index_dir
-        self.model_path = model_path
+    # ============ 行业别名字典(保留,给 05a + reward_knowledge_base 用) ============
+    # ⚠️ 更新别名时注意:
+    #   - 05a_build_industry_aliases.py 会 import 这两个 dict 构建 industry_alias entity
+    #   - reward_knowledge_base.py 也引用
 
-        # 延迟加载，调用 load_index() 后才可用
-        self.faiss_index = None
-        self.bm25 = None
-        self.encoder = None
-        self.texts = []       # 所有 chunk 的文本
-        self.metadatas = []   # 所有 chunk 的元数据
-
-        # 预计算的 source_type → chunk 下标映射，加速过滤
-        self._source_type_ids = {}
-
-    def load_index(self):
-        """加载 FAISS 索引、BM25 索引、embedding 模型、chunk 元数据"""
-        import faiss
-        from sentence_transformers import SentenceTransformer
-
-        logger.info("加载检索索引...")
-
-        # 1. FAISS
-        faiss_path = os.path.join(self.index_dir, "faiss_index.bin")
-        self.faiss_index = faiss.read_index(faiss_path)
-        logger.info(f"  FAISS: {self.faiss_index.ntotal} 条向量, {self.faiss_index.d} 维")
-
-        # 2. BM25
-        bm25_path = os.path.join(self.index_dir, "bm25_index.pkl")
-        with open(bm25_path, 'rb') as f:
-            bm25_data = pickle.load(f)
-        self.bm25 = bm25_data["bm25"]
-        logger.info(f"  BM25: 已加载")
-
-        # 3. Embedding 模型
-        self.encoder = SentenceTransformer(self.model_path)
-        logger.info(f"  Encoder: {self.model_path} ({self.encoder.device})")
-
-        # 4. Chunk 元数据（文本 + metadata）
-        meta_path = os.path.join(self.index_dir, "chunk_metadata.pkl")
-        with open(meta_path, 'rb') as f:
-            meta_data = pickle.load(f)
-        self.texts = meta_data["texts"]
-        self.metadatas = meta_data["metadatas"]
-        logger.info(f"  Chunks: {len(self.texts)} 条")
-
-        # 5. 预计算 source_type → 下标集合（避免每次检索都遍历）
-        self._build_source_type_index()
-
-        # 6. 预计算行业名 → chunk 下标的精确映射
-        self._build_industry_index()
-
-        logger.info("检索索引加载完成")
-
-    def _build_source_type_index(self):
-        """预计算每种 source_type 对应的 chunk 下标集合"""
-        self._source_type_ids = {}
-        for idx, meta in enumerate(self.metadatas):
-            st = meta.get("source_type", "unknown")
-            if st not in self._source_type_ids:
-                self._source_type_ids[st] = set()
-            self._source_type_ids[st].add(idx)
-
-        for st, ids in self._source_type_ids.items():
-            logger.info(f"  source_type '{st}': {len(ids)} 条")
-
-    # 东财细分行业 → 大类映射（复制自 04_build_chunks.py 的 INDUSTRY_MAP）
-    # ⚠️ 如果 04_build_chunks.py 的 INDUSTRY_MAP 有更新，这里必须同步修改
-    # 不直接 import 是因为两个文件的使用场景不同（build_chunks 只在数据构建时跑）
     _INDUSTRY_MAP = {
         "银行": ["银行", "银行Ⅱ"],
         "保险": ["保险", "保险Ⅱ"],
@@ -157,11 +90,9 @@ class FinAgentRetriever:
         "纺织服装": ["纺织制造", "纺织服装"],
         "零售": ["一般零售", "旅游零售Ⅱ", "家居用品"],
         "安防": ["安防设备"],
-        "其他电源设备Ⅱ": [],  # 东财没有细分，只有大类自身
+        "其他电源设备Ⅱ": [],
     }
 
-    # 模型口语化别名（东财没有，但模型实际会搜的说法）
-    # 基于 100 条推理结果中 84 次 search_industry 的实际 query 验证
     _EXTRA_ALIASES = {
         "白酒": ["白酒", "酒类", "高端白酒"],
         "银行": ["银行", "商业银行", "金融"],
@@ -197,387 +128,455 @@ class FinAgentRetriever:
         "其他电源设备Ⅱ": ["其他电源设备", "电源设备", "电力设备", "发电设备", "电气设备"],
     }
 
-    def _build_industry_index(self):
+    # ============ 构造函数 ============
+
+    def __init__(
+        self,
+        collection: str = DEFAULT_COLLECTION,
+        db_path: Optional[str] = None,
+        uri: Optional[str] = None,
+        bm25_path: Optional[str] = None,
+        encoder_model: str = DEFAULT_ENCODER,
+        enrich_parents: bool = True,
+    ):
+        from pymilvus import MilvusClient
+
+        # Milvus 连接:uri 优先,否则用 Lite 文件
+        if uri:
+            self.client = MilvusClient(uri=uri)
+            logger.info(f"Milvus 连接: {uri}")
+        else:
+            path = db_path or str(DEFAULT_DB_PATH)
+            self.client = MilvusClient(path)
+            logger.info(f"Milvus Lite 连接: {path}")
+
+        self.collection = collection
+        self.enrich_parents = enrich_parents
+
+        # BGE dense encoder
+        from sentence_transformers import SentenceTransformer
+        logger.info(f"加载 BGE encoder: {encoder_model}")
+        self.encoder = SentenceTransformer(encoder_model)
+
+        # BM25 sparse(加载 05 时 fit 保存的模型)
+        from pymilvus.model.sparse import BM25EmbeddingFunction
+        from pymilvus.model.sparse.bm25.tokenizers import build_default_analyzer
+        self.bm25_ef = BM25EmbeddingFunction(build_default_analyzer(language="zh"))
+        bm25p = bm25_path or str(DEFAULT_BM25_PATH)
+        if Path(bm25p).exists():
+            # pymilvus 2.5+ 是 load(),2.4.x 是 load_from_file(),兼容两种
+            if hasattr(self.bm25_ef, 'load'):
+                self.bm25_ef.load(bm25p)
+            elif hasattr(self.bm25_ef, 'load_from_file'):
+                self.bm25_ef.load_from_file(bm25p)
+            else:
+                import pickle
+                with open(bm25p, 'rb') as f:
+                    self.bm25_ef = pickle.load(f)
+            logger.info(f"BM25 模型加载: {bm25p}")
+        else:
+            logger.warning(f"⚠️  BM25 模型 {bm25p} 不存在,sparse 检索不可用(只有 dense)")
+
+        # 扁平 alias → industry map(快路径:字典命中优先,否则向量 fallback)
+        self._alias_to_industry = self._flatten_aliases()
+        logger.info(f"行业别名字典: {len(self._alias_to_industry)} 个别名")
+
+        logger.info("✅ FinAgentRetriever (V3 Milvus) 就绪")
+
+    # ============ helpers ============
+
+    @classmethod
+    def _flatten_aliases(cls) -> dict:
+        """扁平化 _INDUSTRY_MAP + _EXTRA_ALIASES 为 alias → industry"""
+        mp = {}
+        for standard in cls._INDUSTRY_MAP:
+            mp[standard] = standard
+        for standard, subs in cls._INDUSTRY_MAP.items():
+            for sub in subs:
+                mp[sub] = standard
+                clean = sub.replace("Ⅱ", "").strip()
+                if clean and clean != sub:
+                    mp[clean] = standard
+        for standard, aliases in cls._EXTRA_ALIASES.items():
+            for a in aliases:
+                if a not in mp:
+                    mp[a] = standard
+        return mp
+
+    def _embed(self, query: str) -> tuple[list, dict]:
+        """query → (dense 向量 list, sparse {col: weight} dict)"""
+        dense = self.encoder.encode(
+            [query], normalize_embeddings=True
+        )[0].tolist()
+
+        sparse_csr = self.bm25_ef.encode_queries([query])
+        start, end = sparse_csr.indptr[0], sparse_csr.indptr[1]
+        sparse = {
+            int(k): float(v)
+            for k, v in zip(sparse_csr.indices[start:end],
+                            sparse_csr.data[start:end])
+        }
+        return dense, sparse
+
+    @staticmethod
+    def _hit_to_chunk(hit) -> dict:
         """
-        预计算行业名 → chunk 下标的精确映射。
-
-        别名来源分两层：
-        1. 东财 INDUSTRY_MAP 的反向映射（130 个细分行业名，官方分类）
-        2. _EXTRA_ALIASES 的口语化别名（基于模型实际 query 验证）
-        3. 标准大类名自身（"银行"→"银行"）
-
-        以后 INDUSTRY_MAP 加了新行业，这里自动跟上。
+        Milvus hit → {text, metadata, score} 标准格式
+        hit['id'] 是主键 chunk_id(不在 output_fields 里自动返回),手动放进 metadata 让 RRF 能 dedup
         """
-        import re
-        self._industry_name_to_idx = {}   # 标准行业名 → chunk 下标
-        self._alias_to_industry = {}       # 别名 → 标准行业名
+        entity = dict(hit.get('entity', {}))
+        text = entity.pop('text', '')
+        # 主键 → metadata.chunk_id,避免 _external_rrf 用 id() 导致 dedup 失效
+        pk = hit.get('id') or hit.get('pk')
+        if pk is not None:
+            entity['chunk_id'] = pk
+        return {
+            'text': text,
+            'metadata': entity,
+            'score': float(hit.get('distance', 0.0)),
+        }
 
-        # Step 1: 从 chunk 文本提取标准行业名
-        industry_ids = self._source_type_ids.get("industry", set())
-        for idx in industry_ids:
-            text = self.texts[idx]
-            match = re.match(r'(\S+?)行业对比', text)
-            if match:
-                name = match.group(1)
-                self._industry_name_to_idx[name] = idx
+    # ============ search_financial ============
 
-        # Step 2: 从 INDUSTRY_MAP 构建反向映射（东财细分 → 大类）
-        for standard_name, sub_industries in self._INDUSTRY_MAP.items():
-            if standard_name in self._industry_name_to_idx:
-                # 标准大类名自身
-                self._alias_to_industry[standard_name] = standard_name
-                # 东财细分行业名
-                for sub in sub_industries:
-                    # 去掉Ⅱ后缀也作为别名（模型不会打Ⅱ）
-                    self._alias_to_industry[sub] = standard_name
-                    clean = sub.replace("Ⅱ", "").strip()
-                    if clean and clean != sub:
-                        self._alias_to_industry[clean] = standard_name
-
-        # Step 3: 合并口语化别名（不覆盖已有的东财映射）
-        for standard_name, aliases in self._EXTRA_ALIASES.items():
-            if standard_name in self._industry_name_to_idx:
-                for alias in aliases:
-                    if alias not in self._alias_to_industry:
-                        self._alias_to_industry[alias] = standard_name
-
-        logger.info(f"  行业索引: {len(self._industry_name_to_idx)} 个行业, "
-                    f"{len(self._alias_to_industry)} 个别名")
-
-    # ================================================================
-    #  核心检索方法：供 tools.py 调用
-    # ================================================================
-
-    def search_financial(self, query: str, top_k: int = 5) -> list[dict]:
+    def search_financial(self, query: str, top_k: int = 5,
+                         stock_code: Optional[str] = None) -> list[dict]:
         """
-        检索财务数据
-
-        策略：混合检索（FAISS 权重 0.7 + BM25 权重 0.3）
-        范围：只返回 source_type == "financial" 的 chunk
-
-        为什么 FAISS 权重更高？
-        因为 financial chunk 分为"盈利"和"偿债"两类，BM25 无法区分，
-        FAISS 能通过语义匹配正确区分"盈利能力"和"偿债能力"。
-        BM25 保留 0.3 的权重用于精确匹配公司名。
+        hybrid_search + RRFRanker,filter source_type == financial
+        可选 stock_code 做精确过滤
         """
-        valid_ids = self._source_type_ids.get("financial", set())
-        results = self._hybrid_search(
-            query,
-            valid_ids=valid_ids,
-            alpha=0.7,        # FAISS 权重高，解决 BM25 偏债务 chunk 的问题
-            top_k=top_k,
+        from pymilvus import AnnSearchRequest, RRFRanker
+
+        q_dense, q_sparse = self._embed(query)
+        filter_expr = 'source_type == "financial"'
+        if stock_code:
+            filter_expr += f' and stock_code == "{stock_code}"'
+
+        results = self.client.hybrid_search(
+            collection_name=self.collection,
+            reqs=[
+                AnnSearchRequest(data=[q_dense],  anns_field="dense",  limit=30),
+                AnnSearchRequest(data=[q_sparse], anns_field="sparse", limit=30),
+            ],
+            ranker=RRFRanker(k=60),
+            filter=filter_expr,
+            output_fields=[
+                "text", "source_type", "stock_code", "stock_name",
+                "date", "chunk_method",
+            ],
+            limit=top_k,
         )
-        return results
+        return [self._hit_to_chunk(h) for h in results[0]]
 
-    def search_industry(self, query: str, top_k: int = 5) -> list[dict]:
+    # ============ search_industry ============
+
+    def search_industry(self, query: str, top_k: int = 5,
+                        sim_threshold: float = 0.75) -> list[dict]:
         """
-        检索行业汇总数据
+        V3 架构:字典快路径 + 向量 fallback,都走 Milvus 取 Parent 冗余数据
 
-        策略：行业名精确匹配（不走 FAISS/BM25 混合检索）
-
-        为什么不用混合检索？
-        行业 chunk 只有 30 条，所有 chunk 都包含相同的指标关键词（ROE、净利率等），
-        BM25 在这 30 条中区分度极差（实测 50% 的查询返回"农业"而非目标行业）。
-        30 条数据不需要向量检索，直接按行业名精确匹配即可。
-
-        匹配逻辑：
-        1. 从 query 中提取行业关键词
-        2. 通过别名映射找到标准行业名
-        3. 直接返回对应的行业 chunk
-        4. 匹配不上则返回空（不返回错误行业）
+        两阶段:
+          1) 字典精确匹配(主流 95% 查询):从 query 抓最长别名 → standard industry
+             → client.query(filter=industry=='XX') 取任意一条 alias entity 拿 Parent
+          2) 字典没中 → ANN 搜 255 个 industry_alias 向量(多拉 top_k*3 条,
+             应用层按 industry dedup —— Lite 不支持 group_by_field)
+             → 直接拿 Parent 冗余数据
         """
-        if not self._industry_name_to_idx:
-            return []
-
-        # 从 query 中匹配行业名（优先匹配最长的别名，避免"石油石化"被"石油"截断）
+        # 阶段 1:字典匹配(保留,因为它是"0 延迟 + 100% 精确")
         matched_industries = []
-        sorted_aliases = sorted(self._alias_to_industry.keys(), key=len, reverse=True)
-        for alias in sorted_aliases:
+        for alias in sorted(self._alias_to_industry.keys(), key=len, reverse=True):
             if alias in query:
-                standard_name = self._alias_to_industry[alias]
-                if standard_name not in matched_industries:
-                    matched_industries.append(standard_name)
+                industry = self._alias_to_industry[alias]
+                if industry not in matched_industries:
+                    matched_industries.append(industry)
                 if len(matched_industries) >= top_k:
                     break
 
-        # 如果没有匹配到任何行业，尝试直接匹配标准行业名
-        if not matched_industries:
-            for name in self._industry_name_to_idx:
-                if name in query:
-                    matched_industries.append(name)
+        if matched_industries:
+            return self._fetch_industry_parents(matched_industries, via='dict')
 
-        # 构建返回结果
-        results = []
-        for name in matched_industries[:top_k]:
-            idx = self._industry_name_to_idx[name]
-            results.append({
-                "text": self.texts[idx],
-                "metadata": self.metadatas[idx],
-                "score": 1.0,
+        # 阶段 2:向量 fallback(ANN,Milvus Lite 不支持 group_by_field,应用层 dedup)
+        q_dense, _ = self._embed(query)
+        results = self.client.search(
+            collection_name=self.collection,
+            anns_field="dense",
+            data=[q_dense],
+            filter='source_type == "industry_alias"',
+            output_fields=["industry", "section_text", "stock_codes", "company_count"],
+            limit=top_k * 3,    # 多拉一些,应用层按 industry dedup
+        )
+        seen_industries = set()
+        hits = []
+        for h in results[0]:
+            sim = float(h.get('distance', 0))
+            if sim < sim_threshold:
+                continue
+            ent = h.get('entity', {})
+            industry = ent.get('industry')
+            if industry in seen_industries:        # 应用层 dedup(代替 group_by_field)
+                continue
+            seen_industries.add(industry)
+            hits.append({
+                'text': ent.get('section_text', '') or '',
+                'metadata': {
+                    'source_type': 'industry',
+                    'industry':      industry,
+                    'stock_codes':   ent.get('stock_codes'),
+                    'company_count': ent.get('company_count'),
+                    'match_via':     'vector_fallback',
+                    'sim':           sim,
+                },
+                'score': sim,
             })
+            if len(hits) >= top_k:
+                break
+        return hits
 
-        if not results:
-            logger.warning(f"search_industry 未匹配到行业: query='{query}'")
-            available = "、".join(sorted(self._industry_name_to_idx.keys()))
-            return [{
-                "text": (
-                    f"未找到匹配的行业数据。请在 query 中使用以下标准行业名之一：{available}。"
-                    f"例如：search_industry(query='半导体 ROE 盈利能力')。"
-                ),
-                "metadata": {"source_type": "industry", "match_failed": True},
-                "score": 0.0,
-            }]
+    def _fetch_industry_parents(self, industries: list, via: str) -> list[dict]:
+        """按标准 industry 名直接 query 取 Parent 冗余字段"""
+        hits = []
+        for ind in industries:
+            rows = self.client.query(
+                collection_name=self.collection,
+                filter=f'source_type == "industry_alias" and industry == "{ind}"',
+                output_fields=["industry", "section_text", "stock_codes", "company_count"],
+                limit=1,
+            )
+            if not rows:
+                continue
+            r = rows[0]
+            hits.append({
+                'text': r.get('section_text', '') or '',
+                'metadata': {
+                    'source_type':  'industry',
+                    'industry':      r.get('industry'),
+                    'stock_codes':   r.get('stock_codes'),
+                    'company_count': r.get('company_count'),
+                    'match_via':     via,
+                },
+                'score': 1.0,   # 字典精确匹配满分
+            })
+        return hits
 
-        return results
+    # ============ search_report ============
 
     def search_report(self, query: str, top_k: int = 5) -> list[dict]:
         """
-        检索研报信息（元数据 + PDF 正文）
-
-        策略：两路分别检索，交替合并
-        - 路线1：研报元数据（report）→ 混合检索，BM25 权重高（alpha=0.4）
-          因为元数据是结构化短文本，关键词精确匹配更有效
-        - 路线2：PDF 正文（report_fulltext）→ 混合检索，FAISS 权重高（alpha=0.7）
-          因为正文是自由文本，需要语义理解（"护城河" ↔ "品牌壁垒"）
-        - 合并：两路各取 top_k 条，交替插入，去重后返回 top_k
+        两路 hybrid_search + 外部 RRF:
+          元数据路 (source_type='report'):       WeightedRanker(0.4, 0.6) BM25 主
+          正文路   (report_fulltext/tabular):    RRFRanker(k=60),多拉 top_k*6 后应用层 dedup
+        然后外部 RRF 融合,enrich_with_parent 展开 section
         """
-        # 路线1：研报元数据
-        meta_ids = self._source_type_ids.get("report", set())
-        meta_results = self._hybrid_search(
-            query,
-            valid_ids=meta_ids,
-            alpha=0.4,         # BM25 权重高，精确匹配标题、评级、机构名
-            top_k=top_k,
+        from pymilvus import AnnSearchRequest, RRFRanker, WeightedRanker
+
+        q_dense, q_sparse = self._embed(query)
+
+        # 元数据路
+        meta_hits = self.client.hybrid_search(
+            collection_name=self.collection,
+            reqs=[
+                AnnSearchRequest(data=[q_dense],  anns_field="dense",  limit=30),
+                AnnSearchRequest(data=[q_sparse], anns_field="sparse", limit=30),
+            ],
+            ranker=WeightedRanker(0.4, 0.6),
+            filter='source_type == "report"',
+            output_fields=[
+                "text", "source_type", "stock_code", "stock_name",
+                "institution", "date", "rating", "report_title",
+            ],
+            limit=30,
         )
 
-        # 路线2：PDF 正文
-        text_ids = self._source_type_ids.get("report_fulltext", set())
-        text_results = self._hybrid_search(
-            query,
-            valid_ids=text_ids,
-            alpha=0.7,         # FAISS 权重高，语义匹配
-            top_k=top_k,
+        # 正文路(prose Child + table Child)
+        # 注意:不用 group_by_field —— Milvus Lite 不支持,且 prose Child 的 parent_id=NULL 会把
+        # 所有 prose 合并到同一 NULL 组导致召回丢失。dedup 全在应用层 enrich_with_parent 做。
+        body_hits = self.client.hybrid_search(
+            collection_name=self.collection,
+            reqs=[
+                AnnSearchRequest(data=[q_dense],  anns_field="dense",  limit=60),
+                AnnSearchRequest(data=[q_sparse], anns_field="sparse", limit=60),
+            ],
+            ranker=RRFRanker(k=60),
+            filter='source_type in ["report_fulltext", "report_tabular"]',
+            output_fields=[
+                "text", "source_type", "chunk_method",
+                "stock_code", "stock_name", "institution", "date",
+                "parent_id", "parent_html", "table_caption",
+                "section_id", "section_title", "section_text",
+                "page_idx",
+            ],
+            limit=60,   # 多拉,enrich_with_parent 合并后再截 top_k
         )
 
-        # 交替合并去重（保证两路都有露出）
-        combined = self._interleave_results(meta_results, text_results, top_k)
+        meta_chunks = [self._hit_to_chunk(h) for h in meta_hits[0]]
+        body_chunks = [self._hit_to_chunk(h) for h in body_hits[0]]
 
-        # 按 score 重排：time_bonus 已经加进 score 里了，
-        # 现在两路的分数可比（都包含了时效性加分），按分数统一排序
-        # 这样 2017 老研报即使 BM25 分高，也会被 time_bonus 更大的新研报压下去
-        combined.sort(key=lambda x: x["score"], reverse=True)
+        merged = self._external_rrf(meta_chunks, body_chunks, k=60, top_k=top_k * 3)
 
-        return combined
+        if self.enrich_parents:
+            merged = self.enrich_with_parent(merged)
 
-    # ================================================================
-    #  底层检索实现
-    # ================================================================
+        return merged[:top_k]
 
-    def _hybrid_search(self, query: str, valid_ids: set,
-                       alpha: float = 0.6, top_k: int = 5) -> list[dict]:
-        """
-        混合检索的底层实现
-
-        Args:
-            query: 检索词
-            valid_ids: 允许返回的 chunk 下标集合（用于 source_type 过滤）
-            alpha: FAISS 权重（1-alpha 为 BM25 权重）
-            top_k: 返回条数
-
-        Returns:
-            [{"text": str, "metadata": dict, "score": float}, ...]
-        """
-        import jieba
-
-        if not valid_ids:
-            return []
-
-        # ---------- FAISS 检索 ----------
-        # 多召回一些候选（top_k * 5），过滤后再截断
-        n_candidates = min(top_k * 5, self.faiss_index.ntotal)
-        q_emb = self.encoder.encode([query], normalize_embeddings=True).astype('float32')
-        faiss_scores_raw, faiss_ids_raw = self.faiss_index.search(q_emb, n_candidates)
-
-        # 只保留 valid_ids 内的结果
-        faiss_scores = []
-        faiss_ids = []
-        for score, idx in zip(faiss_scores_raw[0], faiss_ids_raw[0]):
-            if idx >= 0 and int(idx) in valid_ids:
-                faiss_scores.append(score)
-                faiss_ids.append(int(idx))
-
-        # ---------- BM25 检索 ----------
-        q_tokens = list(jieba.cut(query))
-        bm25_all_scores = self.bm25.get_scores(q_tokens)
-
-        # 只保留 valid_ids 内的，取 top 候选
-        bm25_candidates = [(idx, bm25_all_scores[idx]) for idx in valid_ids]
-        bm25_candidates.sort(key=lambda x: x[1], reverse=True)
-        bm25_ids = [c[0] for c in bm25_candidates[:n_candidates]]
-        bm25_scores = [c[1] for c in bm25_candidates[:n_candidates]]
-
-        # ---------- 分数归一化 ----------
-        faiss_norm = self._normalize(np.array(faiss_scores)) if faiss_scores else {}
-        bm25_norm = self._normalize(np.array(bm25_scores)) if bm25_scores else {}
-
-        # 转成 {idx: normalized_score} 的字典
-        faiss_dict = {faiss_ids[i]: faiss_norm[i] for i in range(len(faiss_ids))}
-        bm25_dict = {bm25_ids[i]: bm25_norm[i] for i in range(len(bm25_ids))}
-
-        # ---------- 加权融合 ----------
-        all_ids = set(faiss_dict.keys()) | set(bm25_dict.keys())
-        combined = {}
-        for idx in all_ids:
-            f_score = faiss_dict.get(idx, 0.0)
-            b_score = bm25_dict.get(idx, 0.0)
-            combined[idx] = alpha * f_score + (1 - alpha) * b_score
-
-        # ---------- 时效性加分 ----------
-        # 只对 report / report_fulltext 生效，financial 不加
-        # 解决的问题：BM25 关键词匹配可能把 7 年前的老研报排在最新研报前面
-        for idx in combined:
-            combined[idx] += self._time_bonus(self.metadatas[idx])
-
-        # ---------- 排序返回 ----------
-        sorted_ids = sorted(combined.keys(), key=lambda x: combined[x], reverse=True)
-
-        results = []
-        for idx in sorted_ids[:top_k]:
-            results.append({
-                "text": self.texts[idx],
-                "metadata": self.metadatas[idx],
-                "score": float(combined[idx]),
-            })
-        return results
+    # ============ 外部 RRF 融合 + Parent 展开 ============
 
     @staticmethod
-    def _time_bonus(metadata: dict, half_life_days: int = 365,
-                    max_bonus: float = 0.4) -> float:
-        """
-        时效性加分：越新的文档 bonus 越高，指数衰减
+    def _external_rrf(list_a: list, list_b: list, k: int = 60,
+                      top_k: int = 30) -> list[dict]:
+        """两路 chunk 列表用 RRF 排序融合(对量纲免疫)"""
+        scores = {}
+        items = {}
+        for rank, c in enumerate(list_a):
+            key = c.get('metadata', {}).get('chunk_id') or id(c)
+            scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
+            items.setdefault(key, c)
+        for rank, c in enumerate(list_b):
+            key = c.get('metadata', {}).get('chunk_id') or id(c)
+            scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
+            items.setdefault(key, c)
 
-        bonus = max_bonus * exp(-0.693 * days_ago / half_life_days)
-
-        参数选择：
-        - half_life_days=365：一年前的文档 bonus 衰减到一半（0.20）
-        - max_bonus=0.4：初始 0.3 时 2017 老研报仍偶尔排进 top-3，
-          调到 0.4 后新研报 bonus 约 0.34（半年内），老研报接近 0，拉开足够差距
-
-        设计决策：
-        - 只对 report / report_fulltext 生效
-        - financial 不加（用户可能需要旧财务数据做趋势分析）
-
-        面试话术：
-        "SFT 数据测试中发现 search_report('贵州茅台 目标价') 返回了 2017 年的老研报，
-        因为标题里恰好有'目标价'三个字，BM25 给了高分。加了指数衰减的 time_bonus 后，
-        7 年前的研报 bonus 接近 0，半年内的研报能拿到 0.2+ 的 bonus，排序直接翻转。
-        half_life 设 365 天是因为金融研报时效性强，一年前的评级和目标价参考价值大幅下降。"
-        """
-        import math
-        from datetime import datetime
-
-        source_type = metadata.get("source_type", "")
-        if source_type not in ("report", "report_fulltext"):
-            return 0.0
-
-        # 兼容两种日期字段名：report/report_fulltext 用 "date"，financial 用 "report_date"
-        date_str = metadata.get("date") or metadata.get("report_date") or ""
-        date_str = str(date_str).strip()[:10]  # 处理 "2025-11-05 00:00:00" 格式
-
-        if not date_str:
-            return 0.0
-
-        try:
-            doc_date = datetime.strptime(date_str, "%Y-%m-%d")
-            days_ago = max((datetime.now() - doc_date).days, 0)
-            decay = math.exp(-0.693 * days_ago / half_life_days)
-            return max_bonus * decay
-        except (ValueError, TypeError):
-            return 0.0
+        ordered = sorted(scores.keys(), key=lambda x: -scores[x])
+        out = []
+        for key in ordered[:top_k]:
+            c = items[key]
+            c['score'] = scores[key]
+            out.append(c)
+        return out
 
     @staticmethod
-    def _normalize(scores: np.ndarray) -> np.ndarray:
-        """Min-Max 归一化到 [0, 1]"""
-        if len(scores) == 0:
-            return scores
-        min_s, max_s = scores.min(), scores.max()
-        if max_s == min_s:
-            return np.zeros_like(scores)
-        return (scores - min_s) / (max_s - min_s)
-
-    @staticmethod
-    def _interleave_results(list_a: list[dict], list_b: list[dict],
-                            top_k: int) -> list[dict]:
+    def enrich_with_parent(hits: list) -> list:
         """
-        交替合并两路结果，去重（按 text 去重）
-
-        为什么用交替而不是按分数排序？
-        因为两路的分数不在同一尺度上（不同的 alpha、不同的 source_type），
-        直接比较分数没有意义。交替插入保证两种数据都有露出。
+        命中 Child 展开 Parent 给 LLM(表格走 parent_id dedup,prose 走 section_id dedup)。
+        所有 dedup 都在这里做(Milvus Lite 不支持 group_by_field,且 NULL 字段分组有陷阱,
+        统一在应用层处理更稳定)。
         """
-        seen_texts = set()
-        combined = []
+        final = []
+        table_parents = OrderedDict()   # parent_id → {score, metadata, child_texts, _insert_at}
+        prose_groups = OrderedDict()    # section_id → 同上
 
-        i, j = 0, 0
-        while len(combined) < top_k and (i < len(list_a) or j < len(list_b)):
-            # 先插 list_a
-            if i < len(list_a):
-                text_key = list_a[i]["text"][:100]  # 用前100字符做去重key
-                if text_key not in seen_texts:
-                    seen_texts.add(text_key)
-                    combined.append(list_a[i])
-                i += 1
+        for h in hits:
+            m = h.get('metadata', {})
+            method = m.get('chunk_method', '')
+            pid = m.get('parent_id')
+            sid = m.get('section_id')
 
-            # 再插 list_b
-            if j < len(list_b) and len(combined) < top_k:
-                text_key = list_b[j]["text"][:100]
-                if text_key not in seen_texts:
-                    seen_texts.add(text_key)
-                    combined.append(list_b[j])
-                j += 1
+            is_table_child = pid and method in ('table_narrative', 'table_row_fact')
+            is_prose_child = sid and method == 'fixed_window'
 
-        return combined
+            if is_table_child:
+                if pid not in table_parents:
+                    table_parents[pid] = {
+                        'score': h.get('score', 0.0),
+                        'metadata': m,
+                        'child_texts': [h['text']],
+                        '_insert_at': len(final),
+                    }
+                    final.append(None)
+                else:
+                    table_parents[pid]['score'] = max(table_parents[pid]['score'],
+                                                      h.get('score', 0.0))
+                    table_parents[pid]['child_texts'].append(h['text'])
+            elif is_prose_child:
+                if sid not in prose_groups:
+                    prose_groups[sid] = {
+                        'score': h.get('score', 0.0),
+                        'metadata': m,
+                        'child_texts': [h['text']],
+                        '_insert_at': len(final),
+                    }
+                    final.append(None)
+                else:
+                    prose_groups[sid]['score'] = max(prose_groups[sid]['score'],
+                                                     h.get('score', 0.0))
+                    prose_groups[sid]['child_texts'].append(h['text'])
+            else:
+                # 元数据 / 财务 / 行业 等原样
+                final.append(h)
+
+        # 表格 Parent 合并
+        for pid, info in table_parents.items():
+            m = info['metadata']
+            caption = m.get('table_caption') or ''
+            page = m.get('page_idx')
+            parent_html = m.get('parent_html') or ''
+
+            header_parts = ['表格']
+            if caption:
+                header_parts.append(caption)
+            if isinstance(page, int) and page >= 0:
+                header_parts.append(f"第 {page + 1} 页")
+            header = '【' + ' · '.join(header_parts) + '】'
+
+            parts = [header]
+            if parent_html:
+                parts.append(parent_html)
+
+            n = len(info['child_texts'])
+            if n == 1:
+                parts.append(f"【检索命中】\n- {info['child_texts'][0]}")
+            else:
+                parts.append(f"【检索命中 {n} 条事实】\n"
+                             + "\n".join(f"- {t}" for t in info['child_texts']))
+
+            final[info['_insert_at']] = {
+                'text': "\n\n".join(parts),
+                'metadata': {**m, 'chunk_method': 'table_enriched', 'n_child_hits': n},
+                'score': info['score'],
+            }
+
+        # Prose Section 合并
+        for sid, info in prose_groups.items():
+            m = info['metadata']
+            title = m.get('section_title') or ''
+            section_text = m.get('section_text') or ''
+            page = m.get('page_idx')
+
+            header_parts = ['章节']
+            if title:
+                header_parts.append(title)
+            if isinstance(page, int) and page >= 0:
+                header_parts.append(f"第 {page + 1} 页")
+            header = '【' + ' · '.join(header_parts) + '】'
+
+            parts = [header]
+            if section_text:
+                parts.append(section_text)
+
+            n = len(info['child_texts'])
+            if n == 1:
+                parts.append(f"【检索命中】\n- {info['child_texts'][0]}")
+            else:
+                parts.append(f"【本段检索命中 {n} 句】\n"
+                             + "\n".join(f"- {t}" for t in info['child_texts']))
+
+            final[info['_insert_at']] = {
+                'text': "\n\n".join(parts),
+                'metadata': {**m, 'chunk_method': 'prose_enriched', 'n_child_hits': n},
+                'score': info['score'],
+            }
+
+        return [h for h in final if h is not None]
 
 
-# ================================================================
-#  测试脚本：直接运行此文件可测试检索效果
-# ================================================================
+# ============ CLI 快速冒烟测 ============
 
-def main():
-    """测试检索效果"""
+def _cli_smoke():
+    """python hybrid_search.py -- 跑一组测试 query"""
     retriever = FinAgentRetriever()
-    retriever.load_index()
-
-    test_queries = [
-        ("search_financial", "贵州茅台盈利能力"),
-        ("search_financial", "宁德时代ROE"),
-        ("search_financial", "比亚迪营收增长率"),
-        ("search_financial", "招商银行资产负债率"),
-        ("search_report", "宁德时代 投资评级 目标价"),
-        ("search_report", "贵州茅台 竞争优势 护城河"),
-        ("search_report", "隆基绿能 行业前景"),
-        ("search_report", "贵州茅台 目标价"),  # 时效性测试：之前返回 2017 老研报
+    queries = [
+        ("search_financial", "茅台 2024 年 ROE",    {"stock_code": "600519"}),
+        ("search_industry",  "白酒行业对比",          {}),
+        ("search_industry",  "酒类赛道",              {}),   # 字典没中,走向量 fallback
+        ("search_report",    "平安银行 2025 三季报营收", {}),
     ]
-
-    for tool, query in test_queries:
-        print(f"\n{'='*60}")
-        print(f"工具: {tool} | Query: {query}")
-        print('='*60)
-
-        if tool == "search_financial":
-            results = retriever.search_financial(query)
-        else:
-            results = retriever.search_report(query)
-
-        for i, r in enumerate(results):
-            source = r["metadata"]["source_type"]
-            name = r["metadata"].get("stock_name", "")
-            date = r["metadata"].get("date") or r["metadata"].get("report_date", "")
-            score = r["score"]
-            text_preview = r["text"][:120].replace("\n", " ")
-            print(f"  [{i+1}] {score:.3f} | {source} | {name} | {str(date)[:10]}")
-            print(f"      {text_preview}...")
+    for method, q, kwargs in queries:
+        logger.info(f"\n══ {method}({q!r}) ══")
+        fn = getattr(retriever, method)
+        results = fn(q, top_k=3, **kwargs)
+        for i, r in enumerate(results, 1):
+            t = r.get('text', '')[:100]
+            score = r.get('score', 0)
+            logger.info(f"  [{i}] score={score:.3f}  {t}")
 
 
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    _cli_smoke()

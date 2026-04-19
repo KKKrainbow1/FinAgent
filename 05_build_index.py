@@ -1,302 +1,340 @@
 """
-FinAgent 检索索引构建脚本
-用途：将 all_chunks.jsonl 构建为 FAISS 向量索引 + BM25 稀疏索引
-依赖：pip install sentence-transformers faiss-gpu rank_bm25 jieba
+FinAgent Step 5 (V3 · Milvus Lite 版): 建 Milvus 索引
 
-运行方式：
-    python 05_build_index.py                    # 构建全部索引
-    python 05_build_index.py --test_query "茅台盈利能力"  # 构建完后测试检索
+目标架构(对照 docs/Finagent项目介绍.md 第 4 节):
+  单 collection + 5 种 source_type + scalar filter 路由 + Parent 冗余在 Child metadata
 
-面试追问：为什么用混合检索而不是纯向量检索？
-答：向量检索擅长语义匹配（"盈利能力" ↔ "ROE"），
-但对精确实体匹配差（"宁德时代"可能和"比亚迪"的向量距离不够远）。
-BM25擅长精确关键词匹配。混合后互补。
+输入:
+  data/processed/all_chunks.jsonl                     (04 产出:report/financial/industry + prose Child)
+  data/processed/tabular_chunks_mineru.jsonl          (06 --source mineru_cleaned 产出:table Child)
+  data/processed/industry_alias_entities.jsonl        (Phase 3 产出:255 别名,可选)
 
-面试追问：embedding 模型为什么选 BGE？
-答：BGE-base-zh-v1.5 是中文 embedding 的 SOTA 之一，
-在 C-MTEB 榜单上排名前列，对中文金融文本的语义理解好。
-base 版本 768 维，推理速度快，58000 条 chunk 在 GPU 上几分钟编码完。
+输出:
+  data/processed/milvus_finagent.db                   (Milvus Lite 单文件)
+  data/processed/bm25_ef.pkl                          (BM25 模型,查询时需要同样 fit)
+
+Schema / index 策略详见 docs/Chunk_Alignment_20260420.md 14 节。
+
+用法:
+    python 05_build_index.py
+    python 05_build_index.py --hnsw          # Standalone 部署切 HNSW(Lite 只能用 FLAT)
+    python 05_build_index.py --limit 1000    # 原型:只插 1000 条
+    python 05_build_index.py --uri http://localhost:19530   # 连 Standalone
 """
-
-import json
-import os
-import pickle
-import time
 import argparse
+import json
 import logging
-import numpy as np
+from collections import Counter
+from pathlib import Path
+
 from tqdm import tqdm
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
+ROOT = Path(__file__).resolve().parent.parent
+
 # ============ 配置 ============
-CHUNK_PATH = "./data/processed/all_chunks.jsonl"
-INDEX_DIR = "./data/index"
+COLLECTION = "finagent"
+DB_PATH = ROOT / "data/processed/milvus_finagent.db"
+BM25_PATH = ROOT / "data/processed/bm25_ef.pkl"
 EMBEDDING_MODEL = "./models/bge-base-zh-v1.5"
-BATCH_SIZE = 256  # GPU 上可以用大 batch
+DIM = 768
 
-os.makedirs(INDEX_DIR, exist_ok=True)
-
-
-# ============ Step 1: 加载 chunks ============
-
-def load_chunks(chunk_path: str) -> list[dict]:
-    """加载 JSONL 格式的 chunks"""
-    chunks = []
-    with open(chunk_path, 'r', encoding='utf-8') as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                chunks.append(json.loads(line))
-    logger.info(f"加载 {len(chunks)} 条 chunks")
-    return chunks
+CHUNK_SOURCES = [
+    ROOT / "data/processed/all_chunks.jsonl",
+    ROOT / "data/processed/tabular_chunks_mineru.jsonl",
+    ROOT / "data/processed/industry_alias_entities.jsonl",
+]
 
 
-# ============ Step 2: 构建 FAISS 向量索引 ============
+# ============ 加载 chunks ============
 
-def build_faiss_index(chunks: list[dict], model_name: str = EMBEDDING_MODEL):
+def load_all_chunks() -> list[dict]:
+    """从所有源加载 chunks"""
+    all_chunks = []
+    for p in CHUNK_SOURCES:
+        if not p.exists():
+            logger.warning(f"⚠️  {p.name} 不存在,跳过")
+            continue
+        n = 0
+        with open(p, encoding='utf-8') as f:
+            for line in f:
+                all_chunks.append(json.loads(line))
+                n += 1
+        logger.info(f"  + {p.name}: {n} 条")
+    return all_chunks
+
+
+# ============ Schema ============
+
+def build_schema(client):
+    """Schema 见 docs/Chunk_Alignment_20260420.md 14.2 节"""
+    from pymilvus import DataType
+    schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
+
+    # 主键 + 双向量
+    schema.add_field("chunk_id",      DataType.VARCHAR, is_primary=True, max_length=256)
+    schema.add_field("dense",         DataType.FLOAT_VECTOR, dim=DIM)
+    schema.add_field("sparse",        DataType.SPARSE_FLOAT_VECTOR)
+
+    # 内容
+    schema.add_field("text",          DataType.VARCHAR, max_length=4096)
+
+    # Scalar (filter/group_by 用,各 source_type 共享)
+    schema.add_field("source_type",   DataType.VARCHAR, max_length=32)
+    schema.add_field("chunk_method",  DataType.VARCHAR, max_length=32,  nullable=True)
+    schema.add_field("stock_code",    DataType.VARCHAR, max_length=16,  nullable=True)
+    schema.add_field("stock_name",    DataType.VARCHAR, max_length=64,  nullable=True)
+    schema.add_field("institution",   DataType.VARCHAR, max_length=128, nullable=True)
+    schema.add_field("date",          DataType.VARCHAR, max_length=24,  nullable=True)
+    schema.add_field("industry",      DataType.VARCHAR, max_length=64,  nullable=True)
+    schema.add_field("rating",        DataType.VARCHAR, max_length=32,  nullable=True)
+    schema.add_field("report_title",  DataType.VARCHAR, max_length=256, nullable=True)
+    schema.add_field("page_idx",      DataType.INT16,                   nullable=True)
+
+    # Parent-Child 关联 + 冗余(Table)
+    schema.add_field("parent_id",     DataType.VARCHAR, max_length=256,   nullable=True)
+    schema.add_field("parent_html",   DataType.VARCHAR, max_length=16384, nullable=True)
+    schema.add_field("table_caption", DataType.VARCHAR, max_length=512,   nullable=True)
+
+    # Parent-Child 关联 + 冗余(Prose)
+    schema.add_field("section_id",    DataType.VARCHAR, max_length=256,  nullable=True)
+    schema.add_field("section_title", DataType.VARCHAR, max_length=256,  nullable=True)
+    schema.add_field("section_text",  DataType.VARCHAR, max_length=8192, nullable=True)
+
+    # Industry(V3 alias + industry_comparison 聚合)
+    schema.add_field("stock_codes",   DataType.VARCHAR, max_length=2048, nullable=True)
+    schema.add_field("company_count", DataType.INT16,                    nullable=True)
+
+    return schema
+
+
+def build_index_params(client, use_hnsw: bool = False):
     """
-    用 BGE 模型对所有 chunk 做 embedding，构建 FAISS 索引
-    
-    面试追问：为什么用 IndexFlatIP 而不是 IndexIVFFlat？
-    答：58000 条数据量不大，暴力搜索（Flat）的延迟在毫秒级，
-    不需要近似搜索（IVF）。IVF 适合百万级以上的数据量。
-    用 IP（Inner Product）是因为 embedding 已归一化，IP = cosine similarity。
+    Lite 默认用 FLAT(精确,~20ms / 335K 单查)
+    Standalone 传 --hnsw 切 HNSW(~5ms,98%+ 召回)
     """
-    from sentence_transformers import SentenceTransformer
-    import faiss
+    params = client.prepare_index_params()
 
-    logger.info(f"加载 embedding 模型: {model_name}")
-    encoder = SentenceTransformer(model_name)
-    
-    # 检查是否使用 GPU
-    device = encoder.device
-    logger.info(f"模型运行设备: {device}")
+    if use_hnsw:
+        params.add_index(field_name="dense", index_type="HNSW", metric_type="COSINE",
+                         params={"M": 16, "efConstruction": 200})
+        logger.info("  dense 用 HNSW(Standalone)")
+    else:
+        params.add_index(field_name="dense", index_type="FLAT", metric_type="COSINE")
+        logger.info("  dense 用 FLAT(Lite)")
 
-    texts = [c["text"] for c in chunks]
-    
-    logger.info(f"开始编码 {len(texts)} 条文本 (batch_size={BATCH_SIZE})")
-    start = time.time()
-    embeddings = encoder.encode(
-        texts,
-        batch_size=BATCH_SIZE,
-        show_progress_bar=True,
-        normalize_embeddings=True,  # 归一化后 IP = cosine similarity
+    params.add_index(field_name="sparse", index_type="SPARSE_INVERTED_INDEX", metric_type="IP")
+    # Scalar 索引:Lite 支持 INVERTED,加速 filter / group_by
+    for scalar in ("source_type", "stock_code", "parent_id", "section_id", "industry"):
+        params.add_index(field_name=scalar, index_type="INVERTED")
+
+    return params
+
+
+# ============ chunk → Milvus row ============
+
+def _truncate(s, max_len):
+    """None-safe 截断"""
+    if s is None:
+        return None
+    s = str(s)
+    return s[:max_len] if len(s) > max_len else s
+
+
+def _csr_row_to_dict(csr, row_idx):
+    """
+    scipy.sparse.csr_array 的一行 → Milvus 可接受的 {col_idx: value} dict
+    Milvus 要求 sparse key 升序,csr.indices 对单行通常升序(scipy 规范),但 sorted 兜底更安全
+    """
+    start = csr.indptr[row_idx]
+    end = csr.indptr[row_idx + 1]
+    pairs = sorted(
+        ((int(k), float(v)) for k, v in zip(csr.indices[start:end], csr.data[start:end])),
+        key=lambda kv: kv[0],
     )
-    elapsed = time.time() - start
-    logger.info(f"编码完成: {elapsed:.1f}秒, 向量维度: {embeddings.shape}")
-
-    # 构建 FAISS 索引
-    dim = embeddings.shape[1]
-    index = faiss.IndexFlatIP(dim)
-    index.add(embeddings.astype('float32'))
-    logger.info(f"FAISS 索引构建完成: {index.ntotal} 条向量")
-
-    # 保存
-    faiss_path = os.path.join(INDEX_DIR, "faiss_index.bin")
-    faiss.write_index(index, faiss_path)
-    logger.info(f"FAISS 索引已保存: {faiss_path}")
-
-    # 保存 encoder 路径供后续加载
-    with open(os.path.join(INDEX_DIR, "encoder_config.json"), 'w') as f:
-        json.dump({"model_name": model_name, "dim": dim}, f)
-
-    return index, encoder
+    return dict(pairs)
 
 
-# ============ Step 3: 构建 BM25 稀疏索引 ============
+def chunk_to_row(chunk: dict, global_idx: int,
+                 dense_vec, sparse_csr, sparse_row_idx: int) -> dict:
+    """把 chunk dict 摊平成 Milvus row(14.4 节字段映射)"""
+    m = chunk.get('metadata', {})
+    source_type = m.get('source_type', 'unknown')
 
-def build_bm25_index(chunks: list[dict]):
-    """
-    用 jieba 分词后构建 BM25 索引
-    
-    面试追问：为什么用 jieba 而不是 BGE 的 tokenizer？
-    答：BM25 需要的是"词"级别的 token，不是 subword。
-    jieba 分出来的是中文词（如"净资产收益率"），
-    BGE tokenizer 分出来的是 subword（如"净资"+"产收"+"益率"），
-    BM25 用 subword 效果很差。
-    """
-    import jieba
-    from rank_bm25 import BM25Okapi
+    # chunk_id:优先 metadata 里的,否则用 global_idx 保证唯一
+    chunk_id = m.get('chunk_id') or f"{source_type}_{global_idx:08d}"
 
-    texts = [c["text"] for c in chunks]
-    
-    logger.info(f"开始 jieba 分词 {len(texts)} 条文本")
-    start = time.time()
-    tokenized = []
-    for text in tqdm(texts, desc="jieba分词"):
-        tokenized.append(list(jieba.cut(text)))
-    elapsed = time.time() - start
-    logger.info(f"分词完成: {elapsed:.1f}秒")
+    # stock_codes 可能是 list[str],转成逗号分隔字符串
+    stock_codes = m.get('stock_codes')
+    if isinstance(stock_codes, list):
+        stock_codes = ','.join(stock_codes)
 
-    logger.info("构建 BM25 索引")
-    bm25 = BM25Okapi(tokenized)
+    # page_idx / company_count 是 nullable INT16,保留 None 避免和真实 -1/0 混淆
+    page_idx = m.get('page_idx')
+    page_idx = int(page_idx) if page_idx is not None else None
+    company_count = m.get('company_count')
+    company_count = int(company_count) if company_count is not None else None
 
-    # 保存
-    bm25_path = os.path.join(INDEX_DIR, "bm25_index.pkl")
-    with open(bm25_path, 'wb') as f:
-        pickle.dump({"bm25": bm25, "tokenized": tokenized}, f)
-    logger.info(f"BM25 索引已保存: {bm25_path}")
+    dense_list = dense_vec.tolist() if hasattr(dense_vec, 'tolist') else list(dense_vec)
 
-    return bm25
-
-
-# ============ Step 4: 保存元数据 ============
-
-def save_metadata(chunks: list[dict]):
-    """
-    保存 chunks 的文本和元数据，供检索时使用
-    索引中只存向量，文本和元数据需要单独存储
-    """
-    metadata = {
-        "texts": [c["text"] for c in chunks],
-        "metadatas": [c["metadata"] for c in chunks],
+    return {
+        "chunk_id":       _truncate(chunk_id, 256),
+        "dense":          dense_list,
+        "sparse":         _csr_row_to_dict(sparse_csr, sparse_row_idx),
+        "text":           _truncate(chunk.get('text', ''), 4096),
+        "source_type":    _truncate(source_type, 32),
+        "chunk_method":   _truncate(m.get('chunk_method'), 32),
+        "stock_code":     _truncate(m.get('stock_code'), 16),
+        "stock_name":     _truncate(m.get('stock_name'), 64),
+        "institution":    _truncate(m.get('institution'), 128),
+        "date":           _truncate(m.get('date'), 24),
+        "industry":       _truncate(m.get('industry'), 64),
+        "rating":         _truncate(m.get('rating'), 32),
+        "report_title":   _truncate(m.get('report_title'), 256),
+        "page_idx":       page_idx,
+        "parent_id":      _truncate(m.get('parent_id'), 256),
+        "parent_html":    _truncate(m.get('parent_html') or m.get('parent_md'), 16384),
+        "table_caption":  _truncate(m.get('table_caption') or m.get('caption'), 512),
+        "section_id":     _truncate(m.get('section_id'), 256),
+        "section_title":  _truncate(m.get('section_title'), 256),
+        "section_text":   _truncate(m.get('section_text'), 8192),
+        "stock_codes":    _truncate(stock_codes, 2048),
+        "company_count":  company_count,
     }
-    
-    meta_path = os.path.join(INDEX_DIR, "chunk_metadata.pkl")
-    with open(meta_path, 'wb') as f:
-        pickle.dump(metadata, f)
-    logger.info(f"元数据已保存: {meta_path} ({len(chunks)} 条)")
-
-
-# ============ Step 5: 测试检索 ============
-
-def test_search(query: str, index, encoder, bm25, chunks: list[dict],
-                top_k: int = 5, alpha: float = 0.6,
-                source_type_filter: str = None):
-    """
-    测试混合检索
-    
-    alpha: 向量检索权重（1-alpha 为 BM25 权重）
-    source_type_filter: 按数据类型过滤（"report", "report_fulltext", "financial"）
-    """
-    import jieba
-    import faiss
-
-    # FAISS 检索
-    q_emb = encoder.encode([query], normalize_embeddings=True).astype('float32')
-    faiss_scores, faiss_ids = index.search(q_emb, top_k * 3)
-    
-    # BM25 检索
-    q_tokens = list(jieba.cut(query))
-    bm25_scores = bm25.get_scores(q_tokens)
-    bm25_top_ids = np.argsort(bm25_scores)[-top_k * 3:][::-1]
-
-    # 分数归一化
-    def normalize(scores):
-        min_s, max_s = scores.min(), scores.max()
-        if max_s == min_s:
-            return np.zeros_like(scores)
-        return (scores - min_s) / (max_s - min_s)
-
-    faiss_norm = normalize(faiss_scores[0])
-    bm25_norm = normalize(bm25_scores[bm25_top_ids])
-
-    # 融合
-    combined = {}
-    for rank, idx in enumerate(faiss_ids[0]):
-        if idx >= 0:  # FAISS 可能返回 -1
-            combined[int(idx)] = combined.get(int(idx), 0) + alpha * faiss_norm[rank]
-    for rank, idx in enumerate(bm25_top_ids):
-        combined[int(idx)] = combined.get(int(idx), 0) + (1 - alpha) * bm25_norm[rank]
-
-    # 按分数排序
-    sorted_ids = sorted(combined.keys(), key=lambda x: combined[x], reverse=True)
-
-    # source_type 过滤
-    results = []
-    for idx in sorted_ids:
-        meta = chunks[idx]["metadata"]
-        if source_type_filter:
-            if isinstance(source_type_filter, str):
-                if meta["source_type"] != source_type_filter:
-                    continue
-            elif isinstance(source_type_filter, list):
-                if meta["source_type"] not in source_type_filter:
-                    continue
-        
-        results.append({
-            "text": chunks[idx]["text"],
-            "metadata": meta,
-            "score": combined[idx],
-        })
-        
-        if len(results) >= top_k:
-            break
-
-    return results
 
 
 # ============ 主流程 ============
 
 def main():
-    parser = argparse.ArgumentParser(description="FinAgent 检索索引构建")
-    parser.add_argument("--test_query", type=str, default=None,
-                        help="构建完后测试检索（可选）")
+    parser = argparse.ArgumentParser(description="建 Milvus Lite 索引")
+    parser.add_argument('--hnsw', action='store_true',
+                        help='用 HNSW dense 索引(Standalone),默认 FLAT(Lite)')
+    parser.add_argument('--limit', type=int, default=0,
+                        help='限制 chunks 数量(用于原型)')
+    parser.add_argument('--batch', type=int, default=500,
+                        help='每批 insert 大小')
+    parser.add_argument('--uri', type=str, default=None,
+                        help='覆盖 URI(连 Standalone 用 http://localhost:19530)')
     args = parser.parse_args()
 
+    # ─── 1. 加载 chunks ───
+    logger.info("加载 chunks:")
+    chunks = load_all_chunks()
+    if not chunks:
+        logger.error("❌ 没有 chunks 可以导入,退出")
+        return
+    logger.info(f"总 chunks: {len(chunks)}")
+    if args.limit > 0:
+        chunks = chunks[:args.limit]
+        logger.info(f"原型模式:限流到 {len(chunks)}")
+
+    dist = Counter(c.get('metadata', {}).get('source_type', '?') for c in chunks)
+    logger.info(f"source_type 分布: {dict(dist)}")
+
+    texts = [(c.get('text') or '')[:2048] for c in chunks]
+
+    # ─── 2. Dense embedding (BGE) ───
+    logger.info(f"加载 embedding model: {EMBEDDING_MODEL}")
+    from sentence_transformers import SentenceTransformer
+    encoder = SentenceTransformer(EMBEDDING_MODEL)
+
+    logger.info(f"encode {len(texts)} 条 dense embedding...")
+    dense_vecs = encoder.encode(
+        texts, batch_size=64,
+        show_progress_bar=True,
+        normalize_embeddings=True,
+    )
+    logger.info(f"dense 完成,shape={dense_vecs.shape}")
+
+    # ─── 3. Sparse embedding (BM25) ───
+    from pymilvus.model.sparse import BM25EmbeddingFunction
+    from pymilvus.model.sparse.bm25.tokenizers import build_default_analyzer
+
+    logger.info("fit BM25(中文分词)...")
+    analyzer = build_default_analyzer(language="zh")
+    bm25_ef = BM25EmbeddingFunction(analyzer)
+    bm25_ef.fit(texts)
+
+    logger.info("encode sparse...")
+    sparse_csr = bm25_ef.encode_documents(texts)
+    logger.info(f"sparse 完成,shape={sparse_csr.shape}")
+
+    BM25_PATH.parent.mkdir(parents=True, exist_ok=True)
+    # pymilvus 2.5+ 是 save(),2.4.x 是 save_to_file(),兼容两种
+    if hasattr(bm25_ef, 'save'):
+        bm25_ef.save(str(BM25_PATH))
+    elif hasattr(bm25_ef, 'save_to_file'):
+        bm25_ef.save_to_file(str(BM25_PATH))
+    else:
+        import pickle
+        with open(BM25_PATH, 'wb') as f:
+            pickle.dump(bm25_ef, f)
+    logger.info(f"BM25 模型保存 → {BM25_PATH}")
+
+    # ─── 4. 建 Milvus collection ───
+    from pymilvus import MilvusClient
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+    uri = args.uri or str(DB_PATH)
+    logger.info(f"连接 Milvus: {uri}")
+    client = MilvusClient(uri=uri)
+
+    if client.has_collection(COLLECTION):
+        logger.info(f"⚠️  collection {COLLECTION!r} 已存在,drop 重建")
+        client.drop_collection(COLLECTION)
+
+    schema = build_schema(client)
+    index_params = build_index_params(client, use_hnsw=args.hnsw)
+    client.create_collection(
+        collection_name=COLLECTION,
+        schema=schema,
+        index_params=index_params,
+    )
+    logger.info(f"✅ collection {COLLECTION!r} 创建完成")
+
+    # ─── 5. 批量 insert ───
+    logger.info(f"批量 insert(batch={args.batch})...")
+    buffer = []
+    n_inserted = 0
+    for i, c in enumerate(tqdm(chunks, desc="insert")):
+        row = chunk_to_row(c, i, dense_vecs[i], sparse_csr, i)
+        buffer.append(row)
+        if len(buffer) >= args.batch:
+            client.insert(collection_name=COLLECTION, data=buffer)
+            n_inserted += len(buffer)
+            buffer = []
+    if buffer:
+        client.insert(collection_name=COLLECTION, data=buffer)
+        n_inserted += len(buffer)
+
+    logger.info(f"✅ insert 完成:{n_inserted} 条")
+
+    # ─── 6. flush + sanity check ───
+    try:
+        client.flush(collection_name=COLLECTION)
+    except Exception:
+        pass   # Lite 可能没有 flush API
+
+    try:
+        sample = client.query(
+            collection_name=COLLECTION,
+            filter='source_type != ""',
+            output_fields=["source_type"],
+            limit=5,
+        )
+        logger.info(f"sanity check: 命中 {len(sample)} 条 source_type 样本")
+    except Exception as e:
+        logger.warning(f"sanity check 跳过: {e}")
+
     logger.info("=" * 60)
-    logger.info("FinAgent 检索索引构建")
-    logger.info("=" * 60)
-
-    # 1. 加载 chunks
-    chunks = load_chunks(CHUNK_PATH)
-
-    # 2. 构建 FAISS 索引
-    faiss_index, encoder = build_faiss_index(chunks)
-
-    # 3. 构建 BM25 索引
-    bm25 = build_bm25_index(chunks)
-
-    # 4. 保存元数据
-    save_metadata(chunks)
-
-    # 5. 保存索引统计
-    stats = {
-        "total_chunks": len(chunks),
-        "faiss_vectors": faiss_index.ntotal,
-        "embedding_model": EMBEDDING_MODEL,
-        "embedding_dim": faiss_index.d,
-        "index_files": os.listdir(INDEX_DIR),
-    }
-    with open(os.path.join(INDEX_DIR, "index_stats.json"), 'w', encoding='utf-8') as f:
-        json.dump(stats, f, ensure_ascii=False, indent=2)
-
-    logger.info("=" * 60)
-    logger.info("索引构建完成！")
-    logger.info(f"  FAISS: {faiss_index.ntotal} 条向量, {faiss_index.d} 维")
-    logger.info(f"  BM25: {len(chunks)} 条文档")
-    logger.info(f"  索引目录: {os.path.abspath(INDEX_DIR)}")
-    logger.info("=" * 60)
-
-    # 6. 可选：测试检索
-    if args.test_query:
-        logger.info(f"\n测试检索: '{args.test_query}'")
-        
-        # 测试1：不过滤
-        print(f"\n===== 全量检索（不过滤）=====")
-        results = test_search(args.test_query, faiss_index, encoder, bm25, chunks)
-        for i, r in enumerate(results):
-            print(f"\n[{i+1}] score={r['score']:.3f} | {r['metadata']['source_type']} | {r['metadata'].get('stock_name', '')}")
-            print(f"    {r['text'][:150]}...")
-
-        # 测试2：只搜研报
-        print(f"\n===== search_report（只搜研报）=====")
-        results = test_search(args.test_query, faiss_index, encoder, bm25, chunks,
-                            source_type_filter=["report", "report_fulltext"])
-        for i, r in enumerate(results):
-            print(f"\n[{i+1}] score={r['score']:.3f} | {r['metadata']['source_type']} | {r['metadata'].get('stock_name', '')}")
-            print(f"    {r['text'][:150]}...")
-
-        # 测试3：只搜财务
-        print(f"\n===== search_financial（只搜财务）=====")
-        results = test_search(args.test_query, faiss_index, encoder, bm25, chunks,
-                            source_type_filter="financial")
-        for i, r in enumerate(results):
-            print(f"\n[{i+1}] score={r['score']:.3f} | {r['metadata']['source_type']} | {r['metadata'].get('stock_name', '')}")
-            print(f"    {r['text'][:150]}...")
+    logger.info("✅ 建索引完成")
+    logger.info(f"   DB 路径:     {DB_PATH}")
+    logger.info(f"   BM25 模型:   {BM25_PATH}")
+    logger.info(f"   索引 backend: {'HNSW(Standalone)' if args.hnsw else 'FLAT(Lite)'}")
+    logger.info("下一步: 跑 hybrid_search.py 做召回验证")
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -5,9 +5,9 @@ FinAgent Step 4: Chunk 构建
 依赖：pip install pandas tqdm
 
 运行方式：
-    python 04_build_chunks.py                                    # 处理全部数据（默认用pdfplumber解析结果）
-    python 04_build_chunks.py --parser marker                    # 用Marker解析结果
-    python 04_build_chunks.py --parser mineru                    # 用MinerU解析结果
+    python 04_build_chunks.py                                    # 处理全部数据（默认用 Marker 解析结果）
+    python 04_build_chunks.py --parser mineru                    # 用MinerU md结果（备选）
+    python 04_build_chunks.py --parser mineru_cleaned            # 用 03d 清洗后的 content_list（Block-native + Rule-based）
     python 04_build_chunks.py --report_only                      # 只处理研报
     python 04_build_chunks.py --financial_only                   # 只处理财务
 
@@ -33,10 +33,13 @@ CHUNK_DIR = "./data/processed"
 os.makedirs(CHUNK_DIR, exist_ok=True)
 
 # 解析器 → 结果文件的映射
+# 当前生产只用 Marker；MinerU 保留作为中文 SOTA 备选用于 A/B 实验。
+# pdfplumber 已于 2026-04-17 下线（Marker 在表格保真度上完胜），03a 脚本保留作历史对比证据。
+# mineru_cleaned 指目录（含 03d 清洗后的 content_list_cleaned.json），2026-04-19 新增。
 PARSER_RESULT_FILES = {
-    "pdfplumber": os.path.join(RAW_DIR, "report_parsed", "pdfplumber_all_results.json"),
     "marker": os.path.join(RAW_DIR, "report_parsed", "marker_all_results.json"),
     "mineru": os.path.join(RAW_DIR, "report_parsed", "mineru_200_results.json"),
+    "mineru_cleaned": os.path.join(CHUNK_DIR, "mineru_compare"),  # 目录,不是文件
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -45,21 +48,34 @@ logger = logging.getLogger(__name__)
 
 # ============ 研报元数据 Chunk 构建 ============
 
-def build_report_chunks(report_path: str) -> list[dict]:
+def build_report_chunks(report_path: str, since: str = '2024-01-01') -> list[dict]:
     """
     将研报数据转为检索chunks
 
-    每篇研报 → 1个chunk，包含：
-    - 报告标题（核心语义信息）
-    - 机构 + 评级（机构观点）
-    - 盈利预测数据（硬数据）
-    - 行业 + 日期（元信息）
+    每篇研报 → 1个chunk,包含:
+    - 报告标题(核心语义信息)
+    - 机构 + 评级(机构观点)
+    - 盈利预测数据(硬数据)
+    - 行业 + 日期(元信息)
 
-    面试追问：为什么不每个字段单独做chunk？
-    答：研报摘要本身就很短（一行标题+几个字段），拆开后每个chunk语义太稀疏，
+    2026-04-20 加日期过滤(默认 >= 2024-01-01):
+    akshare 拉回的 CSV 覆盖 2017-2026 全时段(~39K),但实际 PDF 下载 MAX_PER_STOCK=5
+    按日期倒序,89% 正文集中在 2025-2026。2017-2023 的元数据没有对应正文 chunk,
+    召回这些只能给 LLM 孤立的标题+评级+EPS 预测,对"最新业绩"类查询反而是污染。
+    过滤后保留 ~10K 条(2024 年后),和实际 PDF 正文时间窗对齐 + 留 1 年缓冲给对比类查询。
+
+    面试追问:为什么不每个字段单独做chunk?
+    答:研报摘要本身就很短(一行标题+几个字段),拆开后每个chunk语义太稀疏,
     检索时会匹配到大量无关结果。合在一起语义更完整。
     """
     df = pd.read_csv(report_path, dtype={'股票代码': str})
+
+    # 日期过滤
+    df['日期'] = pd.to_datetime(df['日期'], errors='coerce')
+    before = len(df)
+    df = df[df['日期'] >= pd.Timestamp(since)].copy()
+    logger.info(f"研报元数据日期过滤 (>= {since}): {before} → {len(df)} ({len(df)/before*100:.1f}%)")
+
     chunks = []
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="构建研报chunks"):
@@ -147,8 +163,8 @@ def build_fulltext_chunks(parser: str, pdf_map_path: str = None,
 
         # 清理 markdown 图片标记（Marker 输出的残留，如 ![](_page_0_Picture_0.jpeg)）
         text = re.sub(r'!\[.*?\]\(.*?\)', '', text)
-        text = re.sub(r'\n{3,}', '\n\n', text)
-        text = text.strip()
+        # 深度清洗：HTML 标签 / OCR 模板标签 / 页码 / 免责声明截断（2026-04-17 加）
+        text = _clean_marker_text(text)
 
         if len(text) < 50:
             continue
@@ -168,7 +184,8 @@ def build_fulltext_chunks(parser: str, pdf_map_path: str = None,
             "pdf_file": filename,
         }
 
-        chunks = _sliding_window_chunks(text, base_metadata, chunk_size, overlap)
+        # 表格感知 chunking（2026-04-17 加）：识别 Markdown 表格 + 正文差异化切分
+        chunks = _table_aware_chunks(text, base_metadata, chunk_size, overlap)
         all_chunks.extend(chunks)
 
     logger.info(f"PDF正文chunks ({parser}): {len(all_chunks)} 条")
@@ -222,6 +239,443 @@ def _sliding_window_chunks(text: str, metadata: dict,
             break
 
     return chunks
+
+
+# ============ Marker 文本清洗 + 表格感知 chunking（2026-04-17 加） ============
+#
+# 背景：症状扫描显示 64,008 个 fulltext chunk 中：
+#   - 30.63% 表格行无分隔行（表头丢失）
+#   - 16.27% HTML 标签残留
+#   - 8.13% 免责声明样板
+# 直接影响 GPT-5.4 审计里 25% 的"跨报告期混用"编造
+# 详见 docs/Chunk_Symptom_Scan_20260417.md
+
+_RE_HTML_BR = re.compile(r'<br\s*/?>', re.IGNORECASE)
+_RE_HTML_TABLE_TAG = re.compile(r'</?(table|tr|td|th|span|div|p)[^>]*>', re.IGNORECASE)
+_RE_HTML_ENTITY = re.compile(r'&(nbsp|amp|lt|gt|quot|emsp|ensp);')
+_RE_OCR_TMPL_TAG = re.compile(
+    r'\[[a-zA-Z_\u4e00-\u9fff0-9]*?'
+    r'(?:finchina|wind|ths|table_[a-zA-Z0-9_]+|asset_table|finance|introduction)'
+    r'[a-zA-Z_\u4e00-\u9fff0-9]*?\]',
+    re.IGNORECASE
+)
+_RE_PAGE_NUM = re.compile(r'(?:^|\n)\s*(?:P\s*\d+|第\s*\d+\s*页|page\s*\d+)\s*', re.IGNORECASE)
+_RE_DISCLAIMER_HEAD = re.compile(
+    r'^(#{1,4}\s*)?(免责声明|分析师声明|评级说明|法律声明|分析师保证|证券评级标准|重要声明)\s*$',
+    re.MULTILINE
+)
+
+
+def _clean_marker_text(text: str) -> str:
+    """
+    Marker 输出的文本清洗
+    清洗规则 + 症状扫描触发率：
+      B1: HTML 标签残留        16.27%
+      B2: OCR 模板标签泄漏      0.20%
+      B3: 页码残留              0.05%
+      B5: 免责声明样板          8.13%
+    """
+    # 1. HTML 残留
+    text = _RE_HTML_BR.sub(' ', text)
+    text = _RE_HTML_TABLE_TAG.sub('', text)
+    text = _RE_HTML_ENTITY.sub(' ', text)
+
+    # 2. OCR 模板标签（如 [项ta目ble_FinchinaSimple]、[TABLE_FINANCE]）
+    text = _RE_OCR_TMPL_TAG.sub('', text)
+
+    # 3. 页码/页眉（保守：只删独占一行的页码标记）
+    text = _RE_PAGE_NUM.sub('\n', text)
+
+    # 4. 免责声明截断：只在文档后 60% 位置触发，避免误伤开头提及风险的段落
+    m = _RE_DISCLAIMER_HEAD.search(text)
+    if m and m.start() > len(text) * 0.6:
+        text = text[:m.start()].rstrip()
+
+    # 5. 空白规整
+    text = re.sub(r'[ \t]+\n', '\n', text)
+    text = re.sub(r'\n{3,}', '\n\n', text)
+    return text.strip()
+
+
+# ============ Markdown 表格感知 chunking ============
+
+_RE_TABLE_LINE = re.compile(r'^\s*\|.+\|\s*$')
+_RE_TABLE_SEP_LINE = re.compile(r'^\s*\|[\s:\-|]+\|\s*$')
+
+
+def _split_into_blocks(text: str) -> list[dict]:
+    """
+    把文本切成 [{type: "table"|"prose", content, header}, ...]
+    表格 = 连续 |...| 行 + 至少一行 |---|---| 分隔行
+    每个 table block 附带 header 字段（表头 + 分隔行），用于超长表按行切时前缀复用
+    """
+    lines = text.split('\n')
+    blocks = []
+    i, n = 0, len(lines)
+
+    while i < n:
+        is_table_start = (
+            i + 1 < n
+            and _RE_TABLE_LINE.match(lines[i])
+            and _RE_TABLE_SEP_LINE.match(lines[i + 1])
+        )
+        if is_table_start:
+            j = i + 2
+            while j < n and _RE_TABLE_LINE.match(lines[j]):
+                j += 1
+            blocks.append({
+                'type': 'table',
+                'content': '\n'.join(lines[i:j]),
+                'header': lines[i] + '\n' + lines[i + 1],
+            })
+            i = j
+        else:
+            j = i
+            while j < n:
+                if (j + 1 < n
+                        and _RE_TABLE_LINE.match(lines[j])
+                        and _RE_TABLE_SEP_LINE.match(lines[j + 1])):
+                    break
+                j += 1
+            prose = '\n'.join(lines[i:j]).strip()
+            if prose:
+                blocks.append({'type': 'prose', 'content': prose, 'header': None})
+            i = j
+
+    return blocks
+
+
+def _table_chunks(block: dict, base_metadata: dict, chunk_size: int = 512) -> list[dict]:
+    """
+    表格 block → chunks
+      整表 ≤ chunk_size → 一个原子 chunk          (chunk_method=table_atomic)
+      整表 > chunk_size → 按行切，每块复用表头    (chunk_method=table_split)
+    """
+    content = block['content']
+    header = block['header']
+
+    if len(content) <= chunk_size:
+        return [{
+            'text': content,
+            'metadata': {**base_metadata, 'chunk_method': 'table_atomic'}
+        }]
+
+    lines = content.split('\n')
+    body_lines = lines[2:]
+    chunks, current_rows = [], []
+    current_len = len(header)
+    chunk_idx = 0
+
+    for row in body_lines:
+        row_len = len(row) + 1
+        if current_rows and current_len + row_len > chunk_size:
+            chunks.append({
+                'text': header + '\n' + '\n'.join(current_rows),
+                'metadata': {
+                    **base_metadata,
+                    'chunk_method': 'table_split',
+                    'chunk_index': chunk_idx,
+                }
+            })
+            chunk_idx += 1
+            current_rows = [row]
+            current_len = len(header) + row_len
+        else:
+            current_rows.append(row)
+            current_len += row_len
+
+    if current_rows:
+        chunks.append({
+            'text': header + '\n' + '\n'.join(current_rows),
+            'metadata': {
+                **base_metadata,
+                'chunk_method': 'table_split',
+                'chunk_index': chunk_idx,
+            }
+        })
+    return chunks
+
+
+def _table_aware_chunks(text: str, metadata: dict,
+                       chunk_size: int = 512, overlap: int = 64) -> list[dict]:
+    """
+    表格感知 chunking 主入口
+    流程：split_into_blocks → table block 走 _table_chunks；prose block 走 _sliding_window_chunks
+    """
+    blocks = _split_into_blocks(text)
+    chunks = []
+    for block in blocks:
+        if block['type'] == 'table':
+            chunks.extend(_table_chunks(block, metadata, chunk_size))
+        else:
+            chunks.extend(_sliding_window_chunks(block['content'], metadata, chunk_size, overlap))
+    return chunks
+
+
+# ============ MinerU Prose Parent-Child + fixed_window Chunking（2026-04-20 V3） ============
+#
+# 历史演进:
+#   V1 (Marker)  : 512 字滑窗 + 64 overlap
+#   V2           : Block-native + Rule-based(35 个主题词切)
+#   V3 (当前)    : **Parent-Child 解耦** — section 整段作 Parent,section 内 fixed_window 300+60 切 Child
+#
+# 为什么 V3:
+#   - Embedding 和 LLM 阅读的目标天然冲突(embedding 想短 / LLM 想长)
+#   - V2 切碎后 LLM 看不到 "首先→其次→综上" 完整论述链,容易编造结论
+#   - V3 和表格 Parent-Child 完全同构:Child 做 embedding / Parent 给 LLM
+#
+# Section 边界:MinerU 的 text_level=1 标记
+# 详见 docs/Finagent项目介绍.md 3.6 / Chunk_Alignment 12 节
+
+# 复用 03d 的作者签名正则,避免假 text_level=1 作 section 锚点
+_RE_AUTHOR_TITLE_SECTION = re.compile(
+    r'^(分析师|研究员|联系人|证券分析师|首席分析师)\s*[:：]\s*\S{2,6}$'
+)
+_RE_DATE_SECTION = re.compile(r'^\d{4}\s*年\s*\d{1,2}\s*月')
+_RE_RATING_SECTION = re.compile(r'^(强烈推荐|买入|增持|中性|回避|卖出)')
+
+
+def _is_real_section(section: dict) -> bool:
+    """过滤假 text_level=1(作者签名 / 评级简写 / 日期等)"""
+    title = (section.get('title') or '').strip()
+    if len(title) < 3:
+        return False
+    if _RE_AUTHOR_TITLE_SECTION.match(title):
+        return False
+    if _RE_RATING_SECTION.match(title):
+        return False
+    if _RE_DATE_SECTION.match(title):
+        return False
+    return True
+
+
+def _collect_sections(blocks: list[dict], pdf_stem: str) -> list[dict]:
+    """
+    按 text_level=1 聚合 blocks 为 sections
+    返回: [{id, title, text, page_idx}, ...]
+    """
+    sections = []
+    current_title = ""
+    current_texts = []
+    current_page = -1
+
+    def flush():
+        if current_texts:
+            sid = f"{pdf_stem}_sec_{len(sections)}"
+            sections.append({
+                'id': sid,
+                'title': current_title,
+                'text': '\n\n'.join(current_texts),
+                'page_idx': current_page,
+            })
+
+    for b in blocks:
+        if b.get('type') != 'text':
+            continue
+        text = (b.get('text') or '').strip()
+        if not text:
+            continue
+        if b.get('text_level') == 1:
+            flush()
+            current_title = text
+            current_texts = []
+            current_page = b.get('page_idx', -1)
+        else:
+            if not current_texts:
+                current_page = b.get('page_idx', -1)
+            current_texts.append(text)
+    flush()
+    return sections
+
+
+def _fixed_window_chunks(section: dict, base_metadata: dict,
+                         chunk_size: int = 300, overlap: int = 60) -> list[dict]:
+    """
+    Section 内固定窗口 + overlap 切 Child。
+    每个 Child 的 metadata 冗余存 section 的 id / title / text(Parent-Child zero-join)。
+    """
+    text = section['text'].strip()
+    section_meta = {
+        **base_metadata,
+        'section_id':    section['id'],
+        'section_title': section['title'],
+        'section_text':  text[:3000],       # 冗余存 Parent,最长 3000 字防过长
+        'page_idx':      section.get('page_idx', -1),
+    }
+
+    chunks = []
+
+    # section 本身短于 chunk_size → 整块作 1 个 Child,不切
+    if len(text) <= chunk_size:
+        if len(text) >= 20:
+            chunks.append({
+                'text': text,
+                'metadata': {**section_meta,
+                             'chunk_method': 'fixed_window',
+                             'chunk_index': 0},
+            })
+        return chunks
+
+    # section 长于 chunk_size → 滑窗切
+    start = 0
+    idx = 0
+    while start < len(text):
+        end = start + chunk_size
+        ct = text[start:end].strip()
+        if len(ct) >= 50:   # 尾部太短丢弃
+            chunks.append({
+                'text': ct,
+                'metadata': {**section_meta,
+                             'chunk_method': 'fixed_window',
+                             'chunk_index': idx},
+            })
+            idx += 1
+        start = end - overlap
+        if start >= len(text):
+            break
+    return chunks
+
+
+def _build_table_parent_record(table_block: dict, base_metadata: dict,
+                                current_section: str, parent_id: str) -> dict:
+    """
+    MinerU table block → Parent record (写 data/processed/table_parents.jsonl,不进 all_chunks)
+
+    设计决策(2026-04-19): Parent 是纯 metadata 载体,不应进 embedding 索引
+      - 避免 HTML 表污染 embedding(标签分词化、数字碎片)
+      - 避免 BM25 召回 `<table><tr><td>` 这类通用 token
+      - 只被 Child(narrative/row_fact)通过 parent_id 回取,在 hybrid_search.enrich_with_parent 展开
+
+    06_tabularize_fulltext.py 读这些 record,生成 narrative / row_fact Child,
+    Child metadata 会带 parent_html 冗余字段(zero-join 回取)
+    """
+    caption = ' '.join(table_block.get('table_caption', []))
+    footnote = ' '.join(table_block.get('table_footnote', []))
+    html = table_block.get('table_body', '')
+
+    return {
+        'parent_id': parent_id,
+        'pdf_file': base_metadata.get('pdf_file', ''),
+        'page_idx': table_block.get('page_idx', -1),
+        'current_section': current_section,
+        'table_caption': caption,
+        'table_footnote': footnote,
+        'table_html': html,
+        # 继承研报元数据(便于 06 调 LLM 时构造 prompt + Child metadata)
+        'stock_code': base_metadata.get('stock_code', ''),
+        'stock_name': base_metadata.get('stock_name', ''),
+        'institution': base_metadata.get('institution', ''),
+        'rating': base_metadata.get('rating', ''),
+        'industry': base_metadata.get('industry', ''),
+        'date': base_metadata.get('date', ''),
+        'report_title': base_metadata.get('report_title', ''),
+    }
+
+
+def build_fulltext_chunks_mineru(cleaned_dir: str, pdf_map_path: str = None,
+                                 chunk_size: int = 300,
+                                 overlap: int = 60) -> tuple[list[dict], list[dict]]:
+    """
+    消费 03d 输出的 *_content_list_cleaned.json,按 **Prose Parent-Child + fixed_window** 切 chunks。
+
+    处理规则:
+      1. 先聚合所有 text block 为 sections(按 text_level=1 边界)
+      2. 过滤假 section(_is_real_section 排除作者签名/评级/日期)
+      3. 每个 section 内走 fixed_window 300+60 overlap 切 Child
+         Child metadata 冗余存 section_text(Parent)
+      4. table block → 独立 table_parents.jsonl
+      5. chart / image → 跳过(文字模型无视觉能力)
+
+    Returns:
+        (chunks, parent_records)
+          chunks         : 进 all_chunks.jsonl / Milvus 索引(fixed_window Child)
+          parent_records : 写 table_parents.jsonl(不进索引,仅供 06 消费)
+    """
+    from pathlib import Path
+
+    pdf_map = {}
+    if pdf_map_path and os.path.exists(pdf_map_path):
+        with open(pdf_map_path, 'r', encoding='utf-8') as f:
+            pdf_map = json.load(f)
+
+    cleaned_files = sorted(Path(cleaned_dir).rglob('*_content_list_cleaned.json'))
+    cleaned_files = [f for f in cleaned_files
+                     if '_cleaned_v' not in f.stem and f.stem.endswith('_content_list_cleaned')]
+    logger.info(f"MinerU cleaned content_list 文件数: {len(cleaned_files)}")
+
+    all_chunks = []
+    all_parents = []
+    stats = {'chart': 0, 'image': 0, 'empty_table': 0,
+             'sections_total': 0, 'sections_kept': 0}
+
+    for json_path in tqdm(cleaned_files, desc="构建 MinerU fulltext chunks"):
+        stem = json_path.name.replace('_content_list_cleaned.json', '')
+        pdf_file = f"{stem}.pdf"
+
+        try:
+            with open(json_path, 'r', encoding='utf-8') as f:
+                blocks = json.load(f)
+        except Exception as e:
+            logger.error(f"跳过 {json_path.name}: {e}")
+            continue
+
+        meta = pdf_map.get(pdf_file, {})
+        base_metadata = {
+            "source_type": "report_fulltext",
+            "parser": "mineru_cleaned",
+            "stock_code": meta.get("stock_code", ""),
+            "stock_name": meta.get("stock_name", ""),
+            "institution": meta.get("institution", ""),
+            "rating": meta.get("rating", ""),
+            "industry": meta.get("industry", ""),
+            "date": meta.get("date", ""),
+            "report_title": meta.get("report_title", ""),
+            "pdf_file": pdf_file,
+        }
+
+        # --- Prose 路径:聚合 sections → 过滤 → fixed_window 切 ---
+        sections = _collect_sections(blocks, stem)
+        stats['sections_total'] += len(sections)
+        for section in sections:
+            if not _is_real_section(section):
+                continue
+            stats['sections_kept'] += 1
+            all_chunks.extend(_fixed_window_chunks(
+                section, base_metadata, chunk_size=chunk_size, overlap=overlap,
+            ))
+
+        # --- 表格路径:产出独立 parent records ---
+        table_counter = 0
+        for block in blocks:
+            btype = block.get('type')
+            if btype == 'table':
+                if not block.get('table_body', '').strip():
+                    stats['empty_table'] += 1
+                    continue
+                table_counter += 1
+                parent_id = f"{stem}_table_{table_counter}"
+                # Parent 没有"当前 section" 概念(section 已独立出来),留空字符串
+                all_parents.append(_build_table_parent_record(
+                    block, base_metadata, '', parent_id,
+                ))
+            elif btype == 'chart':
+                stats['chart'] += 1
+            elif btype == 'image':
+                stats['image'] += 1
+
+    logger.info(f"MinerU fulltext chunks: {len(all_chunks)} 条(fixed_window Child,进索引)")
+    logger.info(f"MinerU table parents:  {len(all_parents)} 条(不进索引,06 消费)")
+    logger.info(f"  sections: {stats['sections_kept']}/{stats['sections_total']} "
+                f"(过滤假 text_level=1 后保留)")
+    logger.info(f"  跳过: chart={stats['chart']}, image={stats['image']}, "
+                f"empty_table={stats['empty_table']}")
+    # 方法分布(预期全是 fixed_window)
+    method_counts = {}
+    for c in all_chunks:
+        m = c['metadata'].get('chunk_method', 'unknown')
+        method_counts[m] = method_counts.get(m, 0) + 1
+    logger.info(f"  chunk_method 分布: {method_counts}")
+    return all_chunks, all_parents
 
 
 # ============ 财务数据 Chunk 构建 ============
@@ -781,9 +1235,9 @@ def build_industry_chunks(financial_path: str, report_path: str = None) -> list[
 
 def main():
     parser = argparse.ArgumentParser(description="FinAgent Chunk 构建")
-    parser.add_argument("--parser", type=str, default="pdfplumber",
-                        choices=["pdfplumber", "marker", "mineru"],
-                        help="选择PDF解析器的结果（默认pdfplumber）")
+    parser.add_argument("--parser", type=str, default="marker",
+                        choices=["marker", "mineru", "mineru_cleaned"],
+                        help="选择PDF解析器的结果（默认 marker；mineru_cleaned = 03d 清洗后 Block-native 路径）")
     parser.add_argument("--report_only", action="store_true")
     parser.add_argument("--financial_only", action="store_true")
     args = parser.parse_args()
@@ -801,7 +1255,18 @@ def main():
     # 2. 研报PDF正文chunks（从解析器结果 → 滑动窗口切分）
     pdf_map_path = os.path.join(RAW_DIR, "report_pdfs", "pdf_map.json")
     if not args.financial_only:
-        fulltext_chunks = build_fulltext_chunks(args.parser, pdf_map_path)
+        if args.parser == "mineru_cleaned":
+            cleaned_dir = PARSER_RESULT_FILES["mineru_cleaned"]
+            fulltext_chunks, table_parents = build_fulltext_chunks_mineru(cleaned_dir, pdf_map_path)
+            # 单独持久化 table parents(不进召回索引,仅供 06_tabularize_fulltext.py 消费)
+            if table_parents:
+                parents_path = os.path.join(CHUNK_DIR, "table_parents.jsonl")
+                with open(parents_path, 'w', encoding='utf-8') as f:
+                    for p in table_parents:
+                        f.write(json.dumps(p, ensure_ascii=False) + '\n')
+                logger.info(f"table_parents: {len(table_parents)} 条 → {parents_path}")
+        else:
+            fulltext_chunks = build_fulltext_chunks(args.parser, pdf_map_path)
         all_chunks.extend(fulltext_chunks)
 
     # 3. 财务数据chunks
