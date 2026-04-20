@@ -22,6 +22,7 @@ import pandas as pd
 import json
 import os
 import re
+import hashlib
 import logging
 import argparse
 from datetime import datetime
@@ -48,7 +49,57 @@ logger = logging.getLogger(__name__)
 
 # ============ 研报元数据 Chunk 构建 ============
 
-def build_report_chunks(report_path: str, since: str = '2024-01-01') -> list[dict]:
+def _safe_str(v) -> str:
+    """CSV 字段 NaN-safe:NaN → '',其他 str()+strip"""
+    if pd.isna(v):
+        return ''
+    return str(v).strip()
+
+
+def _load_pdf_reverse_index(pdf_map_path: str) -> dict:
+    """
+    读 02_download_pdfs.py 产出的 pdf_map.json,构建反查:
+      (stock_code, YYYYMMDD, institution, report_title) → [filename, ...]
+
+    4 元 key(加 title):同日同机构可能发多份(如"系列深度一" + "系列点评十一"),
+    3 元 key 会错配第二份 meta 到第一个 filename。加 title 做消歧,冲突率接近 0。
+    未下载的 meta row 查不到 → pdf_file = None,和 body 无法聚合(反正也没 body)。
+    """
+    if not os.path.exists(pdf_map_path):
+        raise FileNotFoundError(
+            f"pdf_map 不存在: {pdf_map_path}\n"
+            f"报告 meta chunk 的 pdf_file 依赖此文件反查,缺失会让 _external_rrf 方案 B 完全失效。\n"
+            f"解决:先跑 02_download_pdfs.py 生成 pdf_map.json 再跑 04。"
+        )
+    with open(pdf_map_path, encoding='utf-8') as f:
+        pdf_map = json.load(f)
+    reverse = {}
+    missing_date = 0
+    for filename, meta in pdf_map.items():
+        try:
+            date_key = pd.to_datetime(meta['date']).strftime('%Y%m%d')
+        except (ValueError, TypeError):
+            missing_date += 1
+            continue
+        except KeyError:
+            missing_date += 1
+            continue
+        key = (
+            meta.get('stock_code', ''),
+            date_key,
+            meta.get('institution', ''),
+            meta.get('report_title', ''),
+        )
+        reverse.setdefault(key, []).append(filename)
+    if missing_date:
+        logger.warning(f"pdf_map 反查:{missing_date} 条 record 缺 date 被跳过")
+    logger.info(f"pdf_map 反查:{len(pdf_map)} 个 filename → {len(reverse)} 个 4 元组")
+    return reverse
+
+
+def build_report_chunks(report_path: str,
+                        pdf_map_path: str = None,
+                        since: str = '2024-01-01') -> list[dict]:
     """
     将研报数据转为检索chunks
 
@@ -57,6 +108,7 @@ def build_report_chunks(report_path: str, since: str = '2024-01-01') -> list[dic
     - 机构 + 评级(机构观点)
     - 盈利预测数据(硬数据)
     - 行业 + 日期(元信息)
+    - pdf_file(_external_rrf 方案 B 按 PDF 聚合必需,从 pdf_map.json 反查)
 
     2026-04-20 加日期过滤(默认 >= 2024-01-01):
     akshare 拉回的 CSV 覆盖 2017-2026 全时段(~39K),但实际 PDF 下载 MAX_PER_STOCK=5
@@ -76,16 +128,35 @@ def build_report_chunks(report_path: str, since: str = '2024-01-01') -> list[dic
     df = df[df['日期'] >= pd.Timestamp(since)].copy()
     logger.info(f"研报元数据日期过滤 (>= {since}): {before} → {len(df)} ({len(df)/before*100:.1f}%)")
 
+    # 加载 pdf_map 反查(用默认路径)
+    if pdf_map_path is None:
+        pdf_map_path = os.path.join(RAW_DIR, "report_pdfs", "pdf_map.json")
+    pdf_reverse = _load_pdf_reverse_index(pdf_map_path)
+
     chunks = []
+    hit_count = 0
 
     for _, row in tqdm(df.iterrows(), total=len(df), desc="构建研报chunks"):
-        code = str(row.get('股票代码', '')).strip()
-        name = str(row.get('股票简称', '')).strip()
-        title = str(row.get('报告名称', '')).strip()
-        rating = str(row.get('东财评级', '')).strip()
-        institution = str(row.get('机构', '')).strip()
-        industry = str(row.get('行业', '')).strip()
-        date = str(row.get('日期', '')).strip()
+        code = _safe_str(row.get('股票代码'))
+        name = _safe_str(row.get('股票简称'))
+        title = _safe_str(row.get('报告名称'))
+        rating = _safe_str(row.get('东财评级'))
+        institution = _safe_str(row.get('机构'))
+        # 归一化到大类(东财细分"白酒Ⅱ" → 大类"白酒"),和 industry_alias / build_industry_chunks 对齐
+        industry = _get_major_industry(_safe_str(row.get('行业')))
+        # date 之前是 str(Timestamp)='2024-01-01 00:00:00';统一成 pdf_map 的 %Y-%m-%d
+        date_ts = row.get('日期')
+        date = date_ts.strftime('%Y-%m-%d') if pd.notna(date_ts) else ''
+
+        # 反查 pdf_file(没下载的 meta 返回 None,方案 B 时与 body 无法聚合)
+        try:
+            date_key = pd.to_datetime(date).strftime('%Y%m%d')
+        except (ValueError, TypeError):
+            date_key = ''
+        filenames = pdf_reverse.get((code, date_key, institution, title), [])
+        pdf_file = filenames[0] if filenames else None
+        if pdf_file:
+            hit_count += 1
 
         # 构建自然语言描述
         text_parts = [f"{name}({code}) 研报：{title}"]
@@ -107,9 +178,14 @@ def build_report_chunks(report_path: str, since: str = '2024-01-01') -> list[dic
 
         text = "\n".join(text_parts)
 
+        # 显式 chunk_id(code + date + institution + title 的 md5 前 12 字符)
+        # md5 确定性(不受 PYTHONHASHSEED 影响),48-bit 空间,10K 条全库碰撞概率 <0.001%
+        title_hash = hashlib.md5(title.encode('utf-8')).hexdigest()[:12]
+        cid = f"report_{code}_{date_key}_{institution}_{title_hash}"
         chunk = {
             "text": text,
             "metadata": {
+                "chunk_id": cid,
                 "source_type": "report",
                 "stock_code": code,
                 "stock_name": name,
@@ -118,9 +194,12 @@ def build_report_chunks(report_path: str, since: str = '2024-01-01') -> list[dic
                 "industry": industry,
                 "date": date,
                 "report_title": title,
+                "pdf_file": pdf_file,
             }
         }
         chunks.append(chunk)
+
+    logger.info(f"pdf_file 命中率: {hit_count}/{len(chunks)} ({hit_count/max(len(chunks),1)*100:.1f}%)")
 
     logger.info(f"研报chunks: {len(chunks)} 条")
     return chunks
@@ -178,7 +257,8 @@ def build_fulltext_chunks(parser: str, pdf_map_path: str = None,
             "stock_name": meta.get("stock_name", ""),
             "institution": meta.get("institution", ""),
             "rating": meta.get("rating", ""),
-            "industry": meta.get("industry", ""),
+            # industry 归一化到大类,和 build_report_chunks / build_industry_chunks 对齐
+            "industry": _get_major_industry(meta.get("industry", "")),
             "date": meta.get("date", ""),
             "report_title": meta.get("report_title", ""),
             "pdf_file": filename,
@@ -495,9 +575,10 @@ def _fixed_window_chunks(section: dict, base_metadata: dict,
     每个 Child 的 metadata 冗余存 section 的 id / title / text(Parent-Child zero-join)。
     """
     text = section['text'].strip()
+    sid = section['id']
     section_meta = {
         **base_metadata,
-        'section_id':    section['id'],
+        'section_id':    sid,
         'section_title': section['title'],
         'section_text':  text[:3000],       # 冗余存 Parent,最长 3000 字防过长
         'page_idx':      section.get('page_idx', -1),
@@ -511,8 +592,9 @@ def _fixed_window_chunks(section: dict, base_metadata: dict,
             chunks.append({
                 'text': text,
                 'metadata': {**section_meta,
+                             'chunk_id':     f"{sid}_c0",
                              'chunk_method': 'fixed_window',
-                             'chunk_index': 0},
+                             'chunk_index':  0},
             })
         return chunks
 
@@ -526,14 +608,52 @@ def _fixed_window_chunks(section: dict, base_metadata: dict,
             chunks.append({
                 'text': ct,
                 'metadata': {**section_meta,
+                             'chunk_id':     f"{sid}_c{idx}",
                              'chunk_method': 'fixed_window',
-                             'chunk_index': idx},
+                             'chunk_index':  idx},
             })
             idx += 1
         start = end - overlap
         if start >= len(text):
             break
     return chunks
+
+
+def _html_table_to_md(html: str) -> str:
+    """
+    HTML table → Markdown,密度提升 3-5 倍(消除 `<tr><td>` 开销)。
+    - 首选 BeautifulSoup(嵌套 / colspan / 空单元格更稳)
+    - 降级 regex(无 bs4 时也能跑)
+    - 非表格 HTML 原样返回
+    """
+    if not html or '<table' not in html.lower():
+        return html
+    try:
+        from bs4 import BeautifulSoup
+        soup = BeautifulSoup(html, 'html.parser')
+        rows = []
+        for tr in soup.find_all('tr'):
+            cells = [td.get_text(separator=' ', strip=True)
+                     for td in tr.find_all(['td', 'th'])]
+            if cells:
+                rows.append('| ' + ' | '.join(cells) + ' |')
+        if not rows:
+            return html
+        if len(rows) > 1:
+            col = max(r.count('|') - 1 for r in rows)
+            rows.insert(1, '|' + '|'.join([' --- '] * col) + '|')
+        return '\n'.join(rows)
+    except ImportError:
+        # 先剥掉 thead/tbody/tfoot,避免被后面的 t[hd] regex 误匹配(word boundary 不够)
+        text = re.sub(r'</?(?:thead|tbody|tfoot)\b[^>]*>', '', html, flags=re.IGNORECASE)
+        text = re.sub(r'</?(?:div|p|span)[^>]*>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'<tr[^>]*>', '\n| ', text, flags=re.IGNORECASE)
+        text = re.sub(r'</tr>', ' |', text, flags=re.IGNORECASE)
+        text = re.sub(r'</?t[hd][^>]*>', ' | ', text, flags=re.IGNORECASE)
+        text = re.sub(r'</?table[^>]*>', '', text, flags=re.IGNORECASE)
+        text = re.sub(r'\|\s*\|', '|', text)
+        text = re.sub(r'\n\s*\n+', '\n', text)
+        return text.strip()
 
 
 def _build_table_parent_record(table_block: dict, base_metadata: dict,
@@ -547,11 +667,13 @@ def _build_table_parent_record(table_block: dict, base_metadata: dict,
       - 只被 Child(narrative/row_fact)通过 parent_id 回取,在 hybrid_search.enrich_with_parent 展开
 
     06_tabularize_fulltext.py 读这些 record,生成 narrative / row_fact Child,
-    Child metadata 会带 parent_html 冗余字段(zero-join 回取)
+    Child metadata 会带 parent_md 冗余字段(zero-join 回取)
+
+    2026-04-20:HTML 改存 Markdown(建库时一次性转,密度 ×3-5,LLM 阅读友好,Milvus VARCHAR 压力降)
     """
     caption = ' '.join(table_block.get('table_caption', []))
     footnote = ' '.join(table_block.get('table_footnote', []))
-    html = table_block.get('table_body', '')
+    md = _html_table_to_md(table_block.get('table_body', ''))
 
     return {
         'parent_id': parent_id,
@@ -560,7 +682,7 @@ def _build_table_parent_record(table_block: dict, base_metadata: dict,
         'current_section': current_section,
         'table_caption': caption,
         'table_footnote': footnote,
-        'table_html': html,
+        'table_md': md,
         # 继承研报元数据(便于 06 调 LLM 时构造 prompt + Child metadata)
         'stock_code': base_metadata.get('stock_code', ''),
         'stock_name': base_metadata.get('stock_name', ''),
@@ -627,7 +749,7 @@ def build_fulltext_chunks_mineru(cleaned_dir: str, pdf_map_path: str = None,
             "stock_name": meta.get("stock_name", ""),
             "institution": meta.get("institution", ""),
             "rating": meta.get("rating", ""),
-            "industry": meta.get("industry", ""),
+            "industry": _get_major_industry(meta.get("industry", "")),
             "date": meta.get("date", ""),
             "report_title": meta.get("report_title", ""),
             "pdf_file": pdf_file,
@@ -645,18 +767,26 @@ def build_fulltext_chunks_mineru(cleaned_dir: str, pdf_map_path: str = None,
             ))
 
         # --- 表格路径:产出独立 parent records ---
+        # 遍历时同步追踪 current_section(最近一次遇到的 text_level=1 标题),
+        # 传给 _build_table_parent_record 让表格知道自己属于哪个章节,便于 06 LLM 构造 prompt
+        # 用 _is_real_section 过滤假 section(作者名 / 日期 / 评级等),和 _collect_sections 一致
         table_counter = 0
+        current_section_title = ''
         for block in blocks:
             btype = block.get('type')
+            if btype == 'text' and block.get('text_level') == 1:
+                raw = (block.get('text') or '').strip()
+                if _is_real_section({'title': raw}):
+                    current_section_title = raw
+                continue
             if btype == 'table':
                 if not block.get('table_body', '').strip():
                     stats['empty_table'] += 1
                     continue
                 table_counter += 1
                 parent_id = f"{stem}_table_{table_counter}"
-                # Parent 没有"当前 section" 概念(section 已独立出来),留空字符串
                 all_parents.append(_build_table_parent_record(
-                    block, base_metadata, '', parent_id,
+                    block, base_metadata, current_section_title, parent_id,
                 ))
             elif btype == 'chart':
                 stats['chart'] += 1
@@ -737,11 +867,12 @@ def build_financial_chunks(financial_path: str) -> list[dict]:
                 chunks.append({
                     "text": text,
                     "metadata": {
+                        "chunk_id":   f"financial_{code}_{date}_profitability",
                         "source_type": "financial",
                         "data_type": "profitability",
                         "stock_code": code,
                         "stock_name": name,
-                        "report_date": date,
+                        "date": date,
                     }
                 })
 
@@ -751,11 +882,12 @@ def build_financial_chunks(financial_path: str) -> list[dict]:
                 chunks.append({
                     "text": text,
                     "metadata": {
+                        "chunk_id":   f"financial_{code}_{date}_balance_structure",
                         "source_type": "financial",
                         "data_type": "balance_structure",
                         "stock_code": code,
                         "stock_name": name,
-                        "report_date": date,
+                        "date": date,
                     }
                 })
 
@@ -765,11 +897,12 @@ def build_financial_chunks(financial_path: str) -> list[dict]:
                 chunks.append({
                     "text": text,
                     "metadata": {
+                        "chunk_id":   f"financial_{code}_{date}_dupont",
                         "source_type": "financial",
                         "data_type": "dupont",
                         "stock_code": code,
                         "stock_name": name,
-                        "report_date": date,
+                        "date": date,
                     }
                 })
 

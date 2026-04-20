@@ -1066,7 +1066,8 @@ def react_loop(client: OpenAI, tools: FinAgentTools, question: str,
 
         else:  # search_financial / search_report / search_industry
             try:
-                observation = tools.call(action, action_input)
+                # tools.call 返回 (observation_str, retrieval_meta) tuple;SFT 数据生成不追溯 chunk_id,丢弃 meta
+                observation, _ = tools.call(action, action_input)
             except Exception as e:
                 observation = f"[工具调用失败] {e}"
                 logger.warning(f"工具调用失败 [{action}({action_input})]: {e}")
@@ -1327,7 +1328,6 @@ def main():
     logger.info("[1/4] 初始化 OpenAI 客户端完成")
 
     retriever = FinAgentRetriever()
-    retriever.load_index()
     tools = FinAgentTools(retriever)
     logger.info("[2/4] 加载检索索引完成")
 

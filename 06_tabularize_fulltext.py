@@ -277,7 +277,7 @@ def extract_all_tables_mineru(parents_path: Path) -> list[TableTask]:
     从 04 产出的 table_parents.jsonl 读 parent records → TableTask
 
     每行是一个扁平 record(见 04_build_chunks.py::_build_table_parent_record):
-      parent_id / pdf_file / page_idx / table_html / table_caption / table_footnote
+      parent_id / pdf_file / page_idx / table_md / table_caption / table_footnote
       current_section / stock_code / stock_name / institution / date / report_title / industry
     """
     tasks = []
@@ -286,8 +286,8 @@ def extract_all_tables_mineru(parents_path: Path) -> list[TableTask]:
             p = json.loads(line)
             if not p.get('stock_code'):
                 continue
-            html = (p.get('table_html') or '').strip()
-            if not html:
+            table_md = (p.get('table_md') or '').strip()
+            if not table_md:
                 continue
 
             context_parts = []
@@ -302,17 +302,18 @@ def extract_all_tables_mineru(parents_path: Path) -> list[TableTask]:
                 pdf_file=p.get('pdf_file', ''),
                 table_idx=0,   # parent_id 已编号
                 context=context,
-                table_md=html,  # 字段名沿用,实际是 HTML
+                table_md=table_md,
                 metadata={
                     'stock_code': p.get('stock_code', ''),
                     'stock_name': p.get('stock_name', ''),
                     'institution': p.get('institution', ''),
-                    'date': str(p.get('date', ''))[:10],
+                    'date': str(p.get('date') or '')[:10],  # None 转 '' 再切,避免 'None'[:10]='None'
                     'report_title': p.get('report_title', ''),
                     'industry': p.get('industry', ''),
                     'table_caption': p.get('table_caption', ''),
                     'table_footnote': p.get('table_footnote', ''),
                     'current_section': p.get('current_section', ''),
+                    'page_idx': p.get('page_idx', -1),
                 },
             ))
     return tasks
@@ -372,6 +373,7 @@ async def tabularize_one(client: AsyncOpenAI, sem: asyncio.Semaphore,
                     'data': data,
                     'metadata': task.metadata,
                     'parent_md': task.table_md,
+                    'pdf_file': task.pdf_file,
                 }
             except (json.JSONDecodeError, ValueError, Exception) as e:
                 last_err = str(e)
@@ -384,6 +386,7 @@ async def tabularize_one(client: AsyncOpenAI, sem: asyncio.Semaphore,
             'error': last_err,
             'metadata': task.metadata,
             'parent_md': task.table_md,
+            'pdf_file': task.pdf_file,
         }
 
 
@@ -403,6 +406,12 @@ def load_done_ids(ckpt_path: Path) -> set[str]:
 
 
 def append_result(ckpt_path: Path, result: dict):
+    """
+    断点续跑写入。单 consumer 顺序调用(main_async:535-537 的 `async for coro in
+    as_completed` 在主协程里顺序执行),不会出现多协程并发 append,无需加 asyncio.Lock。
+    tabularize_one 本身不碰 ckpt_path。如果以后改成实时写(放进 tabularize_one 内),
+    必须在这里加锁,且用 `open('a', buffering=0)` 或整行一次性写入。
+    """
     with open(ckpt_path, 'a', encoding='utf-8') as f:
         f.write(json.dumps(result, ensure_ascii=False) + '\n')
 
@@ -411,9 +420,31 @@ def append_result(ckpt_path: Path, result: dict):
 
 def build_child_chunks(raw_path: Path, parser: str = 'marker') -> list[dict]:
     """读 tabularize raw.jsonl，生成 narrative + row_fact 双版本 chunk
-    parser='marker'       : parent 存到 parent_md(Markdown pipe syntax)
-    parser='mineru_cleaned': parent 存到 parent_html(HTML <table>),并保留 caption/footnote
+
+    2026-04-20:marker 和 mineru_cleaned 统一用 parent_md 字段存 Markdown 表格
+      - marker: 原本就是 Markdown pipe syntax
+      - mineru_cleaned: 04 建库时已经 HTML→Markdown
     """
+    # 防御:旧版 raw jsonl 没有 pdf_file 字段,会让 tabular Child 的 pdf_file 空串 → None
+    # → 方案 B 按 pdf_file 聚合时所有 None 折同桶,完全错乱。要求用户重跑 06。
+    with open(raw_path, encoding='utf-8') as f:
+        first_line = f.readline()
+    if not first_line:
+        raise RuntimeError(
+            f"{raw_path} 为空文件,rm 后重跑 06_tabularize_fulltext.py"
+        )
+    try:
+        first_record = json.loads(first_line)
+    except json.JSONDecodeError as e:
+        raise RuntimeError(
+            f"{raw_path} 首行 JSON 损坏({e}),rm 后重跑 06_tabularize_fulltext.py"
+        ) from e
+    if 'pdf_file' not in first_record:
+        raise RuntimeError(
+            f"{raw_path} 是旧版本 raw jsonl(缺 pdf_file 字段),"
+            f"rm 后重跑 06_tabularize_fulltext.py 重新生成"
+        )
+
     chunks = []
     with open(raw_path, encoding='utf-8') as f:
         for line in f:
@@ -423,7 +454,7 @@ def build_child_chunks(raw_path: Path, parser: str = 'marker') -> list[dict]:
             task_id = r['task_id']
             data = r['data']
             meta = r['metadata']
-            parent_text = r['parent_md']  # raw 里字段名沿用;mineru 路径存的就是 HTML
+            parent_text = r['parent_md']
 
             base_meta = {
                 'source_type': 'report_tabular',
@@ -438,30 +469,38 @@ def build_child_chunks(raw_path: Path, parser: str = 'marker') -> list[dict]:
                 'caption': data.get('caption', ''),
                 'header_type': data.get('header_type', ''),
                 'parent_id': task_id,
+                'parent_md': parent_text,
+                'page_idx': meta.get('page_idx', -1),
+                'pdf_file': r.get('pdf_file', ''),
             }
-            if parser == 'marker':
-                base_meta['parent_md'] = parent_text
-            else:  # mineru_cleaned
-                base_meta['parent_html'] = parent_text
+            if parser == 'mineru_cleaned':
                 base_meta['table_caption'] = meta.get('table_caption', '')
                 base_meta['table_footnote'] = meta.get('table_footnote', '')
                 base_meta['current_section'] = meta.get('current_section', '')
 
-            # Child 1: narrative（整段叙述，给 LLM 阅读用）
+            # Child 1: narrative(整段叙述,给 LLM 阅读用)—— 每表 1 条
             narr = data.get('narrative', '').strip()
             if narr and len(narr) >= 30:
                 chunks.append({
                     'text': narr,
-                    'metadata': {**base_meta, 'chunk_method': 'table_narrative'},
+                    'metadata': {
+                        **base_meta,
+                        'chunk_id':     f"{task_id}_narrative",
+                        'chunk_method': 'table_narrative',
+                    },
                 })
 
-            # Child 2: row_facts（原子事实，给 embedding 匹配用）
-            for fact in data.get('row_facts', []):
+            # Child 2: row_facts(原子事实,给 embedding 匹配用)—— 每表 N 条
+            for idx, fact in enumerate(data.get('row_facts', [])):
                 fact = fact.strip()
                 if fact and len(fact) >= 10:
                     chunks.append({
                         'text': fact,
-                        'metadata': {**base_meta, 'chunk_method': 'table_row_fact'},
+                        'metadata': {
+                            **base_meta,
+                            'chunk_id':     f"{task_id}_rowfact_{idx}",
+                            'chunk_method': 'table_row_fact',
+                        },
                     })
 
     return chunks

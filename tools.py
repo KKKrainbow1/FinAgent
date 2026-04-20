@@ -56,8 +56,10 @@ TOOLS_NATIVE = [
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "返回结果数量，默认3",
-                        "default": 3
+                        "description": "返回结果数量，默认5，上限20",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 20
                     }
                 },
                 "required": ["query"]
@@ -81,8 +83,10 @@ TOOLS_NATIVE = [
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "返回结果数量，默认3",
-                        "default": 3
+                        "description": "返回结果数量，默认5，上限20",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 20
                     }
                 },
                 "required": ["query"]
@@ -112,8 +116,10 @@ TOOLS_NATIVE = [
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "返回结果数量，默认3",
-                        "default": 3
+                        "description": "返回结果数量，默认5，上限20",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 20
                     }
                 },
                 "required": ["query"]
@@ -180,9 +186,12 @@ def _format_result(result: dict, max_text_len: int = 200) -> str:
     [financial | 贵州茅台 | 2024-12-31] 贵州茅台(600519) 2024年报盈利指标，ROE 36.99%...
     """
     meta = result["metadata"]
-    source = meta.get("source_type", "unknown")
-    name = meta.get("stock_name", "未知")
-    date = meta.get("date", meta.get("report_date", ""))
+    source = meta.get("source_type") or "unknown"
+    name = meta.get("stock_name") or "未知"
+    date = meta.get("date") or ""
+    # financial chunk 露出 data_type 标签(profitability / balance_structure / dupont)
+    data_type = meta.get("data_type") or ""
+    tag = f"{source} · {data_type}" if data_type else source
 
     text = _clean_text(result["text"])
     if len(text) > max_text_len:
@@ -192,7 +201,7 @@ def _format_result(result: dict, max_text_len: int = 200) -> str:
         else:
             text = text[:max_text_len] + "..."
 
-    return f"[{source} | {name} | {date}] {text}"
+    return f"[{tag} | {name} | {date}] {text}"
 
 
 # ============ 3 个工具 ============
@@ -210,16 +219,16 @@ class FinAgentTools:
 
     用法：
         from hybrid_search import FinAgentRetriever
-        retriever = FinAgentRetriever()
-        retriever.load_index()
+        retriever = FinAgentRetriever()   # V3 构造时自动加载 Milvus + BM25 + encoder
 
         tools = FinAgentTools(retriever)
 
-        # V2 原生调用（从 tool_calls.arguments 解析出的 dict）
-        obs = tools.call("search_financial", {"query": "贵州茅台 ROE 2024", "top_k": 5})
+        # V2 原生调用(从 tool_calls.arguments 解析出的 dict)
+        obs, meta = tools.call("search_financial", {"query": "贵州茅台 ROE 2024", "top_k": 5})
+        # meta: [{chunk_id, score, source_type, pdf_file, stock_code, date}, ...] 或 None
 
-        # V1 兼容调用（纯字符串）
-        obs = tools.call("search_financial", "贵州茅台 ROE 2024")
+        # V1 兼容调用(纯字符串)
+        obs, meta = tools.call("search_financial", "贵州茅台 ROE 2024")
     """
 
     # V1 纯文本工具描述（保留供 V1 代码使用）
@@ -252,24 +261,45 @@ class FinAgentTools:
     def __init__(self, retriever):
         """
         Args:
-            retriever: FinAgentRetriever 实例（已调用 load_index）
+            retriever: FinAgentRetriever 实例(V3 构造时自动加载索引,无需手动 load_index)
+
+        无共享可变状态:call() 返回 (observation_str, retrieval_meta) tuple,
+        调用方拿到就是本次 call 的局部结果,不会被并发 rollout 污染。
         """
         self.retriever = retriever
 
-    def call(self, tool_name: str, tool_input) -> str:
+    @staticmethod
+    def _build_retrieval_meta(results) -> list:
+        """把 retriever 返回的 list[dict] 压成精简 metadata 列表(追溯必需字段)。
+        match_via / sim 是 search_industry 两阶段的分叉证据(字典 vs 向量 fallback),保留。"""
+        return [
+            {
+                'chunk_id':    r['metadata'].get('chunk_id'),
+                'score':       r.get('score'),
+                'source_type': r['metadata'].get('source_type'),
+                'pdf_file':    r['metadata'].get('pdf_file'),
+                'stock_code':  r['metadata'].get('stock_code'),
+                'date':        r['metadata'].get('date'),
+                'match_via':   r['metadata'].get('match_via'),   # industry:'dict' / 'vector_fallback'
+                'sim':         r['metadata'].get('sim'),         # industry Phase 2 的 cosine sim
+            }
+            for r in results
+        ]
+
+    def call(self, tool_name: str, tool_input) -> tuple:
         """
         统一工具调用入口
 
         Args:
-            tool_name: 工具名（search_report / search_financial / calculate）
-            tool_input: 工具输入，支持两种格式：
-                - dict: 从 tool_calls[0].function.arguments 解析出的 JSON 对象
-                        如 {"query": "贵州茅台 ROE", "top_k": 5}
-                - str:  V1 兼容模式，纯字符串输入
-                        如 "贵州茅台 ROE"
+            tool_name: 工具名（search_report / search_financial / search_industry / calculate）
+            tool_input: 工具输入，支持 dict(tool_calls.arguments 解析)或 str(V1 兼容)
 
         Returns:
-            Observation 字符串
+            (observation_str, retrieval_meta):
+              - observation_str: 给 LLM 看的格式化文本
+              - retrieval_meta: list[{chunk_id, score, source_type, pdf_file, stock_code, date}] 或 None
+                (search 类工具成功返回结果时给 list;异常/空召回/calculate 都是 None)
+            调用方用局部变量接,天然无并发 race
         """
         # 统一解析输入
         if isinstance(tool_input, str):
@@ -285,38 +315,47 @@ class FinAgentTools:
                 else:
                     tool_input = {"input": tool_input.strip()}
 
+        # 输入校验(LLM 可能传 99999 / 'abc' / 10K 字符 query)
+        def _safe_query(v):
+            return str(v or "")[:500]    # 长度上限,避免 DoS
+        def _safe_top_k(v, default=5):
+            try:
+                return max(1, min(int(v), 20))
+            except (TypeError, ValueError):
+                return default
+
         if tool_name == "search_report":
             return self._search_report(
-                query=tool_input.get("query", ""),
-                top_k=tool_input.get("top_k", 3),
+                query=_safe_query(tool_input.get("query", "")),
+                top_k=_safe_top_k(tool_input.get("top_k", 5), default=5),
             )
         elif tool_name == "search_financial":
             return self._search_financial(
-                query=tool_input.get("query", ""),
-                top_k=tool_input.get("top_k", 3),
+                query=_safe_query(tool_input.get("query", "")),
+                top_k=_safe_top_k(tool_input.get("top_k", 5), default=5),
             )
         elif tool_name == "search_industry":
             return self._search_industry(
-                query=tool_input.get("query", ""),
-                top_k=tool_input.get("top_k", 3),
+                query=_safe_query(tool_input.get("query", "")),
+                top_k=_safe_top_k(tool_input.get("top_k", 5), default=5),
             )
         elif tool_name == "calculate":
             return self._calculate(
-                expression=tool_input.get("expression", ""),
-                precision=tool_input.get("precision", 4),
+                expression=str(tool_input.get("expression", ""))[:500],
+                precision=_safe_top_k(tool_input.get("precision", 4), default=4),
             )
         else:
-            return f"[错误] 未知工具: {tool_name}。可用工具: {', '.join(TOOL_NAMES_NATIVE)}"
+            return f"[错误] 未知工具: {tool_name}。可用工具: {', '.join(TOOL_NAMES_NATIVE)}", None
 
     # ---------- search_report ----------
 
-    def _search_report(self, query: str, top_k: int = 3) -> str:
+    def _search_report(self, query: str, top_k: int = 5) -> tuple:
         """
         检索研报信息
 
         返回格式示例：
-        找到 5 条相关研报信息：
-        1. [report | 宁德时代 | 2026-02-15] 宁德时代(300750) 研报：全年业绩超预期...评级：买入...
+        找到 5 条相关研报片段（按 12K 上下文预算截取）：
+        1. [report · - | 宁德时代 | 2026-02-15] 宁德时代(300750) 研报：全年业绩超预期...评级：买入...
         2. [report_fulltext | 宁德时代 | 2026-02-15] 公司动力电池市占率持续提升...
         ...
         """
@@ -324,20 +363,21 @@ class FinAgentTools:
             results = self.retriever.search_report(query, top_k=top_k)
         except Exception as e:
             logger.error(f"search_report 异常: {e}")
-            return f"[检索错误] 研报检索失败: {str(e)}"
+            return f"[检索错误] 研报检索失败: {str(e)}", None
 
         if not results:
-            return "[检索结果为空] 未找到与查询相关的研报信息。"
+            return "[检索结果为空] 未找到与查询相关的研报信息。", None
 
-        lines = [f"找到 {len(results)} 条相关研报信息："]
+        # 提示 LLM:N 是"按上下文预算截取后"的数量,不是数据库总匹配数
+        lines = [f"找到 {len(results)} 条相关研报片段（按 12K 上下文预算截取，数据库可能还有更多匹配）："]
         for i, r in enumerate(results):
             lines.append(f"{i+1}. {_format_result(r)}")
 
-        return "\n".join(lines)
+        return "\n".join(lines), self._build_retrieval_meta(results)
 
     # ---------- search_financial ----------
 
-    def _search_financial(self, query: str, top_k: int = 3) -> str:
+    def _search_financial(self, query: str, top_k: int = 5) -> tuple:
         """
         检索财务数据
 
@@ -351,20 +391,20 @@ class FinAgentTools:
             results = self.retriever.search_financial(query, top_k=top_k)
         except Exception as e:
             logger.error(f"search_financial 异常: {e}")
-            return f"[检索错误] 财务数据检索失败: {str(e)}"
+            return f"[检索错误] 财务数据检索失败: {str(e)}", None
 
         if not results:
-            return "[检索结果为空] 未找到与查询相关的财务数据。"
+            return "[检索结果为空] 未找到与查询相关的财务数据。", None
 
         lines = [f"找到 {len(results)} 条相关财务数据："]
         for i, r in enumerate(results):
             lines.append(f"{i+1}. {_format_result(r)}")
 
-        return "\n".join(lines)
+        return "\n".join(lines), self._build_retrieval_meta(results)
 
     # ---------- search_industry ----------
 
-    def _search_industry(self, query: str, top_k: int = 3) -> str:
+    def _search_industry(self, query: str, top_k: int = 5) -> tuple:
         """
         检索行业对比数据
 
@@ -376,19 +416,20 @@ class FinAgentTools:
             results = self.retriever.search_industry(query, top_k=top_k)
         except Exception as e:
             logger.error(f"search_industry 异常: {e}")
-            return f"[检索错误] 行业数据检索失败: {str(e)}"
+            return f"[检索错误] 行业数据检索失败: {str(e)}", None
 
         if not results:
-            return "[检索结果为空] 未找到与查询相关的行业对比数据。"
+            return "[检索结果为空] 未找到与查询相关的行业对比数据。", None
 
         if len(results) == 1 and results[0]["metadata"].get("match_failed"):
-            return f"[检索结果为空] {_clean_text(results[0]['text'])}"
+            return f"[检索结果为空] {_clean_text(results[0]['text'])}", None
 
+        retrieval_meta = self._build_retrieval_meta(results)
         lines = [f"找到 {len(results)} 条相关行业数据："]
         for i, r in enumerate(results):
             meta = r["metadata"]
-            industry = meta.get("industry", "未知")
-            count = meta.get("company_count", 0)
+            industry = meta.get("industry") or "未知"
+            count = meta.get("company_count") or 0
             # 行业 chunk 较长，截断到 1000 字符保留核心数据
             text = _clean_text(r["text"])
             if len(text) > 1000:
@@ -399,21 +440,25 @@ class FinAgentTools:
                     text = text[:1000] + "..."
             lines.append(f"{i+1}. [industry | {industry} | {count}家公司]\n{text}")
 
-        return "\n".join(lines)
+        return "\n".join(lines), retrieval_meta
 
     # ---------- calculate ----------
 
-    def _calculate(self, expression: str, precision: int = 4) -> str:
+    def _calculate(self, expression: str, precision: int = 4) -> tuple:
         """
         安全计算数学表达式
 
         只允许数字和基本运算符，防止代码注入。
+
         Agent 可能生成 "calculate('(1505-1294)/1294*100')" 这样的输入，
         需要先清理引号和多余字符。
 
         面试追问：为什么不直接用 eval？
         答：直接 eval 有代码注入风险（虽然在离线训练场景下风险低）。
         我用正则白名单过滤，只允许数字、运算符和括号。
+
+        Returns:
+            (result_str, None) — 和 search 工具对齐,但 calculate 不碰 retriever,meta 恒为 None
         """
         # 清理输入：去掉引号、空格，并兼容模型常见的 Unicode 运算符
         expr = expression.strip().strip("'\"")
@@ -429,28 +474,31 @@ class FinAgentTools:
             "）": ")",
         }))
 
-        # 安全检查：只允许数字、运算符、括号、小数点
-        if not re.match(r'^[\d\s\+\-\*/\(\)\.\,%]+$', expr):
-            return f"[计算错误] 表达式包含不允许的字符: {expr}"
+        # 安全检查:只允许数字、运算符、括号、小数点(去掉逗号,避免 eval("1,2") 返 tuple)
+        if not re.match(r'^[\d\s\+\-\*/\(\)\.%]+$', expr):
+            return f"[计算错误] 表达式包含不允许的字符: {expr}", None
 
         # 处理百分号：5% → 0.05
         expr = re.sub(r'(\d+\.?\d*)%', r'(\1/100)', expr)
 
         try:
             result = eval(expr, {"__builtins__": {}}, {})
+            # 防御:白名单虽已限死,但多重保险 —— 拒绝非数字结果
+            if not isinstance(result, (int, float)):
+                return f"[计算错误] 结果不是数值: {result!r}", None
             # 格式化输出
             if isinstance(result, float):
                 if abs(result) >= 1e8:
-                    return f"计算结果: {result/1e8:.{precision}f}亿"
+                    return f"计算结果: {result/1e8:.{precision}f}亿", None
                 elif abs(result) >= 1e4:
-                    return f"计算结果: {result/1e4:.{precision}f}万"
+                    return f"计算结果: {result/1e4:.{precision}f}万", None
                 else:
-                    return f"计算结果: {result:.{precision}f}"
-            return f"计算结果: {result}"
+                    return f"计算结果: {result:.{precision}f}", None
+            return f"计算结果: {result}", None
         except ZeroDivisionError:
-            return "[计算错误] 除数为零"
+            return "[计算错误] 除数为零", None
         except Exception as e:
-            return f"[计算错误] 无法计算 '{expr}': {str(e)}"
+            return f"[计算错误] 无法计算 '{expr}': {str(e)}", None
 
 
 # ================================================================
@@ -461,9 +509,8 @@ def main():
     """测试工具调用"""
     from hybrid_search import FinAgentRetriever
 
-    # 加载检索器
+    # 加载检索器(V3 构造时自动加载)
     retriever = FinAgentRetriever()
-    retriever.load_index()
 
     # 初始化工具
     tools = FinAgentTools(retriever)
@@ -473,18 +520,18 @@ def main():
     print("测试 V2 原生调用（dict 参数）")
     print("=" * 60)
 
-    obs = tools.call("search_financial", {"query": "贵州茅台 ROE 2024", "top_k": 5})
-    print(f"search_financial (top_k=5):\n{obs}\n")
+    obs, meta = tools.call("search_financial", {"query": "贵州茅台 ROE 2024", "top_k": 5})
+    print(f"search_financial (top_k=5):\n{obs}\n命中 chunk_ids: {[m['chunk_id'] for m in (meta or [])]}\n")
 
-    obs = tools.call("search_report", {"query": "宁德时代 投资评级 目标价"})
-    print(f"search_report:\n{obs}\n")
+    obs, meta = tools.call("search_report", {"query": "宁德时代 投资评级 目标价"})
+    print(f"search_report:\n{obs}\n命中 chunk_ids: {[m['chunk_id'] for m in (meta or [])]}\n")
 
     # 测试 V1 兼容调用（纯字符串）
     print("=" * 60)
     print("测试 V1 兼容调用（纯字符串）")
     print("=" * 60)
 
-    obs = tools.call("search_financial", "贵州茅台 ROE 2024")
+    obs, _ = tools.call("search_financial", "贵州茅台 ROE 2024")
     print(f"search_financial (str):\n{obs}\n")
 
     # 测试 calculate
@@ -498,18 +545,18 @@ def main():
         {"expression": "100 / 0"},                                      # 除零错误
     ]
     for case in test_cases:
-        obs = tools.call("calculate", case)
+        obs, _ = tools.call("calculate", case)
         print(f"  {case} → {obs}")
 
     # 测试 calculate V1 兼容
-    obs = tools.call("calculate", "(1505 - 1294) / 1294 * 100")
+    obs, _ = tools.call("calculate", "(1505 - 1294) / 1294 * 100")
     print(f"\n  V1兼容: '(1505 - 1294) / 1294 * 100' → {obs}")
 
     # 测试未知工具
     print("\n" + "=" * 60)
     print("测试未知工具")
     print("=" * 60)
-    obs = tools.call("unknown_tool", "test")
+    obs, _ = tools.call("unknown_tool", "test")
     print(f"  → {obs}")
 
     # 打印 TOOLS_NATIVE（供检查）

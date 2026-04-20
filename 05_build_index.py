@@ -92,11 +92,21 @@ def build_schema(client):
     schema.add_field("rating",        DataType.VARCHAR, max_length=32,  nullable=True)
     schema.add_field("report_title",  DataType.VARCHAR, max_length=256, nullable=True)
     schema.add_field("page_idx",      DataType.INT16,                   nullable=True)
+    # 原始 PDF 文件名(_external_rrf 按 pdf_file 聚合用,同 PDF 多 chunk 共享 RRF 分数)
+    schema.add_field("pdf_file",      DataType.VARCHAR, max_length=256,  nullable=True)
+    # 解析器 / 数据类型 / 表格类型 等语义标签(之前被 enable_dynamic_field=False silent drop)
+    schema.add_field("parser",          DataType.VARCHAR, max_length=32,  nullable=True)
+    schema.add_field("data_type",       DataType.VARCHAR, max_length=32,  nullable=True)
+    schema.add_field("chunk_index",     DataType.INT16,                    nullable=True)
+    schema.add_field("table_type",      DataType.VARCHAR, max_length=64,  nullable=True)
+    schema.add_field("header_type",     DataType.VARCHAR, max_length=32,  nullable=True)
+    schema.add_field("current_section", DataType.VARCHAR, max_length=256, nullable=True)
 
-    # Parent-Child 关联 + 冗余(Table)
-    schema.add_field("parent_id",     DataType.VARCHAR, max_length=256,   nullable=True)
-    schema.add_field("parent_html",   DataType.VARCHAR, max_length=16384, nullable=True)
-    schema.add_field("table_caption", DataType.VARCHAR, max_length=512,   nullable=True)
+    # Parent-Child 关联 + 冗余(Table;建库时 HTML→Markdown,密度 ×3-5,8192 够用)
+    schema.add_field("parent_id",      DataType.VARCHAR, max_length=256,  nullable=True)
+    schema.add_field("parent_md",      DataType.VARCHAR, max_length=8192, nullable=True)
+    schema.add_field("table_caption",  DataType.VARCHAR, max_length=512,  nullable=True)
+    schema.add_field("table_footnote", DataType.VARCHAR, max_length=512,  nullable=True)
 
     # Parent-Child 关联 + 冗余(Prose)
     schema.add_field("section_id",    DataType.VARCHAR, max_length=256,  nullable=True)
@@ -143,6 +153,13 @@ def _truncate(s, max_len):
     return s[:max_len] if len(s) > max_len else s
 
 
+def _nullable(s, max_len):
+    """nullable VARCHAR:空串 / None 统一返回 None,避免 Milvus filter 的 == "" vs is null 双路径"""
+    if s is None or s == "":
+        return None
+    return _truncate(s, max_len)
+
+
 def _csr_row_to_dict(csr, row_idx):
     """
     scipy.sparse.csr_array 的一行 → Milvus 可接受的 {col_idx: value} dict
@@ -171,36 +188,48 @@ def chunk_to_row(chunk: dict, global_idx: int,
     if isinstance(stock_codes, list):
         stock_codes = ','.join(stock_codes)
 
-    # page_idx / company_count 是 nullable INT16,保留 None 避免和真实 -1/0 混淆
+    # page_idx / company_count / chunk_index 是 nullable INT16,保留 None 避免和真实 -1/0 混淆
     page_idx = m.get('page_idx')
     page_idx = int(page_idx) if page_idx is not None else None
     company_count = m.get('company_count')
     company_count = int(company_count) if company_count is not None else None
+    chunk_index = m.get('chunk_index')
+    chunk_index = int(chunk_index) if chunk_index is not None else None
 
     dense_list = dense_vec.tolist() if hasattr(dense_vec, 'tolist') else list(dense_vec)
 
     return {
+        # non-nullable:chunk_id / text / source_type 必须有值
         "chunk_id":       _truncate(chunk_id, 256),
         "dense":          dense_list,
         "sparse":         _csr_row_to_dict(sparse_csr, sparse_row_idx),
         "text":           _truncate(chunk.get('text', ''), 4096),
         "source_type":    _truncate(source_type, 32),
-        "chunk_method":   _truncate(m.get('chunk_method'), 32),
-        "stock_code":     _truncate(m.get('stock_code'), 16),
-        "stock_name":     _truncate(m.get('stock_name'), 64),
-        "institution":    _truncate(m.get('institution'), 128),
-        "date":           _truncate(m.get('date'), 24),
-        "industry":       _truncate(m.get('industry'), 64),
-        "rating":         _truncate(m.get('rating'), 32),
-        "report_title":   _truncate(m.get('report_title'), 256),
+        # nullable VARCHAR:空串统一转 None,避免 filter 双路径
+        "chunk_method":   _nullable(m.get('chunk_method'),   32),
+        "stock_code":     _nullable(m.get('stock_code'),     16),
+        "stock_name":     _nullable(m.get('stock_name'),     64),
+        "institution":    _nullable(m.get('institution'),    128),
+        "date":           _nullable(m.get('date'),           24),
+        "industry":       _nullable(m.get('industry'),       64),
+        "rating":         _nullable(m.get('rating'),         32),
+        "report_title":   _nullable(m.get('report_title'),   256),
         "page_idx":       page_idx,
-        "parent_id":      _truncate(m.get('parent_id'), 256),
-        "parent_html":    _truncate(m.get('parent_html') or m.get('parent_md'), 16384),
-        "table_caption":  _truncate(m.get('table_caption') or m.get('caption'), 512),
-        "section_id":     _truncate(m.get('section_id'), 256),
-        "section_title":  _truncate(m.get('section_title'), 256),
-        "section_text":   _truncate(m.get('section_text'), 8192),
-        "stock_codes":    _truncate(stock_codes, 2048),
+        "pdf_file":       _nullable(m.get('pdf_file'),       256),
+        "parser":         _nullable(m.get('parser'),          32),
+        "data_type":      _nullable(m.get('data_type'),       32),
+        "chunk_index":    chunk_index,
+        "table_type":     _nullable(m.get('table_type'),      64),
+        "header_type":    _nullable(m.get('header_type'),     32),
+        "current_section":_nullable(m.get('current_section'), 256),
+        "parent_id":      _nullable(m.get('parent_id'),      256),
+        "parent_md":      _nullable(m.get('parent_md'),        8192),
+        "table_caption":  _nullable(m.get('table_caption') or m.get('caption'), 512),
+        "table_footnote": _nullable(m.get('table_footnote'),   512),
+        "section_id":     _nullable(m.get('section_id'),     256),
+        "section_title":  _nullable(m.get('section_title'),  256),
+        "section_text":   _nullable(m.get('section_text'),   8192),
+        "stock_codes":    _nullable(stock_codes,             2048),
         "company_count":  company_count,
     }
 
@@ -233,7 +262,8 @@ def main():
     dist = Counter(c.get('metadata', {}).get('source_type', '?') for c in chunks)
     logger.info(f"source_type 分布: {dict(dist)}")
 
-    texts = [(c.get('text') or '')[:2048] for c in chunks]
+    # 与 Milvus text 字段(VARCHAR 4096)对齐,避免 BM25 看到的内容比存储的短
+    texts = [(c.get('text') or '')[:4096] for c in chunks]
 
     # ─── 2. Dense embedding (BGE) ───
     logger.info(f"加载 embedding model: {EMBEDDING_MODEL}")

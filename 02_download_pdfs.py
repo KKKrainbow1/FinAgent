@@ -151,14 +151,17 @@ def batch_download_pdfs(df: pd.DataFrame) -> dict:
 
         if success:
             stats["success"] += 1
+            # 字段做 NaN-safe + strip,和 04 _load_pdf_reverse_index 的 4 元 key 对齐
+            def _f(v):
+                return '' if pd.isna(v) else str(v).strip()
             pdf_map[filename] = {
-                "stock_code": code,
-                "stock_name": row.get('股票简称', ''),
-                "report_title": row.get('报告名称', ''),
-                "institution": row.get('机构', ''),
-                "rating": row.get('东财评级', ''),
-                "industry": row.get('行业', ''),
-                "date": str(row['日期']),
+                "stock_code": _f(code),
+                "stock_name": _f(row.get('股票简称', '')),
+                "report_title": _f(row.get('报告名称', '')),
+                "institution": _f(row.get('机构', '')),
+                "rating": _f(row.get('东财评级', '')),
+                "industry": _f(row.get('行业', '')),
+                "date": pd.to_datetime(row['日期']).strftime('%Y-%m-%d'),
                 "url": url,
                 "pdf_path": save_path,
             }

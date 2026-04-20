@@ -301,14 +301,14 @@ def main():
             "tool_name": "search_financial",
             "tool_arguments": {"query": "贵州茅台 ROE 毛利率 净利率 2024"},
             "tool_call_id": "call_0",
-            "observation": "找到 5 条相关财务数据：\n1. [financial | 贵州茅台 | 2024-12-31] ROE 36.99%...",
+            "observation": "找到 5 条相关财务数据：\n1. [financial · profitability | 贵州茅台 | 2024-12-31] ROE 36.99%...",
         },
         {
             "thought": "检索结果显示贵州茅台2024年ROE高达36.99%，毛利率76.18%，净利率52.27%，盈利能力极强。但仅有财务数据不够，还需了解机构对未来增长的预期和风险判断。",
             "tool_name": "search_report",
             "tool_arguments": {"query": "贵州茅台 投资评级 目标价 2025 2026"},
             "tool_call_id": "call_1",
-            "observation": "找到 5 条相关研报信息：\n1. [report | 贵州茅台 | 2026-03-03] 评级：买入...",
+            "observation": "找到 5 条相关研报片段（按 12K 上下文预算截取，数据库可能还有更多匹配）：\n1. [report | 贵州茅台 | 2026-03-03] 评级：买入...",
         },
     ]
 

@@ -41,6 +41,14 @@ DEFAULT_DB_PATH = ROOT / "data/processed/milvus_finagent.db"
 DEFAULT_BM25_PATH = ROOT / "data/processed/bm25_ef.pkl"
 DEFAULT_ENCODER = "./models/bge-base-zh-v1.5"
 
+# search_report 上下文预算(字符数):Qwen2.5-14B 32K 窗口,留给单次 observation ~12K 字符
+# 策略见 docs/Chunk_Alignment_20260420.md 14.x:建库时 HTML→Markdown + 预算截取,不硬截 Parent
+SEARCH_REPORT_BUDGET_CHARS = 12000
+
+# BGE-zh-v1.5 官方 asymmetric retrieval:query 端加 instruction,doc 端不加
+# 不加会损失 1-2% 召回。index 端保持不加(见 05_build_index.py)
+_BGE_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章:"
+
 
 class FinAgentRetriever:
     """
@@ -204,9 +212,15 @@ class FinAgentRetriever:
         return mp
 
     def _embed(self, query: str) -> tuple[list, dict]:
-        """query → (dense 向量 list, sparse {col: weight} dict)"""
+        """query → (dense 向量 list, sparse {col: weight} dict)
+
+        BGE 端拼 query instruction(asymmetric retrieval),doc 端不拼。
+        防重复:如果 query 已经以 prefix 开头(LLM 偶尔复述),不再拼一次。
+        空 sparse(query 全被 jieba 停用词/OOV 过滤)注入占位,避免 AnnSearchRequest ParamError。
+        """
+        q_with_prefix = query if query.startswith(_BGE_QUERY_PREFIX) else _BGE_QUERY_PREFIX + query
         dense = self.encoder.encode(
-            [query], normalize_embeddings=True
+            [q_with_prefix], normalize_embeddings=True
         )[0].tolist()
 
         sparse_csr = self.bm25_ef.encode_queries([query])
@@ -216,24 +230,33 @@ class FinAgentRetriever:
             for k, v in zip(sparse_csr.indices[start:end],
                             sparse_csr.data[start:end])
         }
+        if not sparse:
+            logger.warning(f"BM25 query 全被过滤: {query!r},用占位 sparse")
+            sparse = {0: 1e-6}
         return dense, sparse
 
     @staticmethod
     def _hit_to_chunk(hit) -> dict:
         """
-        Milvus hit → {text, metadata, score} 标准格式
-        hit['id'] 是主键 chunk_id(不在 output_fields 里自动返回),手动放进 metadata 让 RRF 能 dedup
+        Milvus hit → {text, metadata, score} 标准格式。
+        兼容 dict(MilvusClient.hybrid_search)和 Hit 对象(低级 Collection API)两种返回形态。
         """
-        entity = dict(hit.get('entity', {}))
+        if isinstance(hit, dict):
+            entity = dict(hit.get('entity', {}))
+            pk = hit.get('id') or hit.get('pk')
+            distance = hit.get('distance', 0.0)
+        else:
+            entity = dict(getattr(hit, 'entity', {}) or {})
+            pk = getattr(hit, 'id', None) or getattr(hit, 'pk', None)
+            distance = getattr(hit, 'distance', 0.0)
+
         text = entity.pop('text', '')
-        # 主键 → metadata.chunk_id,避免 _external_rrf 用 id() 导致 dedup 失效
-        pk = hit.get('id') or hit.get('pk')
         if pk is not None:
             entity['chunk_id'] = pk
         return {
             'text': text,
             'metadata': entity,
-            'score': float(hit.get('distance', 0.0)),
+            'score': float(distance),
         }
 
     # ============ search_financial ============
@@ -261,7 +284,7 @@ class FinAgentRetriever:
             filter=filter_expr,
             output_fields=[
                 "text", "source_type", "stock_code", "stock_name",
-                "date", "chunk_method",
+                "date", "chunk_method", "data_type",
             ],
             limit=top_k,
         )
@@ -301,56 +324,68 @@ class FinAgentRetriever:
             anns_field="dense",
             data=[q_dense],
             filter='source_type == "industry_alias"',
-            output_fields=["industry", "section_text", "stock_codes", "company_count"],
+            output_fields=["chunk_id", "text", "industry", "section_text",
+                           "stock_codes", "company_count", "pdf_file"],
             limit=top_k * 3,    # 多拉一些,应用层按 industry dedup
         )
         seen_industries = set()
         hits = []
         for h in results[0]:
-            sim = float(h.get('distance', 0))
+            # 走统一 _hit_to_chunk,兼容 dict / Hit 对象两种返回形态
+            c = self._hit_to_chunk(h)
+            sim = c['score']
             if sim < sim_threshold:
                 continue
-            ent = h.get('entity', {})
+            ent = c['metadata']
             industry = ent.get('industry')
             if industry in seen_industries:        # 应用层 dedup(代替 group_by_field)
                 continue
             seen_industries.add(industry)
+            # 保留 _hit_to_chunk 给出的所有字段(含 chunk_id / pdf_file 等),
+            # 再覆盖/追加 industry 专用字段 —— 追溯 chain 不断
+            meta = {
+                **ent,
+                'source_type':   'industry',
+                'match_via':     'vector_fallback',
+                'sim':           sim,
+            }
             hits.append({
-                'text': ent.get('section_text', '') or '',
-                'metadata': {
-                    'source_type': 'industry',
-                    'industry':      industry,
-                    'stock_codes':   ent.get('stock_codes'),
-                    'company_count': ent.get('company_count'),
-                    'match_via':     'vector_fallback',
-                    'sim':           sim,
-                },
-                'score': sim,
+                'text':     c['text'],
+                'metadata': meta,
+                'score':    sim,
             })
             if len(hits) >= top_k:
                 break
         return hits
 
     def _fetch_industry_parents(self, industries: list, via: str) -> list[dict]:
-        """按标准 industry 名直接 query 取 Parent 冗余字段"""
+        """按标准 industry 名直接 query 取 Parent 冗余字段。metadata 含 chunk_id 等追溯字段。"""
         hits = []
         for ind in industries:
             rows = self.client.query(
                 collection_name=self.collection,
                 filter=f'source_type == "industry_alias" and industry == "{ind}"',
-                output_fields=["industry", "section_text", "stock_codes", "company_count"],
+                output_fields=["chunk_id", "industry", "section_text",
+                               "stock_codes", "company_count", "pdf_file"],
                 limit=1,
             )
             if not rows:
                 continue
             r = rows[0]
+            # rows 元素通常是 dict,但低级 API 可能返回对象,用 getattr 兜底
+            def _g(obj, key, default=None):
+                if isinstance(obj, dict):
+                    return obj.get(key, default)
+                return getattr(obj, key, default)
             hits.append({
-                'text': r.get('section_text', '') or '',
+                'text': _g(r, 'section_text') or '',
                 'metadata': {
-                    'source_type':  'industry',
-                    'industry':      r.get('industry'),
-                    'stock_codes':   r.get('stock_codes'),
-                    'company_count': r.get('company_count'),
+                    'chunk_id':     _g(r, 'chunk_id'),      # 追溯链:industry_alias 的 chunk_id
+                    'source_type':  'industry',             # 对外语义:industry(Milvus 里是 industry_alias)
+                    'industry':      _g(r, 'industry'),
+                    'stock_codes':   _g(r, 'stock_codes'),
+                    'company_count': _g(r, 'company_count'),
+                    'pdf_file':      _g(r, 'pdf_file'),
                     'match_via':     via,
                 },
                 'score': 1.0,   # 字典精确匹配满分
@@ -382,6 +417,7 @@ class FinAgentRetriever:
             output_fields=[
                 "text", "source_type", "stock_code", "stock_name",
                 "institution", "date", "rating", "report_title",
+                "pdf_file",
             ],
             limit=30,
         )
@@ -400,9 +436,10 @@ class FinAgentRetriever:
             output_fields=[
                 "text", "source_type", "chunk_method",
                 "stock_code", "stock_name", "institution", "date",
-                "parent_id", "parent_html", "table_caption",
+                "rating", "industry", "report_title",
+                "parent_id", "parent_md", "table_caption", "table_footnote",
                 "section_id", "section_title", "section_text",
-                "page_idx",
+                "page_idx", "pdf_file",
             ],
             limit=60,   # 多拉,enrich_with_parent 合并后再截 top_k
         )
@@ -410,36 +447,76 @@ class FinAgentRetriever:
         meta_chunks = [self._hit_to_chunk(h) for h in meta_hits[0]]
         body_chunks = [self._hit_to_chunk(h) for h in body_hits[0]]
 
-        merged = self._external_rrf(meta_chunks, body_chunks, k=60, top_k=top_k * 3)
+        # 方案 B:按 pdf_file 聚合,同 PDF 多 chunk 可能累积,top_k * 6 留足量
+        merged = self._external_rrf(meta_chunks, body_chunks, k=60, top_k=top_k * 6)
 
         if self.enrich_parents:
             merged = self.enrich_with_parent(merged)
 
-        return merged[:top_k]
+        # 方案 A:budget-based 截取 —— top_k 是硬上限,字符预算是软上限
+        # 单条超预算时至少返回 1 条(避免空返回),超预算后停
+        out, total = [], 0
+        for chunk in merged:
+            tlen = len(chunk.get('text', ''))
+            if out and total + tlen > SEARCH_REPORT_BUDGET_CHARS:
+                break
+            out.append(chunk)
+            total += tlen
+            if len(out) >= top_k:
+                break
+        return out
 
     # ============ 外部 RRF 融合 + Parent 展开 ============
 
     @staticmethod
     def _external_rrf(list_a: list, list_b: list, k: int = 60,
                       top_k: int = 30) -> list[dict]:
-        """两路 chunk 列表用 RRF 排序融合(对量纲免疫)"""
-        scores = {}
-        items = {}
-        for rank, c in enumerate(list_a):
-            key = c.get('metadata', {}).get('chunk_id') or id(c)
-            scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
-            items.setdefault(key, c)
-        for rank, c in enumerate(list_b):
-            key = c.get('metadata', {}).get('chunk_id') or id(c)
-            scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
-            items.setdefault(key, c)
+        """
+        按**研报身份(pdf_file)**聚合 RRF 融合两路结果。
 
-        ordered = sorted(scores.keys(), key=lambda x: -scores[x])
+        设计(方案 B,2026-04-20):
+          当前 list_a (meta 路) 和 list_b (body 路) 的 chunk 互斥(filter 不相交),
+          如果用 chunk_id 作 key,RRF 的"两路都命中同 chunk 加分"机制永不触发,退化为 interleave。
+
+          **改按 pdf_file 作 key**:同一份研报(PDF)的 meta chunk + 多条 body Child
+          在 RRF 里共享同一 key,分数累加 → 一致性奖励生效:
+            - 同 PDF 的 meta + body 双命中 → PDF 获得 2x 以上 boost
+            - 同 PDF 多条 body 命中(prose+table 都相关) → 内容丰富的研报自动上浮
+
+          industry_comparison 等无 pdf_file 的 chunk fallback 到 chunk_id,
+          确保不会被错误聚合(和其他类型 chunk 分离)。
+
+          返回 flat list,同 PDF 的 chunks 连续排布(meta 先、body 后,便于 LLM 阅读顺序)。
+        """
+        scores = {}           # key → 累加 RRF 分
+        items = {}            # key → [chunk1, chunk2, ...](同 key 可能多 chunk)
+
+        def _key(chunk):
+            m = chunk.get('metadata', {})
+            return m.get('pdf_file') or m.get('chunk_id') or id(chunk)
+
+        def _is_meta(chunk):
+            return chunk.get('metadata', {}).get('source_type') == 'report'
+
+        for rank, c in enumerate(list_a):
+            key = _key(c)
+            scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
+            items.setdefault(key, []).append(c)
+        for rank, c in enumerate(list_b):
+            key = _key(c)
+            scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
+            items.setdefault(key, []).append(c)
+
+        # 按 PDF-level 分数倒序;同一 PDF 内部 meta 先、body 后(给 LLM 的阅读顺序)
+        ordered_keys = sorted(scores.keys(), key=lambda x: -scores[x])
         out = []
-        for key in ordered[:top_k]:
-            c = items[key]
-            c['score'] = scores[key]
-            out.append(c)
+        for key in ordered_keys:
+            group = sorted(items[key], key=lambda c: 0 if _is_meta(c) else 1)
+            for c in group:
+                c['score'] = scores[key]   # 同 PDF 共享 PDF-level 分数
+                out.append(c)
+                if len(out) >= top_k:
+                    return out
         return out
 
     @staticmethod
@@ -492,12 +569,13 @@ class FinAgentRetriever:
                 # 元数据 / 财务 / 行业 等原样
                 final.append(h)
 
-        # 表格 Parent 合并
+        # 表格 Parent 合并(parent_md 建库时已转 Markdown,运行时零开销)
         for pid, info in table_parents.items():
             m = info['metadata']
             caption = m.get('table_caption') or ''
+            footnote = m.get('table_footnote') or ''
             page = m.get('page_idx')
-            parent_html = m.get('parent_html') or ''
+            parent_md = m.get('parent_md') or ''
 
             header_parts = ['表格']
             if caption:
@@ -507,15 +585,19 @@ class FinAgentRetriever:
             header = '【' + ' · '.join(header_parts) + '】'
 
             parts = [header]
-            if parent_html:
-                parts.append(parent_html)
+            if parent_md:
+                parts.append(parent_md)
+            if footnote:
+                parts.append(f"【附注】{footnote}")
 
             n = len(info['child_texts'])
+            # child_text 单行化:替换内部换行避免 "\n- " 分隔符注入(LLM 无法区分条目)
+            safe_texts = [t.replace('\n', ' ').strip() for t in info['child_texts']]
             if n == 1:
-                parts.append(f"【检索命中】\n- {info['child_texts'][0]}")
+                parts.append(f"【检索命中】\n- {safe_texts[0]}")
             else:
                 parts.append(f"【检索命中 {n} 条事实】\n"
-                             + "\n".join(f"- {t}" for t in info['child_texts']))
+                             + "\n".join(f"- {t}" for t in safe_texts))
 
             final[info['_insert_at']] = {
                 'text': "\n\n".join(parts),
@@ -542,11 +624,12 @@ class FinAgentRetriever:
                 parts.append(section_text)
 
             n = len(info['child_texts'])
+            safe_texts = [t.replace('\n', ' ').strip() for t in info['child_texts']]
             if n == 1:
-                parts.append(f"【检索命中】\n- {info['child_texts'][0]}")
+                parts.append(f"【检索命中】\n- {safe_texts[0]}")
             else:
                 parts.append(f"【本段检索命中 {n} 句】\n"
-                             + "\n".join(f"- {t}" for t in info['child_texts']))
+                             + "\n".join(f"- {t}" for t in safe_texts))
 
             final[info['_insert_at']] = {
                 'text': "\n\n".join(parts),
@@ -554,7 +637,9 @@ class FinAgentRetriever:
                 'score': info['score'],
             }
 
-        return [h for h in final if h is not None]
+        # 按 score desc 稳定排序:同 score 的 chunk 保持 _external_rrf 给的"同 PDF 连续"顺序
+        return sorted([h for h in final if h is not None],
+                      key=lambda c: -c.get('score', 0.0))
 
 
 # ============ CLI 快速冒烟测 ============

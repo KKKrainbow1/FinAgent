@@ -99,7 +99,6 @@ class FinAgentEnv:
                     from hybrid_search import FinAgentRetriever
                     from tools import FinAgentTools
                     cls._shared_retriever = FinAgentRetriever()
-                    cls._shared_retriever.load_index()
                     cls._shared_tools = FinAgentTools(cls._shared_retriever)
                     logger.info("FinAgentEnv: 共享检索器已初始化")
 
@@ -129,10 +128,13 @@ class FinAgentEnv:
         """
         self.tool_steps.append({"tool": "search_financial", "query": query})
         try:
-            return self._shared_tools.call("search_financial", {"query": query})
+            result, retrieved = self._shared_tools.call("search_financial", {"query": query})
         except Exception as e:
             logger.warning(f"search_financial 调用失败: {e}")
             return f"搜索失败：{str(e)}"
+        # 局部变量,无共享状态 race(8 并发 rollout 不会互相覆盖)
+        self.tool_steps[-1]['retrieved'] = retrieved
+        return result
 
     def search_report(self, query: str) -> str:
         """
@@ -146,10 +148,12 @@ class FinAgentEnv:
         """
         self.tool_steps.append({"tool": "search_report", "query": query})
         try:
-            return self._shared_tools.call("search_report", {"query": query})
+            result, retrieved = self._shared_tools.call("search_report", {"query": query})
         except Exception as e:
             logger.warning(f"search_report 调用失败: {e}")
             return f"搜索失败：{str(e)}"
+        self.tool_steps[-1]['retrieved'] = retrieved
+        return result
 
     def search_industry(self, query: str) -> str:
         """
@@ -163,10 +167,12 @@ class FinAgentEnv:
         """
         self.tool_steps.append({"tool": "search_industry", "query": query})
         try:
-            return self._shared_tools.call("search_industry", {"query": query})
+            result, retrieved = self._shared_tools.call("search_industry", {"query": query})
         except Exception as e:
             logger.warning(f"search_industry 调用失败: {e}")
             return f"搜索失败：{str(e)}"
+        self.tool_steps[-1]['retrieved'] = retrieved
+        return result
 
     def calculate(self, expression: str) -> str:
         """
@@ -181,7 +187,7 @@ class FinAgentEnv:
         self.tool_steps.append({"tool": "calculate", "query": expression})
         self.has_calculate = True
         try:
-            result = self._shared_tools.call("calculate", {"expression": expression})
+            result, _ = self._shared_tools.call("calculate", {"expression": expression})
             self.calc_results.append(result)
             return result
         except Exception as e:

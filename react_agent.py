@@ -369,8 +369,10 @@ def run_agent(question: str, model, tokenizer, tools_executor, tools_schema: lis
             assistant_msg["content"] = content
         messages.append(assistant_msg)
 
-        # 5. 调用工具获取 Observation
-        observation = tools_executor.call(tool_name, tool_arguments)
+        # 5. 调用工具获取 Observation + retrieval 元信息
+        # tuple 返回:observation 给 LLM,retrieved 给 trajectory 记录(search_* 填 list,calculate 是 None)
+        # 用于 bad case 追溯:重建索引后 chunk_id 稳定,可重回查具体 chunk 看数据质量
+        observation, retrieved = tools_executor.call(tool_name, tool_arguments)
 
         if verbose:
             print(f"  Observation: {observation[:200]}...")
@@ -389,6 +391,7 @@ def run_agent(question: str, model, tokenizer, tools_executor, tools_schema: lis
             "tool_arguments": tool_arguments,
             "tool_call_id": tool_call_id,
             "observation": observation,
+            "retrieved": retrieved,   # list[{chunk_id,score,source_type,...}] 或 None
         })
 
     elapsed = time.time() - start_time
@@ -595,7 +598,6 @@ def main():
     from tools import FinAgentTools, TOOLS_NATIVE
 
     retriever = FinAgentRetriever()
-    retriever.load_index()
 
     # 2. 初始化工具
     tools_executor = FinAgentTools(retriever)
