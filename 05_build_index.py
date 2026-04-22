@@ -32,7 +32,15 @@ from tqdm import tqdm
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parent.parent
+def _find_project_root() -> Path:
+    """兼容 Mac(backup/finagent_repo/ 两层嵌套)和服务器(Finagent/ 一层)两种结构"""
+    here = Path(__file__).resolve()
+    for cand in (here.parent, here.parent.parent):
+        if (cand / "data").is_dir():
+            return cand
+    return here.parent
+
+ROOT = _find_project_root()
 
 # ============ 配置 ============
 COLLECTION = "finagent"

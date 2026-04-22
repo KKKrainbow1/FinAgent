@@ -53,7 +53,15 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger(__name__)
 
 # ============ 配置 ============
-ROOT = Path(__file__).resolve().parent.parent
+def _find_project_root() -> Path:
+    """兼容 Mac(backup/finagent_repo/ 两层嵌套)和服务器(Finagent/ 一层)两种结构"""
+    here = Path(__file__).resolve()
+    for cand in (here.parent, here.parent.parent):
+        if (cand / "data").is_dir():
+            return cand
+    return here.parent
+
+ROOT = _find_project_root()
 MARKER_PATH = ROOT / "data/raw/report_parsed/marker_all_results.json"
 PDF_MAP_PATH = ROOT / "data/raw/report_pdfs/pdf_map.json"
 
