@@ -79,7 +79,7 @@ OUT_CHUNKS_MINERU = ROOT / "data/processed/tabular_chunks_mineru.jsonl"
 OUT_STATS_MINERU = ROOT / "data/processed/tabularize_stats_mineru.json"
 
 MODEL = "qwen3-max"
-CONCURRENCY = 10
+CONCURRENCY = 25   # qwen3-max 60 QPM,平均表处理 ~30s,25 并发 ≈ 50 QPM(留 17% 余量抗抖动)
 CONTEXT_CHARS = 300  # 表格前 300 字作为上下文
 
 # Markdown 表格识别
