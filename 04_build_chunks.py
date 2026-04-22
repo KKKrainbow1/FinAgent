@@ -34,13 +34,15 @@ CHUNK_DIR = "./data/processed"
 os.makedirs(CHUNK_DIR, exist_ok=True)
 
 # 解析器 → 结果文件的映射
-# 当前生产只用 Marker；MinerU 保留作为中文 SOTA 备选用于 A/B 实验。
-# pdfplumber 已于 2026-04-17 下线（Marker 在表格保真度上完胜），03a 脚本保留作历史对比证据。
-# mineru_cleaned 指目录（含 03d 清洗后的 content_list_cleaned.json），2026-04-19 新增。
+# 当前生产:MinerU VLM + 03d 清洗(mineru_cleaned)
+# Marker 保留作 A/B 实验(V2 时代的主用)
+# pdfplumber 已于 2026-04-17 下线(Marker 在表格保真度上完胜),03a 脚本保留作历史对比证据
+# mineru_cleaned 指目录(含 03d 清洗后的 content_list_cleaned.json),2026-04-19 新增
+# 2026-04-23 路径修正:从 ./data/processed/mineru_compare (24 份样本实验目录) 改成生产路径 ./data/raw/report_parsed/mineru
 PARSER_RESULT_FILES = {
-    "marker": os.path.join(RAW_DIR, "report_parsed", "marker_all_results.json"),
-    "mineru": os.path.join(RAW_DIR, "report_parsed", "mineru_200_results.json"),
-    "mineru_cleaned": os.path.join(CHUNK_DIR, "mineru_compare"),  # 目录,不是文件
+    "marker":         os.path.join(RAW_DIR, "report_parsed", "marker_all_results.json"),
+    "mineru":         os.path.join(RAW_DIR, "report_parsed", "mineru_200_results.json"),
+    "mineru_cleaned": os.path.join(RAW_DIR, "report_parsed", "mineru"),  # 目录
 }
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
