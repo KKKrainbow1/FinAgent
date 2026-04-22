@@ -1,29 +1,51 @@
 """
-FinAgent SFT 数据生成脚本（Final - V1 生成引擎 + V2 输出格式）
+FinAgent SFT 数据生成脚本(V4 - Mode B 原生 tool calling)
 
-设计思路：
-  - 生成引擎（V1）：STEP_PROMPT + response_format: json_object + CALC_FILL_PROMPT + ANSWER_PROMPT
-    稳定、高质量、成功率 ~95%，已在 801 条数据上验证
-  - 输出格式（V2）：OpenAI messages 格式，对齐 Qwen2.5 chat_template
-    训练时直接 apply_chat_template(tools=TOOLS_NATIVE) 渲染
+============================================================================
+ V4 设计思路
+============================================================================
 
-  为什么不用纯 V2（原生 tools 参数）？
-    Qwen3-Max 用原生 tool calling 时太"聪明"，总想跳过工具直接回答，
-    成功率仅 60%。V1 的 response_format: json_object 强制模型输出结构化字段，
-    没有"不调工具"的选项，稳定性远高于原生 tool calling。
+Teacher qwen3-max 直接用 OpenAI 原生 tool calling(tools=TOOLS_NATIVE + tool_choice="auto"),
+通过 system prompt 硬约束"必须在 content 写 thought"稳定输出 thought + tool_calls。
 
-  为什么不用纯 V1（纯文本轨迹）？
-    V1 输出的纯文本 ReAct 格式（Thought:/Action:/Action Input:）不是 Qwen2.5
-    预训练时见过的格式，SFT 时模型需要从头学。V2 的 messages 格式对齐 Qwen2.5
-    原生 tool calling（<tool_call>/<tool_response>），复用预训练先验。
+  生成 = 训练 = 推理 三者统一
+    - 生成期 teacher 输出:msg.content(thought) + msg.tool_calls[0](工具调用)
+    - 训练期 assistant messages 直接这样存(arguments=dict,对齐 Qwen2.5 chat_template)
+    - 推理期模型按同样格式输出
+    → 不需要 V1→V2 格式转换层,不需要 arguments string→dict 后处理
 
-运行方式：
+  相对 V3 的核心变化
+    1. 废弃 STEP_PROMPT + response_format=json_object(JSON mode)
+       → SYSTEM_PROMPT_V4 + tools=TOOLS_NATIVE
+    2. 废弃 CALC_FILL_PROMPT 二阶段填充
+       → Mode B 原生直出 expression + validate + eval(单阶段)
+    3. 废弃 ANSWER_PROMPT 单独生成答案
+       → 不调工具时的 content 就是最终分析报告
+    4. 废弃 plan_to_messages / format_as_sft_sample(V1→V2 转换层)
+       → generate_trajectory_v4 直接产 messages,build_sft_sample 只做元数据聚合
+    5. 废弃 MIN_STEPS/MAX_STEPS 按 type 硬约束
+       → 全局 MAX_STEPS=10,teacher 自主判断 finish 时机
+    6. 废弃 pre_retrieve 预检索注入
+       → SYSTEM_PROMPT_V4 明确写数据库覆盖范围,teacher 直接按 Level 1/2 reject 判断
+
+  为什么 V3 当初选 JSON mode?
+    V3 观察到 qwen3-max 用原生 tool calling 时 content 经常被吞(thought 丢失),
+    退回 json_object 强制输出 thought/action/action_input 结构化字段。
+    V4 通过 system prompt 强约束"必须在 content 写 thought",实验(n=30)验证
+    content 非空率 100%,解决了 V3 当时的问题,可以回到更自然的原生 tool calling。
+
+  历史版本见 backup/sft_data_generation_v3_archived.py
+
+============================================================================
+ 运行方式
+============================================================================
+
     python 10_generate_sft_data.py --test 5
     python 10_generate_sft_data.py
     python 10_generate_sft_data.py --type financial_query
     python 10_generate_sft_data.py --resume
 
-环境变量：
+环境变量:
     export OPENAI_API_KEY="你的百炼API Key"
     export OPENAI_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
 """
@@ -63,185 +85,126 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ============ 步数控制 ============
-
-MIN_STEPS = {
-    "financial_query": 1,
-    "single_company_simple": 2,
-    "single_company_medium": 3,
-    "company_comparison": 3,
-    "industry_analysis": 3,
-    "risk_analysis": 3,
-    "reject": 1,
-}
-
-MAX_STEPS = {
-    "financial_query": 3,
-    "single_company_simple": 3,
-    "single_company_medium": 4,
-    "company_comparison": 5,
-    "industry_analysis": 5,
-    "risk_analysis": 4,
-    "reject": 2,
-}
+# ============ 步数控制(V4) ============
+#
+# V3 按 type 硬编码 MIN_STEPS/MAX_STEPS,导致 single_company_medium 87.7% 集中在 3 步
+# → Thought 模板化根因之一。V4 改为全局 max_steps,由 teacher 自主决定 finish 时机
+# (tool_choice="auto" 不调工具即 finish,第 10 步强制 tool_choice="none" 兜底)。
+MAX_STEPS = 10
 
 MODEL = "qwen3-max"
 JUDGE_MODEL = "qwen3-max"
 JUDGE_THRESHOLD = 4
 MAX_REGEN_ATTEMPTS = 3      # 被 Judge 驳回后最多重新生成几次答案
-VALID_TOOLS = {"search_report", "search_financial", "search_industry", "calculate", "finish"}
+VALID_TOOLS = {"search_report", "search_financial", "search_industry", "calculate"}   # V4 删除 "finish" 虚拟工具
 MAX_RETRY = 3
 
+# V4: calculate expression 校验正则(纯数学表达式)
+CALC_EXPR_RE = re.compile(r'^[\d\.\+\-\*\/\(\)\s%]+$')
 
-# ============ V1 生成模板（已验证高质量） ============
 
-STEP_PROMPT = """你是"金融翻译官"，一个专业的A股上市公司分析助手。
-你正在逐步分析用户的问题，每次只输出一步（Thought + Action + Action Input）。
+# ============ V4 Mode B 主 Prompt(原生 tool calling + content 强约束 thought)============
 
-## 数据库覆盖范围（⭐生成 query 时必须参考）
-- **财务数据**：2022H1 ~ 2025年报（300家A股公司，所有公司有2025H1，约半数有2025年报，其余最新年报为2024年）
-- **行业对比数据**：按行业聚合的多家公司核心指标对比表和行业均值（沪深300成分股），用 search_industry 检索
-- **券商研报**：2017年 ~ 2026年3月（约39,000篇元数据 + 64,000篇PDF正文chunk）
-  - 注意：数据库中存在 2017-2021 年的老研报，评级和目标价已严重过时
-  - 除非用户明确询问历史数据，否则应优先检索最近1-2年的研报
-- **时效性原则**：
-  - 用户问"XX怎么样"/"XX盈利能力" → 检索最新数据（query 中加 "2025" 或 "2024"）
-  - 用户问"XX近几年趋势"/"XX变化" → 不限定年份，让检索返回多期数据
-  - 用户问"XX目标价"/"XX评级" → query 中加 "2025 2026" 以获取最新研报
+SYSTEM_PROMPT_V4 = """你是"金融翻译官",一个专业的 A 股上市公司分析助手。你通过调用工具获取数据,逐步分析用户的问题,最终给出带数据支撑的答案。
 
-## 可用工具
-| 工具名 | 功能 | 输入格式 |
-|--------|------|----------|
-| search_report | 检索券商研报 | query字符串 |
-| search_financial | 检索单个公司财务数据 | query字符串 |
-| search_industry | 检索行业对比数据（多家公司指标对比表+行业均值） | query字符串 |
-| calculate | 数学计算（每次只算一个表达式，需要多次计算时分多步调用） | 纯数学表达式（如 36.99 - 24.53） |
-| finish | 输出最终答案 | 分析报告文本 |
+# ⭐ 硬约束:必须在 content 写 thought
 
-## 工具使用原则
-- search_financial 的 query 中只写一家公司名，不要同时查多家
-- 涉及行业分析、行业对比时，优先使用 search_industry 获取行业对比数据，而非逐个公司用 search_financial
-- search_industry 一次返回同行业多家公司的核心指标和行业均值
-- 所有数值计算必须通过 calculate 工具完成，不要在 Thought 中心算
-- 确认信息已足够后才使用 finish
+每次调用工具前,你**必须**在 assistant message 的 content 字段中用自然语言写出你的 thought,然后再通过 tool_calls 调用工具。**content 绝对不能为空**。
 
-## Thought 写作要求（⭐核心）
-- **第一步**：说明分析框架和需要获取什么数据
-- **后续步骤（最重要）**：必须引用上一步 Observation 中的**至少2个具体数字**，
-  说明这些数字意味着什么，然后解释为什么需要执行下一步
-  - 好的例子："Observation 显示阳光电源2024年 ROE 为29.90%（好，>15%），毛利率29.42%，
-    但营收增速仅7.76%（较2023年79.47%大幅放缓）。盈利能力强但增长乏力，
-    需进一步检索券商研报了解市场对其未来增长的预期。"
-  - 坏的例子："已获取数据，接下来查研报。"（❌ 没有引用任何数字）
-- **finish 步的 Thought**：综合前面所有数据给出明确判断，不要用假设句式
+## Thought 写作要求
+- **第一步 thought**:说明分析框架 + 明确说出要获取什么数据(2-3 句)
+  - 好例:"用户问贵州茅台 2024 年 ROE。需要先用 search_financial 获取茅台的财务数据,之后可能用 search_industry 对比白酒行业均值判断水平高低。"
+  - 坏例:(content 为空 ← 绝对禁止)
+- **中间步 thought**:必须引用上一步 Observation 中**至少 2 个具体数字**,说明这些数字意味着什么,解释为什么需要下一步
+  - 好例:"Observation 显示阳光电源 2024 年 ROE 为 29.90%、毛利率 29.42%,但营收增速仅 7.76%(较 2023 年 79.47% 大幅放缓)。盈利能力强但增长乏力,需检索券商研报了解市场对其未来增长的预期。"
+  - 坏例:"已获取数据,接下来查研报。"(❌ 无数字引用)
+- **最终步**(不调工具时):content 直接就是最终分析报告,不要空 content
 
-## 时间一致性要求（⭐重要）
-- 如果 Observation 返回了多个年份的数据，在 Thought 中明确选择使用哪一期
-- 杜邦分析的三个指标（净利率、总资产周转率、权益乘数）必须来自同一期数据
+# 数据库覆盖范围(⭐生成 query 和判断 reject 必须参考)
+
+## 财务数据
+- **范围**:**沪深 300 成分股**(300 家 A 股上市公司),覆盖主要行业:银行 / 保险 / 证券 / 白酒 / 医药 / 半导体 / 消费电子 / 光伏 / 电池 / 汽车 / 钢铁 / 有色金属 / 房地产 / 建筑建材 / 食品饮料 / 软件 / 通信 / 传媒 / 农业 / 石油石化 / 零售 等 30 个行业
+- **时间窗**:**2022H1 ~ 2025 年报**(所有公司有 2025H1,约半数有 2025 年报,其余最新年报为 2024 年)
+- **指标**:ROE / ROA / 毛利率 / 净利率 / 营收增速 / 资产负债率 / 流动比率 / 速动比率 / 周转率等 80+ 指标
+
+## 行业对比数据
+- 按行业聚合的多家公司核心指标对比表和行业均值(用 search_industry 检索)
+
+## 券商研报
+- **时间窗**:**2017 年 ~ 2026 年 3 月**(约 39,000 篇元数据 + 64,000 篇 PDF 正文 chunk)
+- 注意:2017-2021 年老研报的评级和目标价已严重过时,除非用户明确询问历史,否则优先最近 1-2 年
+
+## ❌ 数据库**不覆盖**的(用于 reject 判断)
+- **非 A 股主体**:港股(如腾讯控股、华润置地、平安好医生)、美股(如特斯拉、阿里巴巴、腾讯 ADR)、未上市公司
+- **非沪深 300**:A 股但不在沪深 300 成分股(如创业板 / 科创板非成分股)—— **除非先搜尝试,否则不要假定一定没有**
+- **时间越界**:2021 年之前(如 "2010 年万科营收")、2026Q2 之后(如 "2027 年预测")
+- **非金融问题**:写诗 / 写代码 / 数学题 / 非金融领域查询
+- **主观投资建议**:"哪只股票值得买"、"现在该不该买 XX" —— 这属于专业投资顾问职责,不给
+- **其他金融品种**:加密货币 / 期货 / 外汇 / 基金(除非研报涉及)
+
+# 时效性原则
+- 用户问 "XX 怎么样" / "XX 盈利能力" → 检索最新数据(query 加 "2025" 或 "2024")
+- 用户问 "XX 近几年趋势" / "XX 变化" → 不限定年份
+- 用户问 "XX 目标价" / "XX 评级" → query 加 "2025 2026" 获取最新研报
+
+# 工具使用原则
+
+- **一次只调用一个工具**(不要并行调多个,保持逐步推理);如果确实需要并行(如对比两家公司),可以在一个 assistant message 里放多个 tool_calls,但优先串行
+- search_financial 的 query 只写一家公司名,不要同时查多家
+- 涉及行业分析、行业对比时优先使用 search_industry
+- 所有数值计算必须通过 calculate 工具完成(expression 是**纯数学表达式**,如 `(1505 - 1294) / 1294 * 100`),**禁止在 Thought 中心算**
+- calculate 的 expression 必须是真实数字(来自前面 observation),不能编造
+- 确认信息已足够后,**不调用任何工具**,content 直接输出最终分析报告(不需要"finish"工具)
+
+# 时间一致性要求
+
+- 杜邦分析的三个指标(净利率、总资产周转率、权益乘数)必须来自同一期数据
 - 不要在同一段分析中混用年报和半年报数据
-- 优先使用最新的年报数据（2025年报 > 2024年报 > 2023年报 > 半年报），半年报可作为补充参考但不能替代年报
+- 优先使用最新的年报数据(2025 年报 > 2024 年报 > 2023 年报 > 半年报)
+- 明确标注数据来源期别(如 "根据 2024 年年报数据")
 
-## 预检索结果（数据库实际能返回的信息样例）
-{pre_retrieved_info}
+# Reject 策略(分级处理)
 
-## 用户问题
-{question}
+## Level 1:明显越界 → 直接拒绝(0 步 tool_call)
+当问题**明确**属于以下情况,不调用任何工具,content 直接礼貌拒答并说明原因:
+- 时间明显越界:早于 2021 年或晚于 2026Q2
+- 非 A 股主体已知(港股 / 美股 / 明显外国公司名)
+- 非金融问题(写诗 / 写代码 / 数学题)
+- 主观投资建议("哪只股票值得买")
+- 其他金融品种(期货 / 加密货币 / 外汇)
 
-## 问题类型
-{question_type}
+## Level 2:边界模糊 → 先搜后拒(1-2 步 tool_call)
+当**不确定**是否在覆盖范围内(可能是冷门股、曾用名、子公司名、别名等),必须先用 search_report 或 search_financial 尝试检索,确认无数据后再拒绝。避免 false reject。
 
-## reject 类型特殊说明
-如果问题类型是 reject，说明用户问的是数据库覆盖范围外的内容（如美股、港股、加密货币、期货、非金融问题等）。
-处理方式：**第一步必须先用 search_report 或 search_financial 尝试检索**，确认数据库中没有相关数据后，
-第二步再 finish 输出礼貌的拒绝回答（说明我们的数据库只覆盖A股沪深300公司，建议用户调整问题）。
-不要跳过检索直接拒绝。
+# 按问题类型调整最终答案深度
 
-## 已有的分析过程
-{history}
+最终答案(不调工具那一步的 content)长度建议:
+- **financial_query**(如 "ROE 是多少"):150-300 字,先直接答数字再适度展开
+- **single_company_simple**(如 "目标价多少"):200-350 字,直接答核心信息
+- **single_company_medium**(如 "全面评估"):400-600 字,按德勤框架选相关维度
+- **company_comparison**:400-600 字,用表格对比核心指标
+- **risk_analysis**:400-600 字,重点分析风险因素
+- **industry_analysis**:400-600 字,基于 search_industry 数据分析趋势
+- **reject**:100-200 字,简短说明并建议调整问题
 
-## 步数信息
-当前是第 {step_num} 步（共需 {min_steps}~{max_steps} 步，其中最后一步必须是 finish）。
-{step_hint}
-
-请输出当前这一步：
-```json
-{{"thought": "...", "action": "...", "action_input": "..."}}
-```
-只输出 JSON，不要输出其他内容。"""
-
-
-CALC_FILL_PROMPT = """根据以下已获取的真实数据，为 calculate 步骤生成正确的纯数学表达式。
-
-用户问题：{question}
-
-已获取的数据：
-{observations}
-
-calculate 步骤的 Thought：{calc_thought}
-
-要求：
-1. 只输出一个纯数学表达式，只包含数字和运算符（+、-、*、/、括号）
-2. 表达式中的数字必须来自上面的数据，不能编造
-3. 只输出表达式本身，不要输出其他文字
-4. 如果数据中找不到需要的数字，输出 SKIP
-5. 如果 Thought 中提到多个计算需求，只输出第一个计算的表达式（其余的会在后续步骤中计算）
-6. 不要用逗号分隔多个表达式，不要输出多行
-
-示例：
-- Thought说要算ROE差值，数据中A公司ROE=36.99%，B公司ROE=24.53% → 输出：36.99 - 24.53
-- Thought说要算同比增长率，数据中2024年营收=1505亿，2023年营收=1294亿 → 输出：(1505 - 1294) / 1294 * 100
-- Thought说要验算杜邦ROE，数据中净利率=14.47%，周转率=0.49，权益乘数=1.75 → 输出：14.47 / 100 * 0.49 * 1.75 * 100
-"""
-
-
-ANSWER_PROMPT = """你是金融分析师。根据以下检索到的真实数据，生成最终分析报告。
-
-用户问题：{question}
-
-问题类型：{question_type}
-
-已获取的数据（来自真实检索系统）：
-{observations}
-
-## 核心原则：回答用户的问题，不要套模板
-最终报告应围绕用户的问题展开，只分析与问题相关的内容。
-
-## 按问题类型调整回答深度
-- **financial_query**（如"ROE是多少""流动比率多少"）：先直接回答数字，再适度展开相关分析，不要做全维度分析。控制在 150-300 字。
-- **single_company_simple**（如"目标价多少""研报观点"）：直接回答核心信息，可补充少量相关背景。控制在 200-350 字。
-- **single_company_medium**（如"全面评估财务状况""盈利能力如何"）：按德勤框架选择相关维度深入分析。控制在 400-600 字。
-- **company_comparison**：用表格对比核心指标，重点分析差异原因。控制在 400-600 字。
-- **risk_analysis**：重点分析偿债能力和风险因素。控制在 400-600 字。
-- **industry_analysis**：基于 search_industry 返回的行业对比数据，分析行业整体趋势和公司排名。控制在 400-600 字。
-- **reject**：简短说明数据库不覆盖该内容，建议调整问题。控制在 100-200 字。
-
-## 分析方法（德勤财务分析方法论）
-
-### 财务比率分析（根据问题选择相关维度，不需要每次都覆盖全部三个）
-1. **盈利能力**：销售毛利率、销售净利率、ROA、ROE、EPS。ROE 应在同行业内对比，不能用绝对阈值判定。
-2. **偿债能力**：流动比率（2:1 左右为宜，过高说明资金闲置）、速动比率（1:1 左右）、现金比率（≥20%）、资产负债率（非金融 40-60% 适宜；银行/保险/证券 85-95% 为正常水平）、利息支付倍数（≥1）。
-3. **营运能力**：总资产周转率、存货周转率、应收账款周转率。周转率因行业而异。
-
-### 杜邦分析法（适用于深度分析 ROE 驱动因素，不要在简单查询中使用）
-- ROE = 销售净利率 × 总资产周转率 × 权益乘数
-- 三个因子必须来自同一期数据
+## 分析方法(德勤财务分析方法论)
+- **盈利能力**:销售毛利率 / 销售净利率 / ROA / ROE / EPS。ROE 应在同行业内对比,不能用绝对阈值判定
+- **偿债能力**:流动比率(2:1 左右为宜)/ 速动比率(1:1 左右)/ 现金比率(≥20%)/ 资产负债率(非金融 40-60%,银行 / 保险 / 证券 85-95%)
+- **营运能力**:总资产周转率 / 存货周转率 / 应收账款周转率(因行业而异)
+- **杜邦分析**:ROE = 销售净利率 × 总资产周转率 × 权益乘数(仅用于深度分析,不在简单查询中展开)
 
 ## 写作要求
-1. 所有数字必须来自上述数据，不能编造
-2. 与问题相关的关键指标附带判断和行业对比参考，不相关的不要展开
-3. 如果某个维度的数据不足，不要提及该维度（不要写"数据有限，无法评估XX"）
-4. 风险提示需具体（包含数字或事件），简单查询（financial_query、single_company_simple）不需要强制添加风险提示
-5. 金融行业（银行/保险/证券）无存货周转率、毛利率等指标，应解释行业特性而非说"数据缺失"
-
-## 时间一致性要求
-- 杜邦分析的三个指标必须来自同一期数据（同一年份 + 同一报告类型）
-- 如果数据中有多个年份，选择最新的年报数据进行主要分析
-- 不要在同一段分析中混用年报和半年报的数据
-- 明确标注数据来源期别，如"根据2024年年报数据"
-
-## 种子示例的答案风格（参考结构和深度）
-{answer_example}
+1. 所有数字必须来自 Observation,不能编造
+2. 与问题相关的关键指标附带判断和行业对比参考,不相关的不要展开
+3. 某个维度数据不足时不要提及(不要写"数据有限,无法评估 XX")
+4. 风险提示需具体(含数字或事件),简单查询不强制加风险提示
+5. 金融行业(银行 / 保险 / 证券)无存货周转率、毛利率等指标,应解释行业特性而非说"数据缺失"
 """
+
+
+# V4 种子示例参考(按 type 提供 few-shot,可选注入到 user message)
+# V3 用 {answer_example} placeholder 塞 ANSWER_PROMPT;V4 不强制,teacher 自主判断
+# seed_grouped 仍由 load_seed_data 加载,需要时塞到第一条 user message 末尾
 
 
 # ============ 内联 LLM-as-Judge ============
@@ -672,15 +635,17 @@ def judge_and_regen(client: OpenAI, plan: dict, seed_grouped: dict,
             break
 
         if regen_type == "full_trajectory":
-            # 重新跑整个 react_loop
+            # V4: 重新跑整个 generate_trajectory_v4(原 react_loop)
             logger.info(f"    Judge 建议 full_trajectory，重新生成完整轨迹 (attempt {attempt+1})...")
             try:
-                pre_info = ""
-                if retriever:
-                    pre_info = pre_retrieve(question, retriever, qtype)
-                new_plan = react_loop(client, tools, question, qtype, pre_info, seed_grouped)
+                # V4: 不再需要 pre_retrieve(SYSTEM_PROMPT_V4 已含数据库信息)
+                new_plan = generate_trajectory_v4(client, tools, question, qtype, seed_grouped)
                 if new_plan and any(s.get("action") == "finish" for s in new_plan["steps"]):
+                    # V4: 完整替换 plan 的 steps + messages(保持下游同步)
                     plan["steps"] = new_plan["steps"]
+                    plan["messages"] = new_plan["messages"]
+                    plan["num_tool_steps"] = new_plan["num_tool_steps"]
+                    plan["tools_used"] = new_plan["tools_used"]
                     plan["retrieval_quality"] = new_plan.get("retrieval_quality", True)
                     steps = plan["steps"]
                     # 新轨迹需要过心算检测
@@ -692,13 +657,16 @@ def judge_and_regen(client: OpenAI, plan: dict, seed_grouped: dict,
                             "本次生成的强制要求：\n"
                             "1. 在检索完数据后、finish 之前，必须至少调用一次 calculate 工具\n"
                             "2. 任何需要数值运算的结果都必须通过 calculate 得出\n"
-                            "3. 在 Thought 中写明要计算什么，然后 Action 选 calculate，Action Input 写纯数学表达式"
+                            "3. 在 Thought(content 中)写明要计算什么，然后调用 calculate 工具填入纯数学表达式"
                         )
                         logger.info(f"    full_trajectory 新轨迹存在心算，带提示再次重跑...")
-                        new_plan2 = react_loop(client, tools, question, qtype, pre_info, seed_grouped,
-                                               extra_hint=mm_hint)
+                        new_plan2 = generate_trajectory_v4(client, tools, question, qtype,
+                                                           seed_grouped, extra_hint=mm_hint)
                         if new_plan2 and any(s.get("action") == "finish" for s in new_plan2["steps"]):
                             plan["steps"] = new_plan2["steps"]
+                            plan["messages"] = new_plan2["messages"]
+                            plan["num_tool_steps"] = new_plan2["num_tool_steps"]
+                            plan["tools_used"] = new_plan2["tools_used"]
                             plan["retrieval_quality"] = new_plan2.get("retrieval_quality", True)
                             steps = plan["steps"]
                         else:
@@ -718,11 +686,17 @@ def judge_and_regen(client: OpenAI, plan: dict, seed_grouped: dict,
                 new_answer = regen_answer_with_feedback(
                     client, question, qtype, observations, feedback
                 )
-                # 更新 plan 中的 finish 步答案
+                # 更新 plan 中的 finish 步答案(V1-like steps)
                 for step in reversed(steps):
                     if step.get("action") == "finish":
                         step["action_input"] = new_answer
                         break
+                # V4: 同步更新 plan["messages"] 最后一条 assistant content(无 tool_calls 的那条)
+                if plan.get("messages"):
+                    for m in reversed(plan["messages"]):
+                        if m.get("role") == "assistant" and not m.get("tool_calls"):
+                            m["content"] = new_answer
+                            break
                 answer = new_answer
             except Exception as e:
                 logger.warning(f"    重新生成答案失败: {e}")
@@ -767,40 +741,15 @@ def load_questions() -> list:
     return questions
 
 
-# ============ 预检索 ============
-
-def pre_retrieve(question: str, retriever: FinAgentRetriever,
-                 question_type: str = "") -> str:
-    probe_queries = [question]
-    available_info = []
-    for query in probe_queries:
-        try:
-            results_f = retriever.search_financial(query, top_k=2)
-            for r in results_f:
-                source = r["metadata"].get("source_type", "unknown")
-                text_preview = r["text"][:150]
-                available_info.append(f"- [{source}] {text_preview}...")
-            results_r = retriever.search_report(query, top_k=2)
-            for r in results_r:
-                source = r["metadata"].get("source_type", "unknown")
-                text_preview = r["text"][:150]
-                available_info.append(f"- [{source}] {text_preview}...")
-            # 行业分析类问题额外预检索行业数据
-            if question_type in ("industry_analysis", "company_comparison"):
-                results_i = retriever.search_industry(query, top_k=1)
-                for r in results_i:
-                    # 过滤 match_failed 的伪结果（"未找到匹配行业"的提示信息）
-                    if r.get("metadata", {}).get("match_failed"):
-                        continue
-                    industry = r["metadata"].get("industry", "未知")
-                    text_preview = r["text"][:300]
-                    available_info.append(f"- [industry | {industry}] {text_preview}...")
-        except Exception as e:
-            logger.warning(f"预检索失败: {e}")
-    if not available_info:
-        return "[预检索结果为空]"
-    available_info = list(set(available_info))[:8]
-    return "\n".join(available_info)
+# [V4 REMOVED] pre_retrieve 函数整体删除。
+# V3 的 pre_retrieve 用 probe query 预查一次数据库,把可用信息拼进 STEP_PROMPT 的
+# {pre_retrieved_info} placeholder,让 teacher 知道"数据库大概能返回什么",防止编造
+# 不存在的指标。V4 在 SYSTEM_PROMPT_V4 已经明确写出:
+#   1. 沪深 300 成分股 + 2022H1~2025 财务数据 + 2017~2026.03 研报
+#   2. 30 个行业名称列表
+#   3. 不覆盖的品类(港股/美股/加密货币/期货/非金融/主观荐股)
+# 所以 teacher 不需要"边生成边探查"库里有啥,直接按 SYSTEM_PROMPT 定义的覆盖范围做
+# Level 1 直拒 / Level 2 先搜 的分级判断即可。
 
 
 # ============ 种子数据 ============
@@ -830,365 +779,246 @@ def get_answer_example(seed_grouped: dict, qtype: str) -> str:
 
 # ============ V1 生成引擎 ============
 
-def format_history(history: list) -> str:
-    if not history:
-        return "（这是第一步，尚无历史记录）"
-    parts = []
-    for i, step in enumerate(history):
-        parts.append(f"Step {i+1}:")
-        parts.append(f"  Thought: {step['thought']}")
-        parts.append(f"  Action: {step['action']}")
-        parts.append(f"  Action Input: {step['action_input']}")
-        if step.get("observation"):
-            parts.append(f"  Observation: {step['observation']}")
-    return "\n".join(parts)
+# ============ V4 辅助:tool_call 转换 + calculate 校验 ============
+
+def _tool_call_to_v2(tc, args_dict: dict) -> dict:
+    """把 OpenAI 原生 ChatCompletionMessageToolCall 转成 V2 messages 中的 tool_calls 项。
+    关键:arguments 存 dict(不是 string),对齐 Qwen2.5 chat_template 的 items() 要求。"""
+    return {
+        "id": tc.id,
+        "type": "function",
+        "function": {
+            "name": tc.function.name,
+            "arguments": args_dict,   # ← dict,不是 json.dumps 后的 string
+        }
+    }
 
 
-def generate_step_hint(step_num: int, min_steps: int, max_steps: int) -> str:
-    remaining_min = max(0, min_steps - step_num)
-    remaining_max = max_steps - step_num
-    if remaining_min > 1:
-        return f"还需要至少 {remaining_min} 步（含 finish），请继续检索数据，不要提前 finish。"
-    elif remaining_max <= 1:
-        return "这是最后一步，请使用 finish 输出最终答案。"
-    else:
-        return "如果信息已足够，可以使用 finish；否则继续检索。"
-
-
-def call_llm_for_step(client: OpenAI, question: str, question_type: str,
-                      history: list, step_num: int, min_steps: int,
-                      max_steps: int, pre_info: str) -> dict:
-    """调用 LLM 生成当前步的 Thought + Action + Action Input（V1 方式）"""
-    prompt = STEP_PROMPT.format(
-        pre_retrieved_info=pre_info,
-        question=question,
-        question_type=question_type,
-        history=format_history(history),
-        step_num=step_num + 1,
-        min_steps=min_steps,
-        max_steps=max_steps,
-        step_hint=generate_step_hint(step_num, min_steps, max_steps),
-    )
-
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        response_format={"type": "json_object"},
-        temperature=0.7,
-        max_tokens=800,
-        extra_body={"enable_thinking": False},
-    )
-
-    result = json.loads(response.choices[0].message.content)
-    return result
-
-
-def fill_calculate(client: OpenAI, question: str, history: list, thought: str) -> tuple:
-    """Calculate 专用路径：CALC_FILL_PROMPT + 正则校验 + eval"""
-    obs_parts = []
-    for i, step in enumerate(history):
-        if step.get("observation"):
-            obs_parts.append(f"[Step {i+1} - {step['action']}] {step['observation']}")
-    obs_text = "\n".join(obs_parts)
-
-    prompt = CALC_FILL_PROMPT.format(
-        question=question,
-        observations=obs_text,
-        calc_thought=thought,
-    )
-
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.3,
-        max_tokens=200,
-        extra_body={"enable_thinking": False},
-    )
-    expr = response.choices[0].message.content.strip()
-
-    if expr == "SKIP" or not expr:
-        return None
-
-    expr = expr.replace("`", "").strip()
-    wrapper_match = re.match(r'^calculate\((.*)\)$', expr, flags=re.DOTALL)
-    if wrapper_match:
-        expr = wrapper_match.group(1).strip().strip("'\"")
-    else:
-        expr = expr.strip("'\"")
-
-    # 兜底：如果模型输出了多个表达式（逗号或换行分隔），只取第一个
-    if "," in expr and not re.match(r'^[\d\s\.\+\-\*/\(\)×÷%－−]+$', expr):
-        # 逗号不在括号内，说明是多表达式分隔
-        parts = [p.strip() for p in expr.split(",") if p.strip()]
-        if parts:
-            expr = parts[0]
-            logger.info(f"  calculate 多表达式，取第一个: {expr}")
-    if "\n" in expr:
-        parts = [p.strip() for p in expr.split("\n") if p.strip()]
-        if parts:
-            expr = parts[0]
-            logger.info(f"  calculate 多行表达式，取第一行: {expr}")
-
-    # 兼容 Unicode 运算符（和 tools.py 的 _calculate 对齐）
+def _validate_calc_expression(expr: str) -> str:
+    """返回归一化后的纯数学表达式(Unicode/百分号转换);不合法则 raise ValueError。"""
+    if not isinstance(expr, str) or not expr.strip():
+        raise ValueError(f"calculate expression 为空或非字符串: {expr!r}")
+    # Unicode 运算符转 ASCII
     expr = expr.translate(str.maketrans({
         "×": "*", "÷": "/", "−": "-", "－": "-",
         "（": "(", "）": ")",
     }))
-    # 处理百分号：5% → (5/100)
+    # 百分号:5% → (5/100)
     expr = re.sub(r'(\d+\.?\d*)%', r'(\1/100)', expr)
+    expr = expr.strip()
+    # 纯数学表达式校验
+    if not CALC_EXPR_RE.match(expr):
+        raise ValueError(f"calculate expression 非纯数学: {expr!r}")
+    return expr
 
-    if not re.match(r'^[\d\s\.\+\-\*/\(\)]+$', expr):
-        logger.warning(f"calculate 表达式格式异常: {expr}")
-        return None
 
+def _eval_calc(expr: str) -> str:
+    """eval 纯数学表达式,返回 Observation 文本格式与 V3 一致。"""
     try:
         result = eval(expr, {"__builtins__": {}}, {})
-        return expr, f"计算结果: {result}"
-    except Exception:
-        logger.warning(f"calculate 执行失败: {expr}")
-        return None
+        return f"计算结果: {result}"
+    except Exception as e:
+        raise ValueError(f"calculate eval 失败: {expr!r} ({e})")
 
 
-def generate_answer(client: OpenAI, question: str, history: list,
-                    seed_grouped: dict, qtype: str) -> str:
-    """生成 finish 步的最终答案（V1 ANSWER_PROMPT）"""
-    obs_parts = []
-    for i, step in enumerate(history):
-        if step.get("observation"):
-            obs_parts.append(f"[Step {i+1}] {step['observation']}")
-    obs_text = "\n".join(obs_parts)
-
-    answer_example = get_answer_example(seed_grouped, qtype)
-
-    prompt = ANSWER_PROMPT.format(
-        question=question,
-        question_type=qtype,
-        observations=obs_text,
-        answer_example=answer_example if answer_example else "（无示例，请按写作要求生成）",
-    )
-
-    response = client.chat.completions.create(
-        model=MODEL,
-        messages=[{"role": "user", "content": prompt}],
-        temperature=0.7,
-        max_tokens=1500,
-        extra_body={"enable_thinking": False},
-    )
-    return response.choices[0].message.content
+# [V4 REMOVED] fill_calculate(CALC_FILL_PROMPT 二阶段填充)
+# [V4 REMOVED] generate_answer(ANSWER_PROMPT 单独调用)
+# V4 在 generate_trajectory_v4 里单阶段完成:calculate 直接 validate + eval,
+# 最终答案由模型"不调工具时的 content"直接给出(不需要二次 API)
 
 
-def react_loop(client: OpenAI, tools: FinAgentTools, question: str,
-               question_type: str, pre_info: str, seed_grouped: dict,
-               extra_hint: str = "") -> dict:
-    """V1 生成引擎：逐步生成 Thought/Action，执行 Action 获取 Observation"""
-    min_steps = MIN_STEPS.get(question_type, 2)
-    max_steps = MAX_STEPS.get(question_type, 4)
+def generate_trajectory_v4(client: OpenAI, tools: FinAgentTools, question: str,
+                           question_type: str, seed_grouped: dict = None,
+                           extra_hint: str = "",
+                           max_steps: int = MAX_STEPS) -> dict:
+    """V4 Mode B 生成引擎:原生 tool calling + content 强约束 thought + 全局 max_steps。
+
+    流程:
+      1. system = SYSTEM_PROMPT_V4(含详细数据库范围 + 分级 reject + 工具原则)
+      2. user   = question + question_type(+ 可选 extra_hint)
+      3. loop(step_num in 0..max_steps):
+           - tool_choice = "none"(最后一步强制收尾)| "auto"(其余)
+           - 调 qwen3-max with tools=TOOLS_NATIVE
+           - msg.tool_calls 为空 → finish,content 是最终答案,break
+           - 有 tool_calls:取第 1 个(parallel 只取第一个,保持一步一工具)
+               - calculate: _validate_calc_expression + _eval_calc
+               - search_*: tools.call(name, args_dict)
+           - append assistant / tool 到 messages;同步 V1-like steps
+      4. 返回字段对齐 V3 react_loop + format_as_sft_sample 的组合
+
+    V4 vs V3:
+      - 废弃 MIN_STEPS(teacher 自主判断 finish 时机)
+      - 废弃 pre_retrieve 注入(SYSTEM_PROMPT_V4 已自带覆盖范围)
+      - 废弃 seed_grouped 注入 prompt(保留 seed_grouped 参数仅为下游 judge 兼容)
+      - calculate 单阶段(不再调 CALC_FILL_PROMPT 二次)
+      - 不再有"finish"虚拟工具(不调工具即 finish)
+    """
+    # 构造首轮 user message
+    user_content = f"## 用户问题\n{question}\n\n## 问题类型\n{question_type}"
     if extra_hint:
-        pre_info = f"{pre_info}\n\n## ⚠️ 重要提示\n{extra_hint}"
+        user_content += f"\n\n## ⚠️ 重要提示\n{extra_hint}"
 
-    history = []
+    messages = [
+        {"role": "system", "content": SYSTEM_PROMPT_V4},
+        {"role": "user", "content": user_content},
+    ]
+
+    steps = []                    # V1-like [{thought, action, action_input, observation}]
+    tools_used = []
     retrieval_quality = True
 
+    finished = False
     for step_num in range(max_steps):
-        # 1. 调用 LLM 生成当前步
-        retry_count = 0
-        step_result = None
+        # 最后一步强制收尾(tool_choice=none)
+        tool_choice = "none" if step_num == max_steps - 1 else "auto"
 
-        while retry_count < MAX_RETRY:
+        # 调 API(retry on transient errors)
+        msg = None
+        for retry in range(MAX_RETRY):
             try:
-                step_result = call_llm_for_step(
-                    client, question, question_type, history,
-                    step_num, min_steps, max_steps, pre_info
+                response = client.chat.completions.create(
+                    model=MODEL,
+                    messages=messages,
+                    tools=TOOLS_NATIVE,
+                    tool_choice=tool_choice,
+                    temperature=0.7,
+                    max_tokens=1500,
+                    extra_body={"enable_thinking": False},
                 )
+                msg = response.choices[0].message
+                break
             except Exception as e:
-                logger.warning(f"LLM 调用失败 (retry {retry_count}): {e}")
-                retry_count += 1
+                logger.warning(f"LLM 调用失败 (step {step_num+1} retry {retry}): {e}")
                 time.sleep(1)
-                continue
-
-            thought = step_result.get("thought", "")
-            action = step_result.get("action", "")
-            action_input = step_result.get("action_input", "")
-
-            if action not in VALID_TOOLS:
-                logger.warning(f"非法工具 '{action}'，重试")
-                retry_count += 1
-                continue
-
-            if step_num == 0 and action == "finish":
-                logger.warning("首步试图 finish，重试")
-                retry_count += 1
-                continue
-
-            if (step_num + 1) < min_steps and action == "finish":
-                logger.warning(f"步数不足 ({step_num + 1} < {min_steps})，禁止 finish，重试")
-                retry_count += 1
-                continue
-
-            break
-
-        if step_result is None or retry_count >= MAX_RETRY:
-            logger.error(f"步骤生成失败，已重试 {MAX_RETRY} 次")
+        if msg is None:
+            logger.error(f"step {step_num+1} 生成失败,retry 耗尽")
             return None
 
-        thought = step_result.get("thought", "")
-        action = step_result.get("action", "")
-        action_input = step_result.get("action_input", "")
+        content = (msg.content or "").strip()
+        raw_tcs = msg.tool_calls or []
 
-        # 2. 分支执行
-        if action == "finish":
-            try:
-                answer = generate_answer(client, question, history,
-                                         seed_grouped, question_type)
-            except Exception as e:
-                logger.error(f"答案生成失败: {e}")
+        # ---- 分支 1:不调工具 → finish(content 是最终答案)----
+        if not raw_tcs:
+            if not content:
+                logger.warning(f"step {step_num+1} 既无 tool_call 又无 content,视为失败")
                 return None
-
-            history.append({
-                "thought": thought,
+            # V1-like steps(action=finish,action_input=答案),兼容下游 judge
+            steps.append({
+                "thought": "",
                 "action": "finish",
-                "action_input": answer,
+                "action_input": content,
             })
+            # V2 messages
+            messages.append({"role": "assistant", "content": content})
+            logger.info(f"  Step {step_num+1}: finish (len={len(content)})")
+            finished = True
             break
 
-        elif action == "calculate":
-            calc_result = fill_calculate(client, question, history, thought)
-            if calc_result is None:
-                logger.warning(f"calculate 失败，跳过")
-                continue
-            expr, observation = calc_result
-            history.append({
-                "thought": thought,
-                "action": "calculate",
-                "action_input": expr,
-                "observation": observation,
-            })
+        # ---- 分支 2:有 tool_calls → 取第 1 个,忽略 parallel ----
+        tc = raw_tcs[0]
+        if len(raw_tcs) > 1:
+            logger.info(f"  step {step_num+1}: 收到 {len(raw_tcs)} 个 parallel tool_calls,只取第 1 个")
 
-        else:  # search_financial / search_report / search_industry
+        name = tc.function.name
+        if name not in VALID_TOOLS:
+            logger.warning(f"非法工具 '{name}',step {step_num+1} 跳过")
+            continue
+
+        # arguments:OpenAI SDK 返回 str(JSON),解析为 dict
+        try:
+            args_raw = tc.function.arguments
+            args_dict = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+            if not isinstance(args_dict, dict):
+                raise ValueError("arguments 不是 dict")
+        except Exception as e:
+            logger.warning(f"step {step_num+1} tool_call arguments 解析失败: {e}")
+            continue
+
+        # content 非空校验(⭐V4 硬约束)
+        if not content:
+            logger.warning(f"step {step_num+1} tool_call 时 content 为空(V4 要求必须有 thought)")
+            content = "(thought 缺失)"
+
+        # ---- 执行工具 ----
+        if name == "calculate":
+            expr = args_dict.get("expression", "")
             try:
-                # tools.call 返回 (observation_str, retrieval_meta) tuple;SFT 数据生成不追溯 chunk_id,丢弃 meta
-                observation, _ = tools.call(action, action_input)
+                expr_normalized = _validate_calc_expression(expr)
+                observation = _eval_calc(expr_normalized)
+                args_dict = {"expression": expr_normalized}   # 归一化后回写
+            except ValueError as e:
+                logger.warning(f"step {step_num+1} calculate 失败: {e}")
+                continue
+            action_input_v1 = expr_normalized
+        else:
+            query = args_dict.get("query", "")
+            if not query:
+                logger.warning(f"step {step_num+1} {name} query 为空,跳过")
+                continue
+            try:
+                obs_and_meta = tools.call(name, args_dict)
+                observation = obs_and_meta[0] if isinstance(obs_and_meta, tuple) else obs_and_meta
             except Exception as e:
                 observation = f"[工具调用失败] {e}"
-                logger.warning(f"工具调用失败 [{action}({action_input})]: {e}")
-
+                logger.warning(f"工具调用失败 [{name}({args_dict})]: {e}")
             if "未找到" in observation or len(observation) < 50:
                 retrieval_quality = False
                 logger.warning(f"检索质量低: {observation[:100]}")
+            action_input_v1 = query
 
-            history.append({
-                "thought": thought,
-                "action": action,
-                "action_input": action_input,
-                "observation": observation,
-            })
+        tools_used.append(name)
 
-        logger.info(f"  Step {step_num+1}: {action}({str(action_input)[:60]})")
+        # ---- 记录 steps(V1 风格)和 messages(V2)----
+        steps.append({
+            "thought": content,
+            "action": name,
+            "action_input": action_input_v1,
+            "observation": observation,
+        })
+        messages.append({
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [_tool_call_to_v2(tc, args_dict)],
+        })
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "content": observation,
+        })
+        logger.info(f"  Step {step_num+1}: {name}({str(action_input_v1)[:60]})")
         time.sleep(0.3)
 
-    # 确保最后一步是 finish
-    if not history or history[-1].get("action") != "finish":
-        logger.warning("循环结束但未 finish，强制生成答案")
-        try:
-            answer = generate_answer(client, question, history,
-                                     seed_grouped, question_type)
-            history.append({
-                "thought": "综合以上分析数据，生成最终报告。",
-                "action": "finish",
-                "action_input": answer,
-            })
-        except Exception as e:
-            logger.error(f"强制生成答案失败: {e}")
-            return None
+    if not finished:
+        # 跑满 max_steps 但从未产出 finish(通常是连续 continue 到底),视为失败
+        logger.warning(f"max_steps={max_steps} 耗尽仍未 finish")
+        return None
 
     return {
         "question": question,
         "type": question_type,
-        "steps": history,
+        "messages": messages,
+        "steps": steps,
+        "num_tool_steps": len(tools_used),
+        "tools_used": tools_used,
         "retrieval_quality": retrieval_quality,
     }
 
 
-# ============ V2 格式转换层 ============
+# ============ V4 SFT sample 落库(不需要 V1→V2 转换)============
 
-def format_as_sft_sample(plan: dict) -> dict:
+def build_sft_sample(plan: dict) -> dict:
+    """V4 直接从 plan 提取训练样本字段。
+
+    相对 V3 format_as_sft_sample:
+      - V3 收 V1 steps → 转 V2 messages(70 行转换层)
+      - V4 generate_trajectory_v4 已产 messages,此处只是 re-project
     """
-    将 V1 生成的 plan 转换为 V2 messages 格式
-
-    V1 步骤格式：{"thought", "action", "action_input", "observation"}
-    V2 messages 格式：assistant(content+tool_calls) + tool(observation)
-
-    关键转换：
-    - search/calculate 步 → assistant(content=thought, tool_calls) + tool(observation)
-    - finish 步 → assistant(content=thought + \n\n + 报告)
-    - action_input 字符串 → JSON arguments
-    """
-    from prompts import SYSTEM_PROMPT
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": plan["question"]},
-    ]
-
-    steps = plan["steps"]
-    call_counter = 0
-    tools_used = []
-
-    for step in steps:
-        action = step["action"]
-        thought = step["thought"]
-        action_input = step["action_input"]
-
-        if action == "finish":
-            # 最终回答：thought + 报告合并为 content
-            final_content = f"{thought}\n\n{action_input}" if thought else action_input
-            messages.append({
-                "role": "assistant",
-                "content": final_content,
-            })
-
-        else:
-            # 工具调用步：转换为 tool_calls 格式
-            tool_call_id = f"call_{call_counter}"
-            call_counter += 1
-            tools_used.append(action)
-
-            # action_input 转为 JSON arguments
-            if action in ("search_report", "search_financial", "search_industry"):
-                arguments = json.dumps({"query": action_input}, ensure_ascii=False)
-            elif action == "calculate":
-                arguments = json.dumps({"expression": action_input}, ensure_ascii=False)
-            else:
-                arguments = json.dumps({"input": action_input}, ensure_ascii=False)
-
-            # assistant 消息：content=Thought + tool_calls=Action
-            assistant_msg = {
-                "role": "assistant",
-                "content": thought,
-                "tool_calls": [{
-                    "id": tool_call_id,
-                    "type": "function",
-                    "function": {
-                        "name": action,
-                        "arguments": arguments,
-                    }
-                }]
-            }
-            messages.append(assistant_msg)
-
-            # tool 消息：Observation
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call_id,
-                "content": step.get("observation", ""),
-            })
-
     return {
         "question": plan["question"],
         "type": plan["type"],
-        "messages": messages,
-        "num_tool_steps": len(tools_used),
-        "tools_used": tools_used,
+        "messages": plan["messages"],
+        "num_tool_steps": plan["num_tool_steps"],
+        "tools_used": plan["tools_used"],
     }
 
 
@@ -1367,21 +1197,19 @@ def main():
             logger.info(f"--- 进度: {idx}/{len(questions)} | 成功: {stats['success']} | 失败: {total_failed} ---")
 
         try:
-            # Phase 0: 预检索
-            pre_info = pre_retrieve(question, retriever, qtype)
-
-            # Phase 1: V1 ReAct Loop 生成
-            plan = react_loop(client, tools, question, qtype, pre_info, seed_grouped)
+            # V4: 废弃 Phase 0 预检索(SYSTEM_PROMPT_V4 已含完整数据库范围)
+            # Phase 1: V4 Mode B 生成轨迹
+            plan = generate_trajectory_v4(client, tools, question, qtype, seed_grouped)
 
             if not plan:
                 stats["failed_react"] += 1
-                logger.warning(f"[{idx}] ReAct Loop 失败: {question[:50]}")
+                logger.warning(f"[{idx}] 轨迹生成失败: {question[:50]}")
                 continue
 
             if not plan.get("retrieval_quality", True) and qtype != "reject":
                 stats["low_retrieval"] += 1
 
-            # Phase 2: 验证（V1 格式验证）
+            # Phase 2: 验证(V1-like steps 字段验证)
             passed, validation_errors = validate_sample(plan)
             if not passed:
                 stats["failed_validation"] += 1
@@ -1441,11 +1269,14 @@ def main():
                     "4. 在 Thought 中写明要计算什么，然后 Action 选 calculate，Action Input 写纯数学表达式"
                 )
                 try:
-                    pre_info = pre_retrieve(question, retriever, qtype)
-                    new_plan = react_loop(client, tools, question, qtype, pre_info, seed_grouped,
-                                          extra_hint=mental_math_hint)
+                    new_plan = generate_trajectory_v4(client, tools, question, qtype, seed_grouped,
+                                                      extra_hint=mental_math_hint)
                     if new_plan and any(s.get("action") == "finish" for s in new_plan["steps"]):
+                        # V4: 完整替换 plan(含 messages,保持下游同步)
                         plan["steps"] = new_plan["steps"]
+                        plan["messages"] = new_plan["messages"]
+                        plan["num_tool_steps"] = new_plan["num_tool_steps"]
+                        plan["tools_used"] = new_plan["tools_used"]
                         plan["retrieval_quality"] = new_plan.get("retrieval_quality", True)
                         # 新轨迹需要重新跑规则质检
                         rule_passed2, rule_issues2, rule_score2 = rule_based_quality_check(plan)
@@ -1514,8 +1345,8 @@ def main():
                     logger.warning(f"[{idx}] Judge 重生成后仍存在心算: {mental_math_issues3[0]['detail']}")
                     continue
 
-            # Phase 3: V2 格式转换
-            sft_sample = format_as_sft_sample(plan)
+            # Phase 3: V4 SFT sample 落库(不需要 V1→V2 转换,plan 已带 messages)
+            sft_sample = build_sft_sample(plan)
             sft_sample["validation_passed"] = plan["validation_passed"]
             sft_sample["validation_errors"] = plan.get("validation_errors", [])
             sft_sample["judge_score"] = plan.get("judge_score", {})
