@@ -476,14 +476,22 @@ class FinAgentRetriever:
             merged = self.enrich_with_parent(merged)
 
         # 方案 A:budget-based 截取 —— top_k 是硬上限,字符预算是软上限
-        # 单条超预算时至少返回 1 条(避免空返回),超预算后停
+        # per-pdf cap:每 pdf 最多 MAX_OUT_PER_PDF 条(防止 _external_rrf 同 pdf 连续排布
+        # 搭配 budget 填充时,top-1 pdf 独占全部名额导致其他 pdf 无机会上榜)
+        MAX_OUT_PER_PDF = 3
+        pdf_count = {}
         out, total = [], 0
         for chunk in merged:
+            m = chunk.get('metadata', {})
+            pdf = m.get('pdf_file') or m.get('chunk_id', '') or '_no_pdf'
+            if pdf_count.get(pdf, 0) >= MAX_OUT_PER_PDF:
+                continue
             tlen = len(chunk.get('text', ''))
             if out and total + tlen > SEARCH_REPORT_BUDGET_CHARS:
                 break
             out.append(chunk)
             total += tlen
+            pdf_count[pdf] = pdf_count.get(pdf, 0) + 1
             if len(out) >= top_k:
                 break
         return out
