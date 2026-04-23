@@ -28,10 +28,19 @@ from pathlib import Path
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
-ROOT = Path(__file__).resolve().parent.parent
+def _find_project_root() -> Path:
+    """兼容 Mac(backup/finagent_repo/ 两层嵌套)和服务器(Finagent/ 一层)两种结构"""
+    here = Path(__file__).resolve()
+    for cand in (here.parent, here.parent.parent):
+        if (cand / "data").is_dir():
+            return cand
+    return here.parent
+
+ROOT = _find_project_root()
 ALL_CHUNKS_PATH = ROOT / "data/processed/all_chunks.jsonl"
 OUT_PATH = ROOT / "data/processed/industry_alias_entities.jsonl"
-HYBRID_SEARCH_PATH = ROOT / "finagent_repo" / "hybrid_search.py"
+# hybrid_search.py 和 05a 总是在同一目录(Mac:finagent_repo/ 服务器:Finagent/),用 __file__.parent 定位
+HYBRID_SEARCH_PATH = Path(__file__).resolve().parent / "hybrid_search.py"
 
 
 # ============ 从 hybrid_search.py import 别名字典(单一真相) ============
