@@ -528,10 +528,34 @@ class FinAgentRetriever:
                 periods.add(label)
         return periods
 
+    @staticmethod
+    def _date_to_period(date_str: str) -> set:
+        """
+        根据研报发布日期推断其点评的报告期(A 股发布惯例):
+          3 月:年报(上年度)      5 月:一季报
+          4 月:年报 / 一季报交集  7-9 月:中报
+          10-11 月:三季报
+          1-2 / 6 / 12 月不推断(易误判,返回空集)
+        解决 title 营销性命名(如"电池龙头盈利强劲")缺期间词的 fallback 信号。
+        """
+        if not date_str or len(date_str) < 7:
+            return set()
+        try:
+            month = int(date_str[5:7])
+        except (ValueError, IndexError):
+            return set()
+        if 10 <= month <= 11: return {'q3'}
+        if 7 <= month <= 9:   return {'h1'}
+        if month == 3:        return {'annual'}
+        if month == 5:        return {'q1'}
+        if month == 4:        return {'annual', 'q1'}   # 边界月:两期间都可能
+        return set()
+
     @classmethod
     def _compute_time_boosts(cls, query: str, chunks: list) -> dict:
         """
-        query 含期间关键词时,report_title 含同期间的 pdf 得到 _TIME_BOOST 加分。
+        query 含期间关键词时,title 字面匹配 OR date 推断匹配的 pdf 得到 _TIME_BOOST。
+        title 字面匹配是强信号(命名含"三季报"),date 推断是弱信号兜底(10-11 月发=Q3)。
         返回 {pdf_file: boost_value}
         """
         query_periods = cls._extract_periods(query)
@@ -543,7 +567,10 @@ class FinAgentRetriever:
             pdf = m.get('pdf_file')
             if not pdf or pdf in boosts:
                 continue
-            if query_periods & cls._extract_periods(m.get('report_title', '')):
+            # 双信号合并:title 字面 + date 发布期间推断
+            pdf_periods = cls._extract_periods(m.get('report_title', ''))
+            pdf_periods |= cls._date_to_period(m.get('date', ''))
+            if query_periods & pdf_periods:
                 boosts[pdf] = _TIME_BOOST
         return boosts
 
