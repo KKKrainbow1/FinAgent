@@ -315,7 +315,7 @@ def main():
 
     logger.info(f"encode 完成 dense={dense_vecs.shape} sparse_nnz={sparse_csr.nnz}")
 
-    # ─── 4. 建 Milvus collection ───
+    # ─── 3. 建 Milvus collection ───
     from pymilvus import MilvusClient
     DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
