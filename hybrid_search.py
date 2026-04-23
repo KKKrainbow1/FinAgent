@@ -285,8 +285,8 @@ class FinAgentRetriever:
         results = self.client.hybrid_search(
             collection_name=self.collection,
             reqs=[
-                AnnSearchRequest(data=[q_dense],  anns_field="dense",  limit=30),
-                AnnSearchRequest(data=[q_sparse], anns_field="sparse", limit=30),
+                AnnSearchRequest(data=[q_dense],  anns_field="dense",  param={"metric_type": "COSINE"}, limit=30),
+                AnnSearchRequest(data=[q_sparse], anns_field="sparse", param={"metric_type": "IP"},     limit=30),
             ],
             ranker=RRFRanker(k=60),
             filter=filter_expr,
@@ -417,8 +417,8 @@ class FinAgentRetriever:
         meta_hits = self.client.hybrid_search(
             collection_name=self.collection,
             reqs=[
-                AnnSearchRequest(data=[q_dense],  anns_field="dense",  limit=30),
-                AnnSearchRequest(data=[q_sparse], anns_field="sparse", limit=30),
+                AnnSearchRequest(data=[q_dense],  anns_field="dense",  param={"metric_type": "COSINE"}, limit=30),
+                AnnSearchRequest(data=[q_sparse], anns_field="sparse", param={"metric_type": "IP"},     limit=30),
             ],
             ranker=WeightedRanker(0.4, 0.6),
             filter='source_type == "report"',
@@ -436,8 +436,8 @@ class FinAgentRetriever:
         body_hits = self.client.hybrid_search(
             collection_name=self.collection,
             reqs=[
-                AnnSearchRequest(data=[q_dense],  anns_field="dense",  limit=60),
-                AnnSearchRequest(data=[q_sparse], anns_field="sparse", limit=60),
+                AnnSearchRequest(data=[q_dense],  anns_field="dense",  param={"metric_type": "COSINE"}, limit=60),
+                AnnSearchRequest(data=[q_sparse], anns_field="sparse", param={"metric_type": "IP"},     limit=60),
             ],
             ranker=RRFRanker(k=60),
             filter='source_type in ["report_fulltext", "report_tabular"]',
