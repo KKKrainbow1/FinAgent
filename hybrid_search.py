@@ -65,8 +65,10 @@ _TIME_PERIOD_GROUPS = (
     ('q3',     ('三季报', '三季度', 'Q3', 'q3')),
     ('annual', ('年报',   '年度')),
 )
-# boost 值参考:当前 pdf-level 累加分 ~0.07,差距常在 0.01-0.02,0.03 足以反超但不压倒
-_TIME_BOOST = 0.03
+# boost 值参考(P1.2 调整):
+#   0.03 不够覆盖"chunk 多的无关 pdf"累加优势(Q14/16 翻车算例显示 0.025+0.03=0.055 输给 Q3 0.081)
+#   0.06 让期间匹配的 pdf 稳压"chunk 多但期间错"的 pdf,同时不至于压倒真正高相关的 case
+_TIME_BOOST = 0.06
 
 
 class FinAgentRetriever:
