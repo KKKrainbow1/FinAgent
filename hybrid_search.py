@@ -287,7 +287,11 @@ class FinAgentRetriever:
         """
         hybrid_search + RRFRanker,filter source_type == financial
         可选 stock_code 做精确过滤
+
+        P1.3 年份 tie-break:query 含年份 (20XX) 时,对应 date 年份的 chunk +0.01 分,
+        解决 BGE/BM25 对 "2022" vs "2024" token 区分度弱导致 top-1 年份错位的问题。
         """
+        import re
         from pymilvus import AnnSearchRequest, RRFRanker
 
         q_dense, q_sparse = self._embed(query)
@@ -297,6 +301,7 @@ class FinAgentRetriever:
 
         # 注意:pymilvus hybrid_search 顶层没有 filter 参数(被 **kwargs 吞掉),
         # filter 必须塞进每个 AnnSearchRequest 的 expr 参数才生效。
+        # 多拉 top_k*4 后应用层按年份 rerank,再截 top_k
         results = self.client.hybrid_search(
             collection_name=self.collection,
             reqs=[
@@ -308,9 +313,18 @@ class FinAgentRetriever:
                 "text", "source_type", "stock_code", "stock_name",
                 "date", "chunk_method", "data_type",
             ],
-            limit=top_k,
+            limit=top_k * 4,
         )
-        return [self._hit_to_chunk(h) for h in results[0]]
+        hits = [self._hit_to_chunk(h) for h in results[0]]
+
+        # 年份 tie-break:query 含 "2024" 时,date 年份 == 2024 的 chunk 优先
+        years = set(re.findall(r'(20\d{2})', query))
+        if years:
+            for h in hits:
+                if (h.get('metadata', {}).get('date') or '')[:4] in years:
+                    h['score'] = h.get('score', 0) + 0.01
+            hits.sort(key=lambda h: -h.get('score', 0))
+        return hits[:top_k]
 
     # ============ search_industry ============
 

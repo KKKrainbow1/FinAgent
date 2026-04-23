@@ -52,10 +52,14 @@ logger = logging.getLogger(__name__)
 # ============ 研报元数据 Chunk 构建 ============
 
 def _safe_str(v) -> str:
-    """CSV 字段 NaN-safe:NaN → '',其他 str()+strip"""
+    """
+    CSV 字段 NaN-safe:NaN → '',其他 str()+strip。
+    额外去除内部空格:akshare 对"五粮液"/"新希望"等 3 字股票名返回"五 粮 液"/"新 希 望",
+    query 检索时会因为空格导致 BGE character token 和 BM25 切词混乱,召回错位(召回其他白酒)。
+    """
     if pd.isna(v):
         return ''
-    return str(v).strip()
+    return str(v).replace(' ', '').replace('\u3000', '').strip()
 
 
 def _load_pdf_reverse_index(pdf_map_path: str) -> dict:
