@@ -259,16 +259,16 @@ def build_fulltext_chunks(parser: str, pdf_map_path: str = None,
         base_metadata = {
             "source_type": "report_fulltext",
             "parser": parser,
-            "stock_code": meta.get("stock_code", ""),
-            "stock_name": meta.get("stock_name", ""),
-            "institution": meta.get("institution", ""),
-            "rating": meta.get("rating", ""),
+            "stock_code": _safe_str(meta.get("stock_code", "")),
+            "stock_name": _safe_str(meta.get("stock_name", "")),
+            "institution": _safe_str(meta.get("institution", "")),
+            "rating": _safe_str(meta.get("rating", "")),
             # industry 归一化到大类,和 build_report_chunks / build_industry_chunks 对齐
             "industry": _get_major_industry(meta.get("industry", "")),
             # date 防御性 normalize:历史 pdf_map 可能是 str(Timestamp)='YYYY-MM-DD 00:00:00'
             # 或 ISO 'YYYY-MM-DDTHH:MM:SS',截到纯 date 避免 Milvus filter/dedup 失败
             "date": (meta.get("date") or "").split(" ")[0].split("T")[0],
-            "report_title": meta.get("report_title", ""),
+            "report_title": _safe_str(meta.get("report_title", "")),
             "pdf_file": filename,
         }
 
@@ -753,14 +753,14 @@ def build_fulltext_chunks_mineru(cleaned_dir: str, pdf_map_path: str = None,
         base_metadata = {
             "source_type": "report_fulltext",
             "parser": "mineru_cleaned",
-            "stock_code": meta.get("stock_code", ""),
-            "stock_name": meta.get("stock_name", ""),
-            "institution": meta.get("institution", ""),
-            "rating": meta.get("rating", ""),
+            "stock_code": _safe_str(meta.get("stock_code", "")),
+            "stock_name": _safe_str(meta.get("stock_name", "")),
+            "institution": _safe_str(meta.get("institution", "")),
+            "rating": _safe_str(meta.get("rating", "")),
             "industry": _get_major_industry(meta.get("industry", "")),
             # date 防御性 normalize(同 build_fulltext_chunks 路径,防 pdf_map 残留脏格式)
             "date": (meta.get("date") or "").split(" ")[0].split("T")[0],
-            "report_title": meta.get("report_title", ""),
+            "report_title": _safe_str(meta.get("report_title", "")),
             "pdf_file": pdf_file,
         }
 
@@ -841,7 +841,8 @@ def build_financial_chunks(financial_path: str) -> list[dict]:
     chunks = []
 
     for code, data in tqdm(all_data.items(), desc="构建财务chunks"):
-        name = data.get("stock_name", code)
+        # 走 _safe_str 去内部空格("五 粮 液" → "五粮液")
+        name = _safe_str(data.get("stock_name", code)) or code
 
         if "financial_indicators" not in data:
             continue
@@ -1278,7 +1279,7 @@ def build_industry_chunks(financial_path: str, report_path: str = None) -> list[
         if code not in stock_industry:
             continue
         industry = stock_industry[code]
-        name = data.get("stock_name", code)
+        name = _safe_str(data.get("stock_name", code)) or code
 
         if "financial_indicators" not in data:
             continue
