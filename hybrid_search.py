@@ -293,14 +293,15 @@ class FinAgentRetriever:
         if stock_code:
             filter_expr += f' and stock_code == "{stock_code}"'
 
+        # 注意:pymilvus hybrid_search 顶层没有 filter 参数(被 **kwargs 吞掉),
+        # filter 必须塞进每个 AnnSearchRequest 的 expr 参数才生效。
         results = self.client.hybrid_search(
             collection_name=self.collection,
             reqs=[
-                AnnSearchRequest(data=[q_dense],  anns_field="dense",  param={"metric_type": "COSINE"}, limit=30),
-                AnnSearchRequest(data=[q_sparse], anns_field="sparse", param={"metric_type": "IP"},     limit=30),
+                AnnSearchRequest(data=[q_dense],  anns_field="dense",  param={"metric_type": "COSINE"}, limit=30, expr=filter_expr),
+                AnnSearchRequest(data=[q_sparse], anns_field="sparse", param={"metric_type": "IP"},     limit=30, expr=filter_expr),
             ],
             ranker=RRFRanker(k=60),
-            filter=filter_expr,
             output_fields=[
                 "text", "source_type", "stock_code", "stock_name",
                 "date", "chunk_method", "data_type",
@@ -425,14 +426,16 @@ class FinAgentRetriever:
         q_dense, q_sparse = self._embed(query)
 
         # 元数据路
+        # 注意:pymilvus hybrid_search 顶层 filter 参数无效(见 search_financial 同样 bug),
+        # filter 必须塞进每个 AnnSearchRequest 的 expr 参数
+        _META_FILTER = 'source_type == "report"'
         meta_hits = self.client.hybrid_search(
             collection_name=self.collection,
             reqs=[
-                AnnSearchRequest(data=[q_dense],  anns_field="dense",  param={"metric_type": "COSINE"}, limit=30),
-                AnnSearchRequest(data=[q_sparse], anns_field="sparse", param={"metric_type": "IP"},     limit=30),
+                AnnSearchRequest(data=[q_dense],  anns_field="dense",  param={"metric_type": "COSINE"}, limit=30, expr=_META_FILTER),
+                AnnSearchRequest(data=[q_sparse], anns_field="sparse", param={"metric_type": "IP"},     limit=30, expr=_META_FILTER),
             ],
             ranker=WeightedRanker(0.4, 0.6),
-            filter='source_type == "report"',
             output_fields=[
                 "text", "source_type", "stock_code", "stock_name",
                 "institution", "date", "rating", "report_title",
@@ -444,14 +447,14 @@ class FinAgentRetriever:
         # 正文路(prose Child + table Child)
         # 注意:不用 group_by_field —— Milvus Lite 不支持,且 prose Child 的 parent_id=NULL 会把
         # 所有 prose 合并到同一 NULL 组导致召回丢失。dedup 全在应用层 enrich_with_parent 做。
+        _BODY_FILTER = 'source_type in ["report_fulltext", "report_tabular"]'
         body_hits = self.client.hybrid_search(
             collection_name=self.collection,
             reqs=[
-                AnnSearchRequest(data=[q_dense],  anns_field="dense",  param={"metric_type": "COSINE"}, limit=60),
-                AnnSearchRequest(data=[q_sparse], anns_field="sparse", param={"metric_type": "IP"},     limit=60),
+                AnnSearchRequest(data=[q_dense],  anns_field="dense",  param={"metric_type": "COSINE"}, limit=60, expr=_BODY_FILTER),
+                AnnSearchRequest(data=[q_sparse], anns_field="sparse", param={"metric_type": "IP"},     limit=60, expr=_BODY_FILTER),
             ],
             ranker=RRFRanker(k=60),
-            filter='source_type in ["report_fulltext", "report_tabular"]',
             output_fields=[
                 "text", "source_type", "chunk_method",
                 "stock_code", "stock_name", "institution", "date",
