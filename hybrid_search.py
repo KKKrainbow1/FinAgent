@@ -57,6 +57,17 @@ SEARCH_REPORT_BUDGET_CHARS = 12000
 # 不加会损失 1-2% 召回。index 端保持不加(见 05_build_index.py)
 _BGE_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章:"
 
+# 期间匹配 boost:query 含期间关键词(三季报/中报/年报)时,report_title 含同期间的 pdf 额外加分
+# 解决 BGE/BM25 无法区分 "用户问 Q3 实际" vs "某 pdf 里提到 Q3 回顾"的问题
+_TIME_PERIOD_GROUPS = (
+    ('q1',     ('一季报', '一季度', 'Q1', 'q1')),
+    ('h1',     ('半年报', '中报',   'H1', 'h1')),
+    ('q3',     ('三季报', '三季度', 'Q3', 'q3')),
+    ('annual', ('年报',   '年度')),
+)
+# boost 值参考:当前 pdf-level 累加分 ~0.07,差距常在 0.01-0.02,0.03 足以反超但不压倒
+_TIME_BOOST = 0.03
+
 
 class FinAgentRetriever:
     """
@@ -469,8 +480,13 @@ class FinAgentRetriever:
         )
         body_chunks = [c for _, c in body_chunks]
 
+        # time boost:query 含 "三季报 / 中报 / 年报" 等期间关键词时,
+        # report_title 含同期间的 pdf 得到固定 +0.03 分,反超 chunk 密度高但期间错位的 pdf
+        time_boosts = self._compute_time_boosts(query, meta_chunks + body_chunks)
+
         # 方案 B:按 pdf_file 聚合,同 PDF 多 chunk 可能累积,top_k * 6 留足量
-        merged = self._external_rrf(meta_chunks, body_chunks, k=60, top_k=top_k * 6)
+        merged = self._external_rrf(meta_chunks, body_chunks, k=60, top_k=top_k * 6,
+                                     time_boosts=time_boosts)
 
         if self.enrich_parents:
             merged = self.enrich_with_parent(merged)
@@ -499,9 +515,40 @@ class FinAgentRetriever:
     # ============ 外部 RRF 融合 + Parent 展开 ============
 
     @staticmethod
+    def _extract_periods(text: str) -> set:
+        """从 text 抽取期间标签(q1/h1/q3/annual)集合,用于 time boost 匹配"""
+        if not text:
+            return set()
+        periods = set()
+        for label, keywords in _TIME_PERIOD_GROUPS:
+            if any(kw in text for kw in keywords):
+                periods.add(label)
+        return periods
+
+    @classmethod
+    def _compute_time_boosts(cls, query: str, chunks: list) -> dict:
+        """
+        query 含期间关键词时,report_title 含同期间的 pdf 得到 _TIME_BOOST 加分。
+        返回 {pdf_file: boost_value}
+        """
+        query_periods = cls._extract_periods(query)
+        if not query_periods:
+            return {}
+        boosts = {}
+        for c in chunks:
+            m = c.get('metadata', {})
+            pdf = m.get('pdf_file')
+            if not pdf or pdf in boosts:
+                continue
+            if query_periods & cls._extract_periods(m.get('report_title', '')):
+                boosts[pdf] = _TIME_BOOST
+        return boosts
+
+    @staticmethod
     def _external_rrf(list_a: list, list_b: list, k: int = 60,
                       top_k: int = 30,
-                      max_chunks_per_pdf: int = 5) -> list[dict]:
+                      max_chunks_per_pdf: int = 5,
+                      time_boosts: dict | None = None) -> list[dict]:
         """
         按**研报身份(pdf_file)**聚合 RRF 融合两路结果。
 
@@ -539,12 +586,15 @@ class FinAgentRetriever:
             pdf_hits.setdefault(_key(c), []).append((rank, c))
 
         # 每 pdf 仅累加 rank 最小(最相关)的前 N 条 chunk;items 保留全部
+        # time_boost:query 期间匹配的 pdf 叠加固定分,解决 BGE/BM25 对期间语义无判别力
         scores = {}
         items = {}
         for key, hits in pdf_hits.items():
             hits_sorted = sorted(hits, key=lambda x: x[0])
             top = hits_sorted[:max_chunks_per_pdf]
             scores[key] = sum(1 / (k + r + 1) for r, _ in top)
+            if time_boosts:
+                scores[key] += time_boosts.get(key, 0)
             items[key] = [c for _, c in hits_sorted]
 
         # 按 PDF-level 分数倒序;同一 PDF 内部 meta 先、body 后(给 LLM 的阅读顺序)
