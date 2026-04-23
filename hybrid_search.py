@@ -455,6 +455,20 @@ class FinAgentRetriever:
         meta_chunks = [self._hit_to_chunk(h) for h in meta_hits[0]]
         body_chunks = [self._hit_to_chunk(h) for h in body_hits[0]]
 
+        # chunk_method 硬分桶 rerank(P0 修复):row_fact 数量碾压 fulltext,导致用户问
+        # "2025 三季报营收" 时 top-3 被 profit_forecast row 填满、真正 Q3 fulltext 被挤出。
+        # 按 chunk_method 桶排序(桶间硬序,桶内保留 Milvus 原相关性),再进 _external_rrf,
+        # 使 fixed_window 的 RRF rank 全部小于 row_fact,分数天然领先。
+        _METHOD_BUCKET = {'fixed_window': 0, 'table_narrative': 1, 'table_row_fact': 2}
+        body_chunks = sorted(
+            enumerate(body_chunks),
+            key=lambda pair: (
+                _METHOD_BUCKET.get(pair[1].get('metadata', {}).get('chunk_method', ''), 99),
+                pair[0],   # 同桶内保持 Milvus RRF 原序
+            ),
+        )
+        body_chunks = [c for _, c in body_chunks]
+
         # 方案 B:按 pdf_file 聚合,同 PDF 多 chunk 可能累积,top_k * 6 留足量
         merged = self._external_rrf(meta_chunks, body_chunks, k=60, top_k=top_k * 6)
 

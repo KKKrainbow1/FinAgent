@@ -261,7 +261,9 @@ def build_fulltext_chunks(parser: str, pdf_map_path: str = None,
             "rating": meta.get("rating", ""),
             # industry 归一化到大类,和 build_report_chunks / build_industry_chunks 对齐
             "industry": _get_major_industry(meta.get("industry", "")),
-            "date": meta.get("date", ""),
+            # date 防御性 normalize:历史 pdf_map 可能是 str(Timestamp)='YYYY-MM-DD 00:00:00'
+            # 或 ISO 'YYYY-MM-DDTHH:MM:SS',截到纯 date 避免 Milvus filter/dedup 失败
+            "date": (meta.get("date") or "").split(" ")[0].split("T")[0],
             "report_title": meta.get("report_title", ""),
             "pdf_file": filename,
         }
@@ -752,7 +754,8 @@ def build_fulltext_chunks_mineru(cleaned_dir: str, pdf_map_path: str = None,
             "institution": meta.get("institution", ""),
             "rating": meta.get("rating", ""),
             "industry": _get_major_industry(meta.get("industry", "")),
-            "date": meta.get("date", ""),
+            # date 防御性 normalize(同 build_fulltext_chunks 路径,防 pdf_map 残留脏格式)
+            "date": (meta.get("date") or "").split(" ")[0].split("T")[0],
             "report_title": meta.get("report_title", ""),
             "pdf_file": pdf_file,
         }
