@@ -10,8 +10,9 @@ FinAgent Step 5 (V3 · Milvus Lite 版): 建 Milvus 索引
   data/processed/industry_alias_entities.jsonl        (Phase 3 产出:255 别名,可选)
 
 输出:
-  data/processed/milvus_finagent.db                   (Milvus Lite 单文件)
-  data/processed/bm25_ef.pkl                          (BM25 模型,查询时需要同样 fit)
+  data/processed/milvus_finagent.db                   (Milvus Lite 单文件,含 dense + learned sparse)
+
+  注:旧版 data/processed/bm25_ef.pkl 已废弃(bge-m3 自带 learned sparse 替代 jieba/BM25)。
 
 Schema / index 策略详见 docs/Chunk_Alignment_20260420.md 14 节。
 
@@ -45,9 +46,8 @@ ROOT = _find_project_root()
 # ============ 配置 ============
 COLLECTION = "finagent"
 DB_PATH = ROOT / "data/processed/milvus_finagent.db"
-BM25_PATH = ROOT / "data/processed/bm25_ef.pkl"
-EMBEDDING_MODEL = "./models/bge-base-zh-v1.5"
-DIM = 768
+EMBEDDING_MODEL = "./models/bge-m3"
+DIM = 1024
 
 CHUNK_SOURCES = [
     ROOT / "data/processed/all_chunks.jsonl",
@@ -276,46 +276,44 @@ def main():
     dist = Counter(c.get('metadata', {}).get('source_type', '?') for c in chunks)
     logger.info(f"source_type 分布: {dict(dist)}")
 
-    # 与 Milvus text 字段(VARCHAR 4096)对齐,避免 BM25 看到的内容比存储的短
+    # 与 Milvus text 字段(VARCHAR 4096)对齐,避免 encode 看到的内容比存储的短
     texts = [(c.get('text') or '')[:4096] for c in chunks]
 
-    # ─── 2. Dense embedding (BGE) ───
-    logger.info(f"加载 embedding model: {EMBEDDING_MODEL}")
-    from sentence_transformers import SentenceTransformer
-    encoder = SentenceTransformer(EMBEDDING_MODEL)
-
-    logger.info(f"encode {len(texts)} 条 dense embedding...")
-    dense_vecs = encoder.encode(
-        texts, batch_size=64,
-        show_progress_bar=True,
-        normalize_embeddings=True,
+    # ─── 2. bge-m3 一次输出 dense + native sparse(替代 BGE + jieba/BM25 两路) ───
+    logger.info(f"加载 bge-m3: {EMBEDDING_MODEL}")
+    from pymilvus.model.hybrid import BGEM3EmbeddingFunction
+    m3_ef = BGEM3EmbeddingFunction(
+        model_name=EMBEDDING_MODEL, device="cuda:0", use_fp16=True,
     )
-    logger.info(f"dense 完成,shape={dense_vecs.shape}")
 
-    # ─── 3. Sparse embedding (BM25) ───
-    from pymilvus.model.sparse import BM25EmbeddingFunction
-    from pymilvus.model.sparse.bm25.tokenizers import build_default_analyzer
+    logger.info(f"encode {len(texts)} 条 dense+sparse(bge-m3)...")
+    docs_emb = m3_ef.encode_documents(texts)
 
-    logger.info("fit BM25(中文分词)...")
-    analyzer = build_default_analyzer(language="zh")
-    bm25_ef = BM25EmbeddingFunction(analyzer)
-    bm25_ef.fit(texts)
+    # 兼容:dense 可能是 list[np.ndarray] 或 np.ndarray(pymilvus 版本差异)
+    import numpy as np
+    dense_raw = docs_emb["dense"]
+    dense_vecs = np.array(dense_raw) if isinstance(dense_raw, list) else dense_raw
 
-    logger.info("encode sparse...")
-    sparse_csr = bm25_ef.encode_documents(texts)
-    logger.info(f"sparse 完成,shape={sparse_csr.shape}")
-
-    BM25_PATH.parent.mkdir(parents=True, exist_ok=True)
-    # pymilvus 2.5+ 是 save(),2.4.x 是 save_to_file(),兼容两种
-    if hasattr(bm25_ef, 'save'):
-        bm25_ef.save(str(BM25_PATH))
-    elif hasattr(bm25_ef, 'save_to_file'):
-        bm25_ef.save_to_file(str(BM25_PATH))
+    # 兼容:sparse 可能是 list[dict] 或 scipy csr/coo,统一转 csr_matrix
+    sparse_raw = docs_emb["sparse"]
+    if isinstance(sparse_raw, list) and sparse_raw and isinstance(sparse_raw[0], dict):
+        from scipy.sparse import csr_matrix
+        rows_i, cols_i, data_v = [], [], []
+        max_col = 0
+        for i_row, d in enumerate(sparse_raw):
+            for k, v in d.items():
+                rows_i.append(i_row)
+                cols_i.append(int(k))
+                data_v.append(float(v))
+                if int(k) > max_col:
+                    max_col = int(k)
+        sparse_csr = csr_matrix((data_v, (rows_i, cols_i)),
+                                 shape=(len(sparse_raw), max_col + 1))
     else:
-        import pickle
-        with open(BM25_PATH, 'wb') as f:
-            pickle.dump(bm25_ef, f)
-    logger.info(f"BM25 模型保存 → {BM25_PATH}")
+        # 已经是 scipy sparse,转 csr 以便 chunk_to_row 里的 _csr_row_to_dict 使用 indptr
+        sparse_csr = sparse_raw.tocsr() if hasattr(sparse_raw, 'tocsr') else sparse_raw
+
+    logger.info(f"encode 完成 dense={dense_vecs.shape} sparse_nnz={sparse_csr.nnz}")
 
     # ─── 4. 建 Milvus collection ───
     from pymilvus import MilvusClient
@@ -375,7 +373,7 @@ def main():
     logger.info("=" * 60)
     logger.info("✅ 建索引完成")
     logger.info(f"   DB 路径:     {DB_PATH}")
-    logger.info(f"   BM25 模型:   {BM25_PATH}")
+    logger.info(f"   Embedding:   bge-m3 (1024 维, dense+learned sparse)")
     logger.info(f"   索引 backend: {'HNSW(Standalone)' if args.hnsw else 'FLAT(Lite)'}")
     logger.info("下一步: 跑 hybrid_search.py 做召回验证")
 

@@ -11,9 +11,9 @@ FinAgent Retriever (V3 · Milvus 版)
 
 每个 dict 格式:{text, metadata, score},和 V2 保持一致。
 
-内部实现(全部从 FAISS/BM25 双轨 + 应用层 RRF + enrich_with_parent 迁移到 Milvus):
+内部实现:
   - 所有 chunk 在一个 Milvus collection,scalar filter 路由 3 工具
-  - dense (BGE 768) + sparse (BM25 via pymilvus) 两路 hybrid_search
+  - bge-m3 一次 forward 同时出 dense (1024) + learned sparse(替代 BGE + jieba/BM25)
   - RRFRanker 融合 dense/sparse 两路(search_report 元数据路仍用 WeightedRanker)
   - Parent-Child dedup 在应用层做(enrich_with_parent,Lite 不支持 group_by_field,
     且 NULL 字段分组陷阱,统一应用层处理更稳)
@@ -21,7 +21,7 @@ FinAgent Retriever (V3 · Milvus 版)
   - search_industry 走 V3 Parent-Child 复用(255 别名 Child + industry Parent)
 
 依赖:
-  pip install pymilvus sentence-transformers
+  pip install pymilvus "pymilvus[model]" FlagEmbedding
 
 V1 FAISS 版本备份在 hybrid_search_legacy_faiss.py,不建议继续使用。
 """
@@ -46,16 +46,15 @@ ROOT = _find_project_root()
 # ============ 默认路径配置 ============
 DEFAULT_COLLECTION = "finagent"
 DEFAULT_DB_PATH = ROOT / "data/processed/milvus_finagent.db"
-DEFAULT_BM25_PATH = ROOT / "data/processed/bm25_ef.pkl"
-DEFAULT_ENCODER = "./models/bge-base-zh-v1.5"
+DEFAULT_ENCODER = "./models/bge-m3"
 
 # search_report 上下文预算(字符数):Qwen2.5-14B 32K 窗口,留给单次 observation ~12K 字符
 # 策略见 docs/Chunk_Alignment_20260420.md 14.x:建库时 HTML→Markdown + 预算截取,不硬截 Parent
 SEARCH_REPORT_BUDGET_CHARS = 12000
 
-# BGE-zh-v1.5 官方 asymmetric retrieval:query 端加 instruction,doc 端不加
-# 不加会损失 1-2% 召回。index 端保持不加(见 05_build_index.py)
-_BGE_QUERY_PREFIX = "为这个句子生成表示以用于检索相关文章:"
+# bge-m3 unified retrieval:模型一次 forward 同时输出 dense(1024)和 learned sparse。
+# 不再走 jieba + BM25 路径 —— sparse 由模型自己训出的 lexical weights 决定,
+# 对中文金融术语的精确匹配比 BM25 的 tf-idf 更准,无 OOV(XLM-R BPE 子词覆盖全)。
 
 # 期间匹配 boost:query 含期间关键词(三季报/中报/年报)时,report_title 含同期间的 pdf 额外加分
 # 解决 BGE/BM25 无法区分 "用户问 Q3 实际" vs "某 pdf 里提到 Q3 回顾"的问题
@@ -71,9 +70,60 @@ _TIME_PERIOD_GROUPS = (
 _TIME_BOOST = 0.06
 
 
+def _sparse_to_dict(sp):
+    """
+    单行 sparse → {int: float} dict(Milvus SPARSE 要求升序)
+    兼容:dict / scipy csr_matrix / csr_array / coo_matrix / coo_array
+    注意:如果是多行 sparse (N, V) with N > 1,indices/data 覆盖所有行,调用方须保证单行。
+    """
+    if isinstance(sp, dict):
+        return {int(k): float(v) for k, v in sp.items()}
+    if hasattr(sp, 'tocsr'):
+        try:
+            sp = sp.tocsr()
+        except Exception:
+            pass
+    if hasattr(sp, 'indices') and hasattr(sp, 'data'):
+        pairs = sorted(
+            ((int(k), float(v)) for k, v in zip(sp.indices, sp.data)),
+            key=lambda kv: kv[0],
+        )
+        return dict(pairs)
+    if hasattr(sp, 'col') and hasattr(sp, 'data'):   # coo 兜底
+        pairs = sorted(
+            ((int(k), float(v)) for k, v in zip(sp.col, sp.data)),
+            key=lambda kv: kv[0],
+        )
+        return dict(pairs)
+    raise ValueError(f"unsupported sparse format: {type(sp)}")
+
+
+def _sparse_from_row(sp_raw, row_idx: int = 0):
+    """
+    从 embedding 模型返回的 sparse 里取第 row_idx 行 → dict{int: float}。
+    handle:list[dict] / 2D sparse (1, V) 或 (N, V) / 1D sparse
+    """
+    if isinstance(sp_raw, list):
+        return {int(k): float(v) for k, v in sp_raw[row_idx].items()}
+    if hasattr(sp_raw, 'tocsr'):
+        try:
+            csr = sp_raw.tocsr()
+            if hasattr(csr, 'indptr') and getattr(csr, 'ndim', 2) == 2 and csr.shape[0] > 1:
+                start = int(csr.indptr[row_idx])
+                end = int(csr.indptr[row_idx + 1])
+                pairs = sorted(
+                    ((int(k), float(v)) for k, v in zip(csr.indices[start:end], csr.data[start:end])),
+                    key=lambda kv: kv[0],
+                )
+                return dict(pairs)
+        except Exception:
+            pass
+    return _sparse_to_dict(sp_raw)
+
+
 class FinAgentRetriever:
     """
-    V3 Milvus 版统一检索器。无参构造自动加载默认 DB + BM25 + BGE。
+    V3 Milvus 版统一检索器。无参构造自动加载默认 DB + bge-m3。
 
     三种部署:
         Lite (默认):    MilvusClient("./data/processed/milvus_finagent.db")
@@ -164,7 +214,6 @@ class FinAgentRetriever:
         collection: str = DEFAULT_COLLECTION,
         db_path: Optional[str] = None,
         uri: Optional[str] = None,
-        bm25_path: Optional[str] = None,
         encoder_model: str = DEFAULT_ENCODER,
         enrich_parents: bool = True,
     ):
@@ -182,35 +231,18 @@ class FinAgentRetriever:
         self.collection = collection
         self.enrich_parents = enrich_parents
 
-        # BGE dense encoder
-        from sentence_transformers import SentenceTransformer
-        logger.info(f"加载 BGE encoder: {encoder_model}")
-        self.encoder = SentenceTransformer(encoder_model)
-
-        # BM25 sparse(加载 05 时 fit 保存的模型)
-        from pymilvus.model.sparse import BM25EmbeddingFunction
-        from pymilvus.model.sparse.bm25.tokenizers import build_default_analyzer
-        self.bm25_ef = BM25EmbeddingFunction(build_default_analyzer(language="zh"))
-        bm25p = bm25_path or str(DEFAULT_BM25_PATH)
-        if Path(bm25p).exists():
-            # pymilvus 2.5+ 是 load(),2.4.x 是 load_from_file(),兼容两种
-            if hasattr(self.bm25_ef, 'load'):
-                self.bm25_ef.load(bm25p)
-            elif hasattr(self.bm25_ef, 'load_from_file'):
-                self.bm25_ef.load_from_file(bm25p)
-            else:
-                import pickle
-                with open(bm25p, 'rb') as f:
-                    self.bm25_ef = pickle.load(f)
-            logger.info(f"BM25 模型加载: {bm25p}")
-        else:
-            logger.warning(f"⚠️  BM25 模型 {bm25p} 不存在,sparse 检索不可用(只有 dense)")
+        # bge-m3:dense + native sparse 一体化(替代 BGE dense + jieba/BM25 两路)
+        from pymilvus.model.hybrid import BGEM3EmbeddingFunction
+        logger.info(f"加载 bge-m3 encoder: {encoder_model}")
+        self.m3_ef = BGEM3EmbeddingFunction(
+            model_name=encoder_model, device="cuda:0", use_fp16=True,
+        )
 
         # 扁平 alias → industry map(快路径:字典命中优先,否则向量 fallback)
         self._alias_to_industry = self._flatten_aliases()
         logger.info(f"行业别名字典: {len(self._alias_to_industry)} 个别名")
 
-        logger.info("✅ FinAgentRetriever (V3 Milvus) 就绪")
+        logger.info("✅ FinAgentRetriever (V3 Milvus + bge-m3) 就绪")
 
     # ============ helpers ============
 
@@ -235,24 +267,18 @@ class FinAgentRetriever:
     def _embed(self, query: str) -> tuple[list, dict]:
         """query → (dense 向量 list, sparse {col: weight} dict)
 
-        BGE 端拼 query instruction(asymmetric retrieval),doc 端不拼。
-        防重复:如果 query 已经以 prefix 开头(LLM 偶尔复述),不再拼一次。
-        空 sparse(query 全被 jieba 停用词/OOV 过滤)注入占位,避免 AnnSearchRequest ParamError。
+        bge-m3 一次 forward 同时输出 dense + learned sparse。
+        不需要 query prefix(bge-m3 多语言训练,无 asymmetric 要求),
+        不需要 jieba 分词(XLM-R BPE 覆盖全)。
         """
-        q_with_prefix = query if query.startswith(_BGE_QUERY_PREFIX) else _BGE_QUERY_PREFIX + query
-        dense = self.encoder.encode(
-            [q_with_prefix], normalize_embeddings=True
-        )[0].tolist()
-
-        sparse_csr = self.bm25_ef.encode_queries([query])
-        start, end = sparse_csr.indptr[0], sparse_csr.indptr[1]
-        sparse = {
-            int(k): float(v)
-            for k, v in zip(sparse_csr.indices[start:end],
-                            sparse_csr.data[start:end])
-        }
+        result = self.m3_ef.encode_queries([query])
+        # dense 可能是 list[ndarray] 或 ndarray (1, D)
+        d0 = result["dense"][0]
+        dense = d0.tolist() if hasattr(d0, 'tolist') else list(d0)
+        # sparse 可能是 list[dict] / csr / coo,统一取第 0 行转 dict
+        sparse = _sparse_from_row(result["sparse"])
         if not sparse:
-            logger.warning(f"BM25 query 全被过滤: {query!r},用占位 sparse")
+            logger.warning(f"bge-m3 query sparse 空: {query!r},用占位 sparse")
             sparse = {0: 1e-6}
         return dense, sparse
 
