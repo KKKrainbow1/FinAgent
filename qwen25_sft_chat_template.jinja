@@ -1,0 +1,93 @@
+{#-
+  Qwen2.5-14B-Instruct SFT chat_template (V4 patched)
+  ============================================================================
+  基于 Qwen2.5-14B-Instruct 官方 tokenizer_config.json 的 chat_template,
+  在 assistant 分支包 `{% generation %}...{% endgeneration %}` 标签,
+  让 TRL SFTTrainer 的 `assistant_only_loss=True` 自动做 loss masking,
+  替代 11_sft_train.py 原来的手写 token-level mask 逻辑(~100 行)。
+
+  关键改动(相对官方版本):
+    1. 拆分原联合分支:
+       原: `{%- if user or system(非首) or assistant(无 tool_calls) %}`
+       新: 三个独立分支,其中两个 assistant 分支分别包 generation
+    2. 两个 assistant 分支都包 generation:
+       - `{%- elif message.role == "assistant" and not message.tool_calls %}` —
+         最终回答步,content 是答案
+       - `{%- elif message.role == "assistant" %}` — 有 tool_calls,含 thought + 工具调用
+    3. `<|im_start|>assistant` 在 generation 外(这是 template 的 role prompt)
+       `<|im_end|>` 在 generation 内(这是模型要学习生成的结束 token)
+       `<|im_end|>` 后的 `\n` 在 generation 外(消息分隔符)
+    4. user / system / tool(observation) 分支全部在 generation 外
+       → TRL 自动把这些 token 的 label 设为 -100,不算 loss
+
+  推理期(vLLM 等)不会被影响:chat_template 用 `{% generation %}` 标签在
+  `apply_chat_template(return_assistant_tokens_mask=True)` 时才产生 mask,
+  推理期调用路径不传该参数,标签对生成的文本无影响。
+
+  归档:backup/finagent_repo/qwen25_sft_chat_template.jinja(随 git 追踪)
+-#}
+{%- if tools %}
+    {{- '<|im_start|>system\n' }}
+    {%- if messages[0]['role'] == 'system' %}
+        {{- messages[0]['content'] }}
+    {%- else %}
+        {{- 'You are Qwen, created by Alibaba Cloud. You are a helpful assistant.' }}
+    {%- endif %}
+    {{- "\n\n# Tools\n\nYou may call one or more functions to assist with the user query.\n\nYou are provided with function signatures within <tools></tools> XML tags:\n<tools>" }}
+    {%- for tool in tools %}
+        {{- "\n" }}
+        {{- tool | tojson }}
+    {%- endfor %}
+    {{- "\n</tools>\n\nFor each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:\n<tool_call>\n{\"name\": <function-name>, \"arguments\": <args-json-object>}\n</tool_call><|im_end|>\n" }}
+{%- else %}
+    {%- if messages[0]['role'] == 'system' %}
+        {{- '<|im_start|>system\n' + messages[0]['content'] + '<|im_end|>\n' }}
+    {%- else %}
+        {{- '<|im_start|>system\nYou are Qwen, created by Alibaba Cloud. You are a helpful assistant.<|im_end|>\n' }}
+    {%- endif %}
+{%- endif %}
+{%- for message in messages %}
+    {%- if message.role == "user" or (message.role == "system" and not loop.first) %}
+        {{- '<|im_start|>' + message.role + '\n' + message.content + '<|im_end|>' + '\n' }}
+    {%- elif message.role == "assistant" and not message.tool_calls %}
+        {#- V4: 最终回答步(不调工具),content 是最终分析报告 -#}
+        {{- '<|im_start|>assistant\n' }}
+        {%- generation %}
+        {{- message.content + '<|im_end|>' }}
+        {%- endgeneration %}
+        {{- '\n' }}
+    {%- elif message.role == "assistant" %}
+        {#- V4: 推理步(有 tool_calls),content 是 thought,tool_calls 是工具调用 -#}
+        {{- '<|im_start|>assistant' }}
+        {%- generation %}
+        {%- if message.content %}
+            {{- '\n' + message.content }}
+        {%- endif %}
+        {%- for tool_call in message.tool_calls %}
+            {%- if tool_call.function is defined %}
+                {%- set tool_call = tool_call.function %}
+            {%- endif %}
+            {{- '\n<tool_call>\n{"name": "' }}
+            {{- tool_call.name }}
+            {{- '", "arguments": ' }}
+            {{- tool_call.arguments | tojson }}
+            {{- '}\n</tool_call>' }}
+        {%- endfor %}
+        {{- '<|im_end|>' }}
+        {%- endgeneration %}
+        {{- '\n' }}
+    {%- elif message.role == "tool" %}
+        {%- if (loop.index0 == 0) or (messages[loop.index0 - 1].role != "tool") %}
+            {{- '<|im_start|>user' }}
+        {%- endif %}
+        {{- '\n<tool_response>\n' }}
+        {{- message.content }}
+        {{- '\n</tool_response>' }}
+        {%- if loop.last or (messages[loop.index0 + 1].role != "tool") %}
+            {{- '<|im_end|>\n' }}
+        {%- endif %}
+    {%- endif %}
+{%- endfor %}
+{%- if add_generation_prompt %}
+    {{- '<|im_start|>assistant\n' }}
+{%- endif %}
