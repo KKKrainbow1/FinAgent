@@ -90,40 +90,41 @@ def build_schema(client):
     schema.add_field("text",          DataType.VARCHAR, max_length=4096)
 
     # Scalar (filter/group_by 用,各 source_type 共享)
+    # milvus-lite 不支持 nullable(PR #332 至今未合并),全部用 sentinel:VARCHAR="",INT16=-1
     schema.add_field("source_type",   DataType.VARCHAR, max_length=32)
-    schema.add_field("chunk_method",  DataType.VARCHAR, max_length=32,  nullable=True)
-    schema.add_field("stock_code",    DataType.VARCHAR, max_length=16,  nullable=True)
-    schema.add_field("stock_name",    DataType.VARCHAR, max_length=64,  nullable=True)
-    schema.add_field("institution",   DataType.VARCHAR, max_length=128, nullable=True)
-    schema.add_field("date",          DataType.VARCHAR, max_length=24,  nullable=True)
-    schema.add_field("industry",      DataType.VARCHAR, max_length=64,  nullable=True)
-    schema.add_field("rating",        DataType.VARCHAR, max_length=32,  nullable=True)
-    schema.add_field("report_title",  DataType.VARCHAR, max_length=256, nullable=True)
-    schema.add_field("page_idx",      DataType.INT16,                   nullable=True)
+    schema.add_field("chunk_method",  DataType.VARCHAR, max_length=32)
+    schema.add_field("stock_code",    DataType.VARCHAR, max_length=16)
+    schema.add_field("stock_name",    DataType.VARCHAR, max_length=64)
+    schema.add_field("institution",   DataType.VARCHAR, max_length=128)
+    schema.add_field("date",          DataType.VARCHAR, max_length=24)
+    schema.add_field("industry",      DataType.VARCHAR, max_length=64)
+    schema.add_field("rating",        DataType.VARCHAR, max_length=32)
+    schema.add_field("report_title",  DataType.VARCHAR, max_length=256)
+    schema.add_field("page_idx",      DataType.INT16)
     # 原始 PDF 文件名(_external_rrf 按 pdf_file 聚合用,同 PDF 多 chunk 共享 RRF 分数)
-    schema.add_field("pdf_file",      DataType.VARCHAR, max_length=256,  nullable=True)
+    schema.add_field("pdf_file",      DataType.VARCHAR, max_length=256)
     # 解析器 / 数据类型 / 表格类型 等语义标签(之前被 enable_dynamic_field=False silent drop)
-    schema.add_field("parser",          DataType.VARCHAR, max_length=32,  nullable=True)
-    schema.add_field("data_type",       DataType.VARCHAR, max_length=32,  nullable=True)
-    schema.add_field("chunk_index",     DataType.INT16,                    nullable=True)
-    schema.add_field("table_type",      DataType.VARCHAR, max_length=64,  nullable=True)
-    schema.add_field("header_type",     DataType.VARCHAR, max_length=32,  nullable=True)
-    schema.add_field("current_section", DataType.VARCHAR, max_length=256, nullable=True)
+    schema.add_field("parser",          DataType.VARCHAR, max_length=32)
+    schema.add_field("data_type",       DataType.VARCHAR, max_length=32)
+    schema.add_field("chunk_index",     DataType.INT16)
+    schema.add_field("table_type",      DataType.VARCHAR, max_length=64)
+    schema.add_field("header_type",     DataType.VARCHAR, max_length=32)
+    schema.add_field("current_section", DataType.VARCHAR, max_length=256)
 
     # Parent-Child 关联 + 冗余(Table;建库时 HTML→Markdown,密度 ×3-5,8192 够用)
-    schema.add_field("parent_id",      DataType.VARCHAR, max_length=256,  nullable=True)
-    schema.add_field("parent_md",      DataType.VARCHAR, max_length=8192, nullable=True)
-    schema.add_field("table_caption",  DataType.VARCHAR, max_length=512,  nullable=True)
-    schema.add_field("table_footnote", DataType.VARCHAR, max_length=512,  nullable=True)
+    schema.add_field("parent_id",      DataType.VARCHAR, max_length=256)
+    schema.add_field("parent_md",      DataType.VARCHAR, max_length=8192)
+    schema.add_field("table_caption",  DataType.VARCHAR, max_length=512)
+    schema.add_field("table_footnote", DataType.VARCHAR, max_length=512)
 
     # Parent-Child 关联 + 冗余(Prose)
-    schema.add_field("section_id",    DataType.VARCHAR, max_length=256,  nullable=True)
-    schema.add_field("section_title", DataType.VARCHAR, max_length=256,  nullable=True)
-    schema.add_field("section_text",  DataType.VARCHAR, max_length=8192, nullable=True)
+    schema.add_field("section_id",    DataType.VARCHAR, max_length=256)
+    schema.add_field("section_title", DataType.VARCHAR, max_length=256)
+    schema.add_field("section_text",  DataType.VARCHAR, max_length=8192)
 
     # Industry(V3 alias + industry_comparison 聚合)
-    schema.add_field("stock_codes",   DataType.VARCHAR, max_length=2048, nullable=True)
-    schema.add_field("company_count", DataType.INT16,                    nullable=True)
+    schema.add_field("stock_codes",   DataType.VARCHAR, max_length=2048)
+    schema.add_field("company_count", DataType.INT16)
 
     return schema
 
@@ -161,11 +162,16 @@ def _truncate(s, max_len):
     return s[:max_len] if len(s) > max_len else s
 
 
-def _nullable(s, max_len):
-    """nullable VARCHAR:空串 / None 统一返回 None,避免 Milvus filter 的 == "" vs is null 双路径"""
-    if s is None or s == "":
-        return None
+def _varchar(s, max_len):
+    """VARCHAR sentinel:None / 空串 → "",避免 milvus-lite 不支持 nullable 的限制"""
+    if s is None:
+        return ""
     return _truncate(s, max_len)
+
+
+# INT16 sentinel:page_idx / chunk_index / company_count 缺失时用 -1
+# 业务上 page_idx 最小 0、chunk_index 最小 0、company_count 最小 2,-1 不会与真实值冲突
+_INT_MISSING = -1
 
 
 def _csr_row_to_dict(csr, row_idx):
@@ -196,48 +202,48 @@ def chunk_to_row(chunk: dict, global_idx: int,
     if isinstance(stock_codes, list):
         stock_codes = ','.join(stock_codes)
 
-    # page_idx / company_count / chunk_index 是 nullable INT16,保留 None 避免和真实 -1/0 混淆
+    # INT16 缺失用 -1 sentinel(page_idx/chunk_index 业务范围 ≥0,company_count ≥2)
     page_idx = m.get('page_idx')
-    page_idx = int(page_idx) if page_idx is not None else None
+    page_idx = int(page_idx) if page_idx is not None else _INT_MISSING
     company_count = m.get('company_count')
-    company_count = int(company_count) if company_count is not None else None
+    company_count = int(company_count) if company_count is not None else _INT_MISSING
     chunk_index = m.get('chunk_index')
-    chunk_index = int(chunk_index) if chunk_index is not None else None
+    chunk_index = int(chunk_index) if chunk_index is not None else _INT_MISSING
 
     dense_list = dense_vec.tolist() if hasattr(dense_vec, 'tolist') else list(dense_vec)
 
     return {
-        # non-nullable:chunk_id / text / source_type 必须有值
+        # 必填:chunk_id / text / source_type
         "chunk_id":       _truncate(chunk_id, 256),
         "dense":          dense_list,
         "sparse":         _csr_row_to_dict(sparse_csr, sparse_row_idx),
         "text":           _truncate(chunk.get('text', ''), 4096),
         "source_type":    _truncate(source_type, 32),
-        # nullable VARCHAR:空串统一转 None,避免 filter 双路径
-        "chunk_method":   _nullable(m.get('chunk_method'),   32),
-        "stock_code":     _nullable(m.get('stock_code'),     16),
-        "stock_name":     _nullable(m.get('stock_name'),     64),
-        "institution":    _nullable(m.get('institution'),    128),
-        "date":           _nullable(m.get('date'),           24),
-        "industry":       _nullable(m.get('industry'),       64),
-        "rating":         _nullable(m.get('rating'),         32),
-        "report_title":   _nullable(m.get('report_title'),   256),
+        # 可选 VARCHAR:缺失用 "" sentinel(查询侧 `x or ''` / `if x:` 已是 null-safe)
+        "chunk_method":   _varchar(m.get('chunk_method'),   32),
+        "stock_code":     _varchar(m.get('stock_code'),     16),
+        "stock_name":     _varchar(m.get('stock_name'),     64),
+        "institution":    _varchar(m.get('institution'),    128),
+        "date":           _varchar(m.get('date'),           24),
+        "industry":       _varchar(m.get('industry'),       64),
+        "rating":         _varchar(m.get('rating'),         32),
+        "report_title":   _varchar(m.get('report_title'),   256),
         "page_idx":       page_idx,
-        "pdf_file":       _nullable(m.get('pdf_file'),       256),
-        "parser":         _nullable(m.get('parser'),          32),
-        "data_type":      _nullable(m.get('data_type'),       32),
+        "pdf_file":       _varchar(m.get('pdf_file'),       256),
+        "parser":         _varchar(m.get('parser'),          32),
+        "data_type":      _varchar(m.get('data_type'),       32),
         "chunk_index":    chunk_index,
-        "table_type":     _nullable(m.get('table_type'),      64),
-        "header_type":    _nullable(m.get('header_type'),     32),
-        "current_section":_nullable(m.get('current_section'), 256),
-        "parent_id":      _nullable(m.get('parent_id'),      256),
-        "parent_md":      _nullable(m.get('parent_md'),        8192),
-        "table_caption":  _nullable(m.get('table_caption') or m.get('caption'), 512),
-        "table_footnote": _nullable(m.get('table_footnote'),   512),
-        "section_id":     _nullable(m.get('section_id'),     256),
-        "section_title":  _nullable(m.get('section_title'),  256),
-        "section_text":   _nullable(m.get('section_text'),   8192),
-        "stock_codes":    _nullable(stock_codes,             2048),
+        "table_type":     _varchar(m.get('table_type'),      64),
+        "header_type":    _varchar(m.get('header_type'),     32),
+        "current_section":_varchar(m.get('current_section'), 256),
+        "parent_id":      _varchar(m.get('parent_id'),      256),
+        "parent_md":      _varchar(m.get('parent_md'),        8192),
+        "table_caption":  _varchar(m.get('table_caption') or m.get('caption'), 512),
+        "table_footnote": _varchar(m.get('table_footnote'),   512),
+        "section_id":     _varchar(m.get('section_id'),     256),
+        "section_title":  _varchar(m.get('section_title'),  256),
+        "section_text":   _varchar(m.get('section_text'),   8192),
+        "stock_codes":    _varchar(stock_codes,             2048),
         "company_count":  company_count,
     }
 
