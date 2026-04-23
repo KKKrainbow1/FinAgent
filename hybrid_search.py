@@ -492,7 +492,8 @@ class FinAgentRetriever:
 
     @staticmethod
     def _external_rrf(list_a: list, list_b: list, k: int = 60,
-                      top_k: int = 30) -> list[dict]:
+                      top_k: int = 30,
+                      max_chunks_per_pdf: int = 5) -> list[dict]:
         """
         按**研报身份(pdf_file)**聚合 RRF 融合两路结果。
 
@@ -509,10 +510,12 @@ class FinAgentRetriever:
           确保不会被错误聚合(和其他类型 chunk 分离)。
 
           返回 flat list,同 PDF 的 chunks 连续排布(meta 先、body 后,便于 LLM 阅读顺序)。
-        """
-        scores = {}           # key → 累加 RRF 分
-        items = {}            # key → [chunk1, chunk2, ...](同 key 可能多 chunk)
 
+        P0b 补丁(max_chunks_per_pdf):
+          同一 pdf 最多累加 rank 最高的 N 条 chunk 的 RRF 分,防止 row_fact 多的研报
+          靠 chunk 数量(14 条 vs 10 条)在累加分上碾压 row_fact 少但内容更相关的研报。
+          items 仍保留全部 chunk 供后续 enrich_with_parent 展开。
+        """
         def _key(chunk):
             m = chunk.get('metadata', {})
             return m.get('pdf_file') or m.get('chunk_id') or id(chunk)
@@ -520,14 +523,21 @@ class FinAgentRetriever:
         def _is_meta(chunk):
             return chunk.get('metadata', {}).get('source_type') == 'report'
 
+        # 按 pdf 收集所有命中 (rank, chunk)
+        pdf_hits = {}   # key → [(rank, chunk), ...]
         for rank, c in enumerate(list_a):
-            key = _key(c)
-            scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
-            items.setdefault(key, []).append(c)
+            pdf_hits.setdefault(_key(c), []).append((rank, c))
         for rank, c in enumerate(list_b):
-            key = _key(c)
-            scores[key] = scores.get(key, 0) + 1 / (k + rank + 1)
-            items.setdefault(key, []).append(c)
+            pdf_hits.setdefault(_key(c), []).append((rank, c))
+
+        # 每 pdf 仅累加 rank 最小(最相关)的前 N 条 chunk;items 保留全部
+        scores = {}
+        items = {}
+        for key, hits in pdf_hits.items():
+            hits_sorted = sorted(hits, key=lambda x: x[0])
+            top = hits_sorted[:max_chunks_per_pdf]
+            scores[key] = sum(1 / (k + r + 1) for r, _ in top)
+            items[key] = [c for _, c in hits_sorted]
 
         # 按 PDF-level 分数倒序;同一 PDF 内部 meta 先、body 后(给 LLM 的阅读顺序)
         ordered_keys = sorted(scores.keys(), key=lambda x: -scores[x])
