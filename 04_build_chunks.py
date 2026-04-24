@@ -576,6 +576,23 @@ def _collect_sections(blocks: list[dict], pdf_stem: str) -> list[dict]:
     return sections
 
 
+def _extract_period_from_title(title: str) -> str:
+    """从 report_title 字面抽"年报/中报/三季报/一季报"独立 token。
+    只认字面关键词,不按 date 推断,避免"年度销量点评"这类主题研报被误标。"""
+    t = title or ''
+    if not t:
+        return ""
+    if '三季报' in t or '三季度' in t or '前三季度' in t or '3季报' in t:
+        return "三季报"
+    if '一季报' in t or '一季度' in t or '1季报' in t:
+        return "一季报"
+    if '中报' in t or '半年报' in t or '半年度' in t or '二季报' in t or '二季度' in t:
+        return "中报"
+    if '年报' in t or '年度报告' in t or '年度业绩' in t or '全年业绩' in t:
+        return "年报"
+    return ""
+
+
 def _fixed_window_chunks(section: dict, base_metadata: dict,
                          chunk_size: int = 300, overlap: int = 60) -> list[dict]:
     """
@@ -592,11 +609,13 @@ def _fixed_window_chunks(section: dict, base_metadata: dict,
         'page_idx':      section.get('page_idx', -1),
     }
 
-    # 前缀注入 [股票名 日期 研报标题]:embedding + BM25 都能看到 chunk 来源身份,
-    # 解决 Q28/Q35/Q36 跨股召回(正文 chunk 里股票名不出现 → 同类财务叙述被 ANN 混选)
+    # 前缀注入 [股票名 日期 期间 研报标题]:embedding + BM25 都能看到 chunk 来源身份,
+    # 解决跨股召回(Q28/Q35/Q36) + 期间词独立 token(让 query "三季报" 直接命中)
+    period = _extract_period_from_title(base_metadata.get('report_title') or '')
     header_parts = [
         base_metadata.get('stock_name') or '',
         base_metadata.get('date') or '',
+        period,
         base_metadata.get('report_title') or '',
     ]
     header_parts = [p for p in header_parts if p]
