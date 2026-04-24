@@ -214,7 +214,8 @@ def build_report_chunks(report_path: str,
 # ============ PDF正文 Chunk 构建 ============
 
 def build_fulltext_chunks(parser: str, pdf_map_path: str = None,
-                          chunk_size: int = 512, overlap: int = 64) -> list[dict]:
+                          chunk_size: int = 512, overlap: int = 64,
+                          since: str = '2024-01-01') -> list[dict]:
     """
     加载解析器输出的全文JSON，切分为检索chunks（滑动窗口）
 
@@ -222,6 +223,11 @@ def build_fulltext_chunks(parser: str, pdf_map_path: str = None,
     答：512是经验值。256太短一段分析可能被切断，1024太长检索时混入无关信息。
     消融实验R-1会验证 {256, 512, 768, 1024} 的效果差异。
     overlap=64（约12.5%）保证上下文不断裂。
+
+    2026-04-26 加日期硬过滤(默认 >= 2024-01-01):
+    对齐 build_report_chunks 的 since 窗口,防止 2022-2023 年残留 PDF(原 02 下载
+    MAX_PER_STOCK=5 按日期倒序导致的零星残留,全量 65 份)污染召回。
+    pdf_map 里缺 date 的 PDF 也一律跳过。
     """
     result_file = PARSER_RESULT_FILES.get(parser)
     if not result_file or not os.path.exists(result_file):
@@ -239,6 +245,8 @@ def build_fulltext_chunks(parser: str, pdf_map_path: str = None,
             pdf_map = json.load(f)
 
     all_chunks = []
+    filtered_by_date = 0
+    filtered_missing_date = 0
     for item in tqdm(results, desc=f"构建{parser}正文chunks"):
         filename = item["file"]
         text = item["text"]
@@ -256,6 +264,18 @@ def build_fulltext_chunks(parser: str, pdf_map_path: str = None,
 
         # 从 pdf_map 获取元数据
         meta = pdf_map.get(filename, {})
+        # date 防御性 normalize:历史 pdf_map 可能是 str(Timestamp)='YYYY-MM-DD 00:00:00'
+        # 或 ISO 'YYYY-MM-DDTHH:MM:SS',截到纯 date 避免 Milvus filter/dedup 失败
+        pdf_date = (meta.get("date") or "").split(" ")[0].split("T")[0]
+
+        # 日期硬过滤:缺 date 一律跳过;早于 since 跳过
+        if not pdf_date:
+            filtered_missing_date += 1
+            continue
+        if pdf_date < since:
+            filtered_by_date += 1
+            continue
+
         base_metadata = {
             "source_type": "report_fulltext",
             "parser": parser,
@@ -265,9 +285,7 @@ def build_fulltext_chunks(parser: str, pdf_map_path: str = None,
             "rating": _safe_str(meta.get("rating", "")),
             # industry 归一化到大类,和 build_report_chunks / build_industry_chunks 对齐
             "industry": _get_major_industry(meta.get("industry", "")),
-            # date 防御性 normalize:历史 pdf_map 可能是 str(Timestamp)='YYYY-MM-DD 00:00:00'
-            # 或 ISO 'YYYY-MM-DDTHH:MM:SS',截到纯 date 避免 Milvus filter/dedup 失败
-            "date": (meta.get("date") or "").split(" ")[0].split("T")[0],
+            "date": pdf_date,
             "report_title": _safe_str(meta.get("report_title", "")),
             "pdf_file": filename,
         }
@@ -276,7 +294,11 @@ def build_fulltext_chunks(parser: str, pdf_map_path: str = None,
         chunks = _table_aware_chunks(text, base_metadata, chunk_size, overlap)
         all_chunks.extend(chunks)
 
-    logger.info(f"PDF正文chunks ({parser}): {len(all_chunks)} 条")
+    logger.info(
+        f"PDF正文chunks ({parser}): {len(all_chunks)} 条 | "
+        f"日期过滤 (>= {since}) 跳过 {filtered_by_date} 份 | "
+        f"缺 date 跳过 {filtered_missing_date} 份"
+    )
     return all_chunks
 
 
@@ -714,7 +736,8 @@ def _build_table_parent_record(table_block: dict, base_metadata: dict,
 
 def build_fulltext_chunks_mineru(cleaned_dir: str, pdf_map_path: str = None,
                                  chunk_size: int = 300,
-                                 overlap: int = 60) -> tuple[list[dict], list[dict]]:
+                                 overlap: int = 60,
+                                 since: str = '2024-01-01') -> tuple[list[dict], list[dict]]:
     """
     消费 03d 输出的 *_content_list_cleaned.json,按 **Prose Parent-Child + fixed_window** 切 chunks。
 
@@ -725,6 +748,11 @@ def build_fulltext_chunks_mineru(cleaned_dir: str, pdf_map_path: str = None,
          Child metadata 冗余存 section_text(Parent)
       4. table block → 独立 table_parents.jsonl
       5. chart / image → 跳过(文字模型无视觉能力)
+
+    2026-04-26 加日期硬过滤(默认 >= 2024-01-01):
+    对齐 build_report_chunks / build_fulltext_chunks(Marker 路径) 的 since 窗口,
+    防止旧年份残留 PDF(02 下载 MAX_PER_STOCK=5 按日期倒序导致的零星残留)污染召回。
+    pdf_map 里缺 date 的 PDF 也一律跳过。同时 table_parents 产出也受此过滤影响。
 
     Returns:
         (chunks, parent_records)
@@ -746,11 +774,23 @@ def build_fulltext_chunks_mineru(cleaned_dir: str, pdf_map_path: str = None,
     all_chunks = []
     all_parents = []
     stats = {'chart': 0, 'image': 0, 'empty_table': 0,
-             'sections_total': 0, 'sections_kept': 0}
+             'sections_total': 0, 'sections_kept': 0,
+             'filtered_by_date': 0, 'filtered_missing_date': 0}
 
     for json_path in tqdm(cleaned_files, desc="构建 MinerU fulltext chunks"):
         stem = json_path.name.replace('_content_list_cleaned.json', '')
         pdf_file = f"{stem}.pdf"
+
+        meta = pdf_map.get(pdf_file, {})
+        pdf_date = (meta.get("date") or "").split(" ")[0].split("T")[0]
+
+        # 日期硬过滤:缺 date 跳过;早于 since 跳过
+        if not pdf_date:
+            stats['filtered_missing_date'] += 1
+            continue
+        if pdf_date < since:
+            stats['filtered_by_date'] += 1
+            continue
 
         try:
             with open(json_path, 'r', encoding='utf-8') as f:
@@ -759,7 +799,6 @@ def build_fulltext_chunks_mineru(cleaned_dir: str, pdf_map_path: str = None,
             logger.error(f"跳过 {json_path.name}: {e}")
             continue
 
-        meta = pdf_map.get(pdf_file, {})
         base_metadata = {
             "source_type": "report_fulltext",
             "parser": "mineru_cleaned",
@@ -768,8 +807,7 @@ def build_fulltext_chunks_mineru(cleaned_dir: str, pdf_map_path: str = None,
             "institution": _safe_str(meta.get("institution", "")),
             "rating": _safe_str(meta.get("rating", "")),
             "industry": _get_major_industry(meta.get("industry", "")),
-            # date 防御性 normalize(同 build_fulltext_chunks 路径,防 pdf_map 残留脏格式)
-            "date": (meta.get("date") or "").split(" ")[0].split("T")[0],
+            "date": pdf_date,
             "report_title": _safe_str(meta.get("report_title", "")),
             "pdf_file": pdf_file,
         }
@@ -816,6 +854,8 @@ def build_fulltext_chunks_mineru(cleaned_dir: str, pdf_map_path: str = None,
     logger.info(f"MinerU table parents:  {len(all_parents)} 条(不进索引,06 消费)")
     logger.info(f"  sections: {stats['sections_kept']}/{stats['sections_total']} "
                 f"(过滤假 text_level=1 后保留)")
+    logger.info(f"  日期过滤 (>= {since}) 跳过 {stats['filtered_by_date']} 份 | "
+                f"缺 date 跳过 {stats['filtered_missing_date']} 份")
     logger.info(f"  跳过: chart={stats['chart']}, image={stats['image']}, "
                 f"empty_table={stats['empty_table']}")
     # 方法分布(预期全是 fixed_window)
