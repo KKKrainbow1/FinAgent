@@ -1378,9 +1378,11 @@ def build_industry_chunks(financial_path: str, report_path: str = None) -> list[
 
 def main():
     parser = argparse.ArgumentParser(description="FinAgent Chunk 构建")
-    parser.add_argument("--parser", type=str, default="marker",
+    parser.add_argument("--parser", type=str, default="mineru_cleaned",
                         choices=["marker", "mineru", "mineru_cleaned"],
-                        help="选择PDF解析器的结果（默认 marker；mineru_cleaned = 03d 清洗后 Block-native 路径）")
+                        help="选择PDF解析器的结果(默认 mineru_cleaned = 03d 清洗后的 Block-native 路径,"
+                             "MinerU VLM 3:0 胜 Marker 见 docs/Finagent项目RAG数据库部分.md §2;"
+                             "marker 路径保留作 fallback)")
     parser.add_argument("--report_only", action="store_true")
     parser.add_argument("--financial_only", action="store_true")
     args = parser.parse_args()
