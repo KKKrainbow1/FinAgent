@@ -511,19 +511,12 @@ class FinAgentRetriever:
         meta_chunks = [self._hit_to_chunk(h) for h in meta_hits[0]]
         body_chunks = [self._hit_to_chunk(h) for h in body_hits[0]]
 
-        # chunk_method 硬分桶 rerank(P0 修复):row_fact 数量碾压 fulltext,导致用户问
-        # "2025 三季报营收" 时 top-3 被 profit_forecast row 填满、真正 Q3 fulltext 被挤出。
-        # 按 chunk_method 桶排序(桶间硬序,桶内保留 Milvus 原相关性),再进 _external_rrf,
-        # 使 fixed_window 的 RRF rank 全部小于 row_fact,分数天然领先。
-        _METHOD_BUCKET = {'fixed_window': 0, 'table_narrative': 1, 'table_row_fact': 2}
-        body_chunks = sorted(
-            enumerate(body_chunks),
-            key=lambda pair: (
-                _METHOD_BUCKET.get(pair[1].get('metadata', {}).get('chunk_method', ''), 99),
-                pair[0],   # 同桶内保持 Milvus RRF 原序
-            ),
-        )
-        body_chunks = [c for _, c in body_chunks]
+        # 注:去掉了 chunk_method 硬分桶 rerank。ablation(qwen3-max 严格 judge,30 条 query)
+        #    实证 rerank 反而让 P@5 下降 20 pp。
+        #    原设计假设"row_fact 数量碾压 fulltext"是错的:Milvus 原 RRF rank 已反映真实语义相关性,
+        #    硬分桶强行覆盖 Milvus 信号,把真正相关的 row_fact 压后,用泛化 fulltext 顶前。
+        #    真正修复期间错位用 time_boost,不用 rerank。
+        #    配合 05_build_index 里 filter 掉 table_row_fact(索引瘦身 80%),两者一起简化架构。
 
         # time boost:query 含 "三季报 / 中报 / 年报" 等期间关键词时,
         # report_title 含同期间的 pdf 得到固定 +0.03 分,反超 chunk 密度高但期间错位的 pdf

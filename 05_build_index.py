@@ -59,7 +59,7 @@ CHUNK_SOURCES = [
 # ============ 加载 chunks ============
 
 def load_all_chunks() -> list[dict]:
-    """从所有源加载 chunks"""
+    """从所有源加载 chunks,filter 掉 table_row_fact(实证无贡献,占 80% 空间)"""
     all_chunks = []
     for p in CHUNK_SOURCES:
         if not p.exists():
@@ -71,6 +71,19 @@ def load_all_chunks() -> list[dict]:
                 all_chunks.append(json.loads(line))
                 n += 1
         logger.info(f"  + {p.name}: {n} 条")
+
+    # Filter: table_row_fact 不索引
+    # 依据:qwen3-max 严格 judge ablation(30 条 query,P@5 对比):
+    #   with row_fact + rerank:    10/30 (33%)  ← 原 baseline
+    #   with row_fact + no rerank: 16/30 (53%)
+    #   no  row_fact + no rerank:  16/30 (53%)  ← 完全等价,row_fact 无贡献
+    #   no  row_fact + rerank:      8/30 (27%)  ← 最差
+    # row_fact 保留在 tabular_chunks_mineru.jsonl(未来可回滚),只是不进 Milvus 索引
+    before = len(all_chunks)
+    all_chunks = [c for c in all_chunks
+                   if c.get('metadata', {}).get('chunk_method') != 'table_row_fact']
+    filtered = before - len(all_chunks)
+    logger.info(f"  过滤 table_row_fact: {before} → {len(all_chunks)}(去掉 {filtered} 条)")
     return all_chunks
 
 
