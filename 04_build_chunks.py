@@ -592,13 +592,23 @@ def _fixed_window_chunks(section: dict, base_metadata: dict,
         'page_idx':      section.get('page_idx', -1),
     }
 
+    # 前缀注入 [股票名 日期 研报标题]:embedding + BM25 都能看到 chunk 来源身份,
+    # 解决 Q28/Q35/Q36 跨股召回(正文 chunk 里股票名不出现 → 同类财务叙述被 ANN 混选)
+    header_parts = [
+        base_metadata.get('stock_name') or '',
+        base_metadata.get('date') or '',
+        base_metadata.get('report_title') or '',
+    ]
+    header_parts = [p for p in header_parts if p]
+    header = f"[{' '.join(header_parts)}] " if header_parts else ""
+
     chunks = []
 
     # section 本身短于 chunk_size → 整块作 1 个 Child,不切
     if len(text) <= chunk_size:
         if len(text) >= 20:
             chunks.append({
-                'text': text,
+                'text': header + text,
                 'metadata': {**section_meta,
                              'chunk_id':     f"{sid}_c0",
                              'chunk_method': 'fixed_window',
@@ -614,7 +624,7 @@ def _fixed_window_chunks(section: dict, base_metadata: dict,
         ct = text[start:end].strip()
         if len(ct) >= 50:   # 尾部太短丢弃
             chunks.append({
-                'text': ct,
+                'text': header + ct,
                 'metadata': {**section_meta,
                              'chunk_id':     f"{sid}_c{idx}",
                              'chunk_method': 'fixed_window',
