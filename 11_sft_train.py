@@ -327,8 +327,8 @@ def main():
     parser.add_argument("--output_dir", type=str,
                         default="./outputs/sft_lora_v4",
                         help="输出目录")
-    parser.add_argument("--max_length", type=int, default=8192,
-                        help="最大序列长度")
+    parser.add_argument("--max_length", type=int, default=12288,
+                        help="最大序列长度(V4 升至 12288:精简 SYSTEM_PROMPT 后 5 步轨迹 ~10K tokens,12K 留 2K 余量给深度推理)")
     parser.add_argument("--epochs", type=int, default=3,
                         help="训练轮数")
     parser.add_argument("--batch_size", type=int, default=1,

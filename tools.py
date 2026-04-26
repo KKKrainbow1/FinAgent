@@ -44,19 +44,29 @@ TOOLS_NATIVE = [
         "function": {
             "name": "search_report",
             "description": (
-                "检索券商研报信息，返回机构评级、目标价、EPS预测、行业分析等。"
-                "适用于：查机构观点、投资评级、行业前景、竞争分析等。"
+                "检索**单一公司**的券商研报信息,返回机构评级、目标价、EPS 预测、深度研报观点等。\n"
+                "⚠️ 仅限单只公司或单一议题的研报观点查询。涉及行业整体趋势/同行对比时禁用本工具,改用 search_industry。\n"
+                "返回格式: '[report · - | 公司名 | 2026-XX-XX] 机构观点... 评级:... 目标价:... '\n"
+                "    或: '[report_fulltext | 公司名 | 日期] 研报正文段落...'"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "研报检索关键词，如'贵州茅台 投资评级 2025 2026'"
+                        "description": (
+                            "研报检索关键词。建议结构: '<公司名> <主题/指标关键词> <期别>'。"
+                            "示例见 examples 字段。"
+                        ),
+                        "examples": [
+                            "贵州茅台 投资评级 目标价 2025 2026",
+                            "宁德时代 业绩点评 2025H1",
+                            "招商银行 深度研报 净息差预期"
+                        ]
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "返回结果数量，默认5，上限20",
+                        "description": "返回结果数量,默认 5,上限 20",
                         "default": 5,
                         "minimum": 1,
                         "maximum": 20
@@ -71,19 +81,31 @@ TOOLS_NATIVE = [
         "function": {
             "name": "search_financial",
             "description": (
-                "检索公司财务数据，返回ROE、毛利率、营收增长率、资产负债率等指标。"
-                "适用于：查具体财务数据、盈利能力、偿债能力、运营效率等。"
+                "检索**单一公司**的财务数据,返回 ROE / ROA / 毛利率 / 净利率 / 营收增长率 / 资产负债率 / "
+                "杜邦三因子 / 周转率 等 80+ 指标(中国 A 股财报口径)。\n"
+                "⚠️ 仅限单只公司查询。涉及行业对比/同行排名/行业均值时**禁用本工具**,必须用 search_industry。\n"
+                "⚠️ 银行/保险/证券类公司**不要用毛利率**(用 NIM / 综合成本率 / 经纪业务收入 等行业专属指标)。\n"
+                "返回格式: '[financial · profitability | 公司 | 2024-12-31] ROE 36.99%, 毛利率 91.93%...'\n"
+                "    多 chunk 拼接,subtype 标签:profitability / balance_structure / dupont 等"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "财务数据检索关键词，如'宁德时代 ROE 毛利率 2024'"
+                        "description": (
+                            "财务数据检索关键词。建议结构: '<公司名> <指标关键词> <期别>'。"
+                            "期别可选 2024H1 / 2024年报 / 2025H1 / 2025年报。"
+                        ),
+                        "examples": [
+                            "贵州茅台 ROE 毛利率 2025年报",
+                            "宁德时代 杜邦分析 2024年报",
+                            "招商银行 NIM 拨备覆盖率 ROA"
+                        ]
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "返回结果数量，默认5，上限20",
+                        "description": "返回结果数量,默认 5,上限 20",
                         "default": 5,
                         "minimum": 1,
                         "maximum": 20
@@ -98,25 +120,33 @@ TOOLS_NATIVE = [
         "function": {
             "name": "search_industry",
             "description": (
-                "检索行业对比数据，返回同行业多家公司的关键指标对比表（ROE、净利率、"
-                "周转率、资产负债率、营收增长率等）和行业均值。"
-                "适用于：行业分析、同行对比、行业排名、行业趋势等。"
-                "query 中必须包含以下行业名之一：白酒、银行、保险、证券、半导体、消费电子、"
+                "检索**行业级**对比数据 —— 同行业多家公司核心指标对比表 + 行业均值。\n"
+                "⚠️ 涉及行业分析/同行对比/行业排名/行业均值/行业趋势时**必须**用本工具,"
+                "禁止用 search_financial 逐个查公司(效率低且 V3 已知失败模式)。\n"
+                "query 必须包含以下 30 个行业名之一:白酒、银行、保险、证券、半导体、消费电子、"
                 "光伏、电池、汽车、医药、医疗、家电、化工、煤炭、钢铁、有色金属、电力、"
                 "军工、机械、房地产、建筑建材、食品饮料、软件、通信、交通运输、传媒、"
-                "农业、石油石化、零售。"
-                "示例：search_industry(query='光伏行业 ROE 盈利能力')"
+                "农业、石油石化、零售、纺织服装。\n"
+                "返回格式: '[industry | 行业名 | N家公司] 包含 N 家公司逐项指标对比表 + 行业均值'"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "行业检索关键词，必须包含行业名，如'银行行业 ROE 对比'、'光伏 盈利能力'"
+                        "description": (
+                            "行业检索关键词。建议结构: '<行业名> <对比维度>'。"
+                            "必须含 30 个行业名之一。"
+                        ),
+                        "examples": [
+                            "银行行业 ROE 资产负债率 对比",
+                            "光伏 盈利能力 行业均值",
+                            "白酒 周转率 营运能力"
+                        ]
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "返回结果数量，默认5，上限20",
+                        "description": "返回结果数量,默认 5,上限 20",
                         "default": 5,
                         "minimum": 1,
                         "maximum": 20
@@ -131,21 +161,31 @@ TOOLS_NATIVE = [
         "function": {
             "name": "calculate",
             "description": (
-                "计算数学表达式。所有涉及数值计算的场景（同比增长率、行业均值、"
-                "PE/PB、杜邦分析等）都必须使用此工具，禁止在 Thought 中心算。"
+                "计算数学表达式。\n"
+                "⭐ **硬规则**:expression 中**每个数字必须出自前面 tool message 的 observation**,"
+                "禁止使用模型先验/估算数字。任何无法在 observation 中字面匹配的数字一律不允许出现在 expression 里。\n"
+                "⚠️ 所有涉及数值计算的场景(同比增长率、行业均值、PE/PB、杜邦验证、敏感性分析等)"
+                "都必须使用本工具,**禁止在 Thought 中心算**。\n"
                 "支持加减乘除、百分比、括号。"
-                "示例：calculate(expression='(1505 - 1294) / 1294 * 100') → 16.31"
             ),
             "parameters": {
                 "type": "object",
                 "properties": {
                     "expression": {
                         "type": "string",
-                        "description": "纯数学表达式，如 '(1505 - 1294) / 1294 * 100'"
+                        "description": (
+                            "纯数学表达式。每个数字必须可溯源到前面 observation。"
+                            "禁止使用模型估算或经验值。"
+                        ),
+                        "examples": [
+                            "(1505 - 1294) / 1294 * 100",
+                            "36.99 / 18.5",
+                            "(21.3 + 18.5 + 15.2) / 3"
+                        ]
                     },
                     "precision": {
                         "type": "integer",
-                        "description": "小数精度位数，默认4",
+                        "description": "小数精度位数,默认 4",
                         "default": 4
                     }
                 },

@@ -206,32 +206,67 @@ class GRPOMetricsCallback(TrainerCallback):
         self.step_count = 0
 
     def on_log(self, args, state, control, logs=None, **kwargs):
-        """每次 logging 时输出自定义指标 + 注入 TensorBoard"""
-        self.step_count += 1
-        if self.step_count % self.log_interval == 0:
-            try:
-                from grpo_plugin import get_and_reset_metrics
-                metrics = get_and_reset_metrics()
-                if metrics:
-                    # 打印到终端
-                    logger.info(f"[GRPO V4.1 指标] Step {state.global_step}:")
-                    logger.info(f"  calculate_rate: {metrics.get('calculate_rate', 0):.3f}")
-                    logger.info(f"  mental_math_rate: {metrics.get('mental_math_rate', 0):.3f}")
-                    logger.info(f"  tool_call_count: {metrics.get('tool_call_count', 0):.1f}")
-                    logger.info(f"  tool_coverage: {metrics.get('tool_coverage_scores', 0):.3f}")
-                    logger.info(f"  query_quality: {metrics.get('query_quality_scores', 0):.3f}")
-                    logger.info(f"  calc_behavior: {metrics.get('calc_behavior_scores', 0):.3f}")
-                    logger.info(f"  strategy_match: {metrics.get('strategy_match_scores', 0):.3f}")
-                    if metrics.get('llm_judge_scores', 0) > 0:
-                        logger.info(f"  llm_judge: {metrics['llm_judge_scores']:.3f}")
+        """每次 logging 时输出自定义指标 + 注入 TensorBoard
 
-                    # 注入 logs → TensorBoard 自动写入
-                    if logs is not None:
-                        for key, value in metrics.items():
-                            if isinstance(value, (int, float)):
-                                logs[f"custom/{key}"] = value
-            except Exception as e:
-                logger.warning(f"获取自定义指标失败: {e}")
+        同时采集 V2(grpo_plugin)和 V3(v3_rubric_reward)的 metrics——
+        哪个 reward 在跑就有哪个的指标,另一个返回空 dict。
+        """
+        self.step_count += 1
+        if self.step_count % self.log_interval != 0:
+            return
+
+        # V2 metrics(若 USE_V3_RUBRIC=1 则全为空)
+        try:
+            from grpo_plugin import get_and_reset_metrics
+            v2_metrics = get_and_reset_metrics()
+        except Exception as e:
+            logger.warning(f"获取 V2 指标失败: {e}")
+            v2_metrics = {}
+
+        # V3 metrics(若没用 V3 reward 则全为空)
+        try:
+            from v3_rubric_reward import get_and_reset_v3_metrics
+            v3_metrics = get_and_reset_v3_metrics()
+        except Exception as e:
+            logger.warning(f"获取 V3 指标失败: {e}")
+            v3_metrics = {}
+
+        if v2_metrics:
+            logger.info(f"[GRPO V2 指标] Step {state.global_step}:")
+            logger.info(f"  calculate_rate: {v2_metrics.get('calculate_rate', 0):.3f}")
+            logger.info(f"  mental_math_rate: {v2_metrics.get('mental_math_rate', 0):.3f}")
+            logger.info(f"  tool_call_count: {v2_metrics.get('tool_call_count', 0):.1f}")
+            logger.info(f"  tool_coverage: {v2_metrics.get('tool_coverage_scores', 0):.3f}")
+            logger.info(f"  query_quality: {v2_metrics.get('query_quality_scores', 0):.3f}")
+            logger.info(f"  calc_behavior: {v2_metrics.get('calc_behavior_scores', 0):.3f}")
+            logger.info(f"  strategy_match: {v2_metrics.get('strategy_match_scores', 0):.3f}")
+            if v2_metrics.get('llm_judge_scores', 0) > 0:
+                logger.info(f"  llm_judge: {v2_metrics['llm_judge_scores']:.3f}")
+
+        if v3_metrics:
+            logger.info(f"[GRPO V3 Rubric 指标] Step {state.global_step}:")
+            for k, v in sorted(v3_metrics.items()):
+                logger.info(f"  {k}: {v:.3f}")
+            # Reward hacking 报警:form 增长 > fact 增长 1.5 倍
+            fact_rate = v3_metrics.get("v3_rubric/fact_satisfaction_rate")
+            form_rate = v3_metrics.get("v3_rubric/form_satisfaction_rate")
+            if fact_rate is not None and form_rate is not None and fact_rate > 0:
+                ratio = form_rate / fact_rate
+                if ratio > 1.5:
+                    logger.warning(
+                        f"⚠ Reward Hacking 报警: form/fact = {ratio:.2f} > 1.5 "
+                        f"(form={form_rate:.3f} fact={fact_rate:.3f})"
+                    )
+
+        # 注入 logs → TensorBoard 自动写入
+        if logs is not None:
+            for key, value in v2_metrics.items():
+                if isinstance(value, (int, float)):
+                    logs[f"custom/{key}"] = value
+            for key, value in v3_metrics.items():
+                if isinstance(value, (int, float)):
+                    # v3_metrics 的 key 已经带 "v3_rubric/" 前缀,直接用
+                    logs[key] = value
 
 
 # ============ 主函数 ============
@@ -303,7 +338,15 @@ def main():
     model, tokenizer = load_model_and_tokenizer(args.model_path, args.adapter_path)
 
     # ---- 导入 reward 和环境 ----
-    from grpo_plugin import FinAgentEnv, finagent_reward
+    # USE_V3_RUBRIC=1 → V3 Rubric-based(per-task_type rubric + GPT-5.5 judge)
+    # 否则 → V2 V4.1.2(4 维硬规则 + 可选 LLM)
+    from grpo_plugin import FinAgentEnv
+    if os.environ.get("USE_V3_RUBRIC") == "1":
+        from v3_rubric_reward import v3_rubric_reward as reward_fn
+        logger.info("Reward: V3 Rubric-based (USE_V3_RUBRIC=1)")
+    else:
+        from grpo_plugin import finagent_reward as reward_fn
+        logger.info("Reward: V2 V4.1.2 (4 维硬规则)")
 
     # ---- 手动设置 Qwen2.5 的 response_schema ----
     # TRL v1.0 的 environment_factory 只自动识别 Qwen3/3.5 的 chat template。
@@ -413,7 +456,7 @@ def main():
         test_env = FinAgentEnv()
         test_env.reset()
         try:
-            test_rewards = finagent_reward(
+            test_rewards = reward_fn(
                 completions=test_completions,
                 environments=[test_env],
                 question=["测试问题"],
@@ -431,7 +474,7 @@ def main():
         model=model,
         processing_class=tokenizer,
         train_dataset=dataset,
-        reward_funcs=[finagent_reward],
+        reward_funcs=[reward_fn],
         environment_factory=FinAgentEnv,
         args=grpo_config,
         callbacks=[GRPOMetricsCallback()],
