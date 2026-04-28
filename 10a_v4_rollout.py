@@ -147,6 +147,7 @@ def build_candidate(question_id: int, rollout_idx: int, question_meta: dict,
         "num_tool_steps":    plan["num_tool_steps"],
         "tools_used":        plan["tools_used"],
         "retrieval_quality": plan["retrieval_quality"],
+        "final_answer":      plan.get("final_answer", ""),
         "rule_check":        rule_check,
     }
 
@@ -181,6 +182,7 @@ async def generate_trajectory_async(async_client: AsyncOpenAI, tools, question: 
     steps = []
     tools_used = []
     retrieval_quality = True
+    final_answer = ""             # V4: 答案存 plan 顶层,steps 不再写 finish sentinel
     finished = False
 
     for step_num in range(max_steps):
@@ -210,12 +212,12 @@ async def generate_trajectory_async(async_client: AsyncOpenAI, tools, question: 
         content = (msg.content or "").strip()
         raw_tcs = msg.tool_calls or []
 
-        # 分支 1:不调工具 → finish
+        # 分支 1:不调工具 → finish(V4 mode B 天然语义,不写 finish sentinel)
         if not raw_tcs:
             if not content:
                 return None
-            steps.append({"thought": "", "action": "finish", "action_input": content})
             messages.append({"role": "assistant", "content": content})
+            final_answer = content
             finished = True
             break
 
@@ -289,6 +291,7 @@ async def generate_trajectory_async(async_client: AsyncOpenAI, tools, question: 
         "num_tool_steps": len(tools_used),
         "tools_used": tools_used,
         "retrieval_quality": retrieval_quality,
+        "final_answer": final_answer,
     }
 
 

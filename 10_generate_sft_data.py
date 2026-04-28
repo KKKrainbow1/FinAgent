@@ -552,11 +552,19 @@ def extract_obs_from_steps(steps: list) -> str:
 
 
 def extract_answer_from_steps(steps: list) -> str:
-    """从 V1 steps 中提取最终答案"""
+    """V1 兼容:从 steps[finish] 提取答案。V4 推荐用 extract_answer(plan)。"""
     for step in reversed(steps):
         if step.get("action") == "finish":
             return step.get("action_input", "")
     return ""
+
+
+def extract_answer(plan_or_sample: dict) -> str:
+    """V4 主入口:优先读 plan["final_answer"](V4 不再写 finish sentinel),
+    fallback 到 V1 steps[finish](legacy 兼容)。"""
+    if plan_or_sample.get("final_answer"):
+        return plan_or_sample["final_answer"]
+    return extract_answer_from_steps(plan_or_sample.get("steps", []))
 
 
 def judge_and_regen(client: OpenAI, plan: dict, seed_grouped: dict,
@@ -575,7 +583,7 @@ def judge_and_regen(client: OpenAI, plan: dict, seed_grouped: dict,
     qtype = plan["type"]
     steps = plan["steps"]
     observations = extract_obs_from_steps(steps)
-    answer = extract_answer_from_steps(steps)
+    answer = extract_answer(plan)   # V4: 优先 plan["final_answer"]
 
     # 记录所有轮次的 Judge 评语
     all_judge_rounds = []
@@ -661,13 +669,14 @@ def judge_and_regen(client: OpenAI, plan: dict, seed_grouped: dict,
             try:
                 # V4: 不再需要 pre_retrieve(SYSTEM_PROMPT_V4 已含数据库信息)
                 new_plan = generate_trajectory_v4(client, tools, question, qtype, seed_grouped)
-                if new_plan and any(s.get("action") == "finish" for s in new_plan["steps"]):
-                    # V4: 完整替换 plan 的 steps + messages(保持下游同步)
+                if new_plan and new_plan.get("final_answer"):
+                    # V4: 完整替换 plan 的 steps + messages + final_answer(保持下游同步)
                     plan["steps"] = new_plan["steps"]
                     plan["messages"] = new_plan["messages"]
                     plan["num_tool_steps"] = new_plan["num_tool_steps"]
                     plan["tools_used"] = new_plan["tools_used"]
                     plan["retrieval_quality"] = new_plan.get("retrieval_quality", True)
+                    plan["final_answer"] = new_plan["final_answer"]
                     steps = plan["steps"]
                     # 新轨迹再过 LLM Grounding(替代 check_mental_math)
                     g2 = llm_grounding_check(client, plan, n_samples=1, model=JUDGE_MODEL)
@@ -685,12 +694,13 @@ def judge_and_regen(client: OpenAI, plan: dict, seed_grouped: dict,
                         logger.info(f"    full_trajectory 新轨迹 grounding 仍 fail,带提示再次重跑...")
                         new_plan2 = generate_trajectory_v4(client, tools, question, qtype,
                                                            seed_grouped, extra_hint=mm_hint)
-                        if new_plan2 and any(s.get("action") == "finish" for s in new_plan2["steps"]):
+                        if new_plan2 and new_plan2.get("final_answer"):
                             plan["steps"] = new_plan2["steps"]
                             plan["messages"] = new_plan2["messages"]
                             plan["num_tool_steps"] = new_plan2["num_tool_steps"]
                             plan["tools_used"] = new_plan2["tools_used"]
                             plan["retrieval_quality"] = new_plan2.get("retrieval_quality", True)
+                            plan["final_answer"] = new_plan2["final_answer"]
                             steps = plan["steps"]
                         else:
                             logger.warning(f"    full_trajectory 二次重跑失败")
@@ -699,7 +709,7 @@ def judge_and_regen(client: OpenAI, plan: dict, seed_grouped: dict,
                         logger.warning(f"    full_trajectory 重跑后 grounding={g2.get('label')},放弃")
                         break
                     observations = extract_obs_from_steps(steps)
-                    answer = extract_answer_from_steps(steps)
+                    answer = extract_answer(plan)
                 else:
                     logger.warning(f"    full_trajectory 重新生成失败")
                     break
@@ -712,12 +722,8 @@ def judge_and_regen(client: OpenAI, plan: dict, seed_grouped: dict,
                 new_answer = regen_answer_with_feedback(
                     client, question, qtype, observations, feedback
                 )
-                # 更新 plan 中的 finish 步答案(V1-like steps)
-                for step in reversed(steps):
-                    if step.get("action") == "finish":
-                        step["action_input"] = new_answer
-                        break
-                # V4: 同步更新 plan["messages"] 最后一条 assistant content(无 tool_calls 的那条)
+                # V4: 更新 plan["final_answer"] + plan["messages"] 末尾 assistant content
+                plan["final_answer"] = new_answer
                 if plan.get("messages"):
                     for m in reversed(plan["messages"]):
                         if m.get("role") == "assistant" and not m.get("tool_calls"):
@@ -896,6 +902,7 @@ def generate_trajectory_v4(client: OpenAI, tools: FinAgentTools, question: str,
     steps = []                    # V1-like [{thought, action, action_input, observation}]
     tools_used = []
     retrieval_quality = True
+    final_answer = ""             # V4: 答案存 plan 顶层,steps 不再写 finish sentinel
 
     finished = False
     for step_num in range(max_steps):
@@ -928,19 +935,14 @@ def generate_trajectory_v4(client: OpenAI, tools: FinAgentTools, question: str,
         content = (msg.content or "").strip()
         raw_tcs = msg.tool_calls or []
 
-        # ---- 分支 1:不调工具 → finish(content 是最终答案)----
+        # ---- 分支 1:不调工具 → finish(V4 mode B 天然语义,不再写 finish sentinel)----
         if not raw_tcs:
             if not content:
                 logger.warning(f"step {step_num+1} 既无 tool_call 又无 content,视为失败")
                 return None
-            # V1-like steps(action=finish,action_input=答案),兼容下游 judge
-            steps.append({
-                "thought": "",
-                "action": "finish",
-                "action_input": content,
-            })
-            # V2 messages
+            # V4: 答案存 messages 末尾 assistant content + plan 顶层 final_answer
             messages.append({"role": "assistant", "content": content})
+            final_answer = content
             logger.info(f"  Step {step_num+1}: finish (len={len(content)})")
             finished = True
             break
@@ -1032,6 +1034,7 @@ def generate_trajectory_v4(client: OpenAI, tools: FinAgentTools, question: str,
         "num_tool_steps": len(tools_used),
         "tools_used": tools_used,
         "retrieval_quality": retrieval_quality,
+        "final_answer": final_answer,
     }
 
 
@@ -1058,47 +1061,34 @@ def build_sft_sample(plan: dict) -> dict:
 def validate_sample(sample: dict) -> tuple:
     errors = []
     steps = sample.get("steps", [])
+    final_answer = sample.get("final_answer", "")
 
     if not sample.get("question"):
         errors.append("FORMAT: 缺少 question")
-    if not steps:
-        errors.append("FORMAT: 缺少 steps")
-    if not any(s.get("action") == "finish" for s in steps):
-        errors.append("FORMAT: 缺少 finish 步骤")
+    if not final_answer:
+        errors.append("FORMAT: 缺少 final_answer(V4 不再写 finish sentinel,答案存 plan 顶层)")
 
+    # V4:steps 全部是工具调用步,无 finish sentinel,所有 step.action 都必须 in VALID_TOOLS
     for i, step in enumerate(steps):
         action = step.get("action", "")
-        # V4: "finish" 是 V1-like sentinel(不调工具的 finish 步骤),不在 VALID_TOOLS,
-        # 但 generate_trajectory_v4 / 下游 Judge 需要它,跳过合法性检查
-        if action == "finish":
-            continue
         if action not in VALID_TOOLS:
             errors.append(f"TOOL: 第{i+1}步使用非法工具 '{action}'")
-
-    for i, step in enumerate(steps):
-        if step.get("action") != "finish" and not step.get("observation"):
+        if not step.get("observation"):
             errors.append(f"OBS: 第{i+1}步缺少 observation")
 
+    # 答案数字溯源(reject 类不查,answer 可能是拒答语)
     qtype = sample.get("type", "")
-    if qtype != "reject":
-        finish_step = next((s for s in steps if s.get("action") == "finish"), None)
-        if finish_step:
-            answer = finish_step.get("action_input", "")
-            if answer and answer != "PLACEHOLDER":
-                answer_nums = set(re.findall(r'\d+\.?\d*', answer))
-                obs_text = " ".join(
-                    s.get("observation", "") for s in steps
-                    if s.get("observation") and s.get("action") != "finish"
-                )
-                obs_nums = set(re.findall(r'\d+\.?\d*', obs_text))
-                if answer_nums:
-                    coverage = len(answer_nums & obs_nums) / len(answer_nums)
-                    if coverage < 0.5:
-                        errors.append(f"CONSISTENCY: 答案数字溯源率仅 {coverage:.0%}")
+    if qtype != "reject" and final_answer and final_answer != "PLACEHOLDER":
+        answer_nums = set(re.findall(r'\d+\.?\d*', final_answer))
+        obs_text = " ".join(s.get("observation", "") for s in steps if s.get("observation"))
+        obs_nums = set(re.findall(r'\d+\.?\d*', obs_text))
+        if answer_nums:
+            coverage = len(answer_nums & obs_nums) / len(answer_nums)
+            if coverage < 0.5:
+                errors.append(f"CONSISTENCY: 答案数字溯源率仅 {coverage:.0%}")
 
+    # V4:steps 数 = 实际工具调用数(0 步直答合法 — finance_concept / reject 类)
     num_steps = len(steps)
-    if num_steps < 1:
-        errors.append(f"STEPS: 步数过少({num_steps})")
     if num_steps > 6:
         errors.append(f"STEPS: 步数过多({num_steps})")
 
@@ -1269,10 +1259,13 @@ def main():
                         new_answer = regen_answer_with_feedback(
                             client, question, qtype, observations, feedback
                         )
-                        for step in reversed(plan["steps"]):
-                            if step.get("action") == "finish":
-                                step["action_input"] = new_answer
-                                break
+                        # V4: 更新 plan["final_answer"] + messages 末尾(无 finish step)
+                        plan["final_answer"] = new_answer
+                        if plan.get("messages"):
+                            for m in reversed(plan["messages"]):
+                                if m.get("role") == "assistant" and not m.get("tool_calls"):
+                                    m["content"] = new_answer
+                                    break
 
                         # 再次规则质检
                         rule_passed2, rule_issues2, rule_score2 = rule_based_quality_check(plan)

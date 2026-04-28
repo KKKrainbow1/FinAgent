@@ -105,6 +105,7 @@ def candidate_to_plan(candidate: dict) -> dict:
         "messages":       candidate["messages"],
         "tools_used":     candidate.get("tools_used", []),
         "num_tool_steps": candidate.get("num_tool_steps", 0),
+        "final_answer":   candidate.get("final_answer", ""),
     }
 
 
@@ -182,7 +183,7 @@ def process_candidate(candidate: dict, grounding_client: OpenAI, judge_client: O
 
     # ---- 第 2 关 简化 Judge D2-D5 ----
     obs = gen_sft.extract_obs_from_steps(plan["steps"])
-    answer = gen_sft.extract_answer_from_steps(plan["steps"])
+    answer = gen_sft.extract_answer(plan)   # V4: 优先 plan["final_answer"]
     qtype = plan["type"]
     question = plan["question"]
 
