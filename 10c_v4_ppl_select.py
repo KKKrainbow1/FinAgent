@@ -103,6 +103,12 @@ def compute_assistant_ppl(model, tokenizer, messages: list, tools_native: list,
                           max_length: int, device: str) -> tuple:
     """对单条 messages 渲染 → forward → 只在 assistant tokens 算 cross-entropy。
 
+    Temperature: 标准 ppl 用 T=1(等价 raw logits → softmax → -log)。
+    F.cross_entropy(raw_logits, labels) 默认就是 T=1,与 rollout 时的 sampling
+    temperature(10a 用 0.7)解耦。GRAPE 论文范式:teacher 怎么采样无所谓,
+    ppl 度量必须用 base model 标准 T=1 分布,才能反映"trajectory 与 base
+    预训练分布的对齐程度"。
+
     Returns:
         (ppl, n_assistant_tokens, n_total_tokens, truncated)
     """
@@ -124,8 +130,8 @@ def compute_assistant_ppl(model, tokenizer, messages: list, tools_native: list,
         truncated = True
 
     if sum(mask) == 0:
-        # 没有 assistant token(理论不可能,防御一下)
-        return float("inf"), 0, len(input_ids), truncated
+        # 没有 assistant token(超长截断后尾部全是 prefix 时可能触发)
+        return 1e10, 0, len(input_ids), truncated
 
     input_tensor = torch.tensor([input_ids], dtype=torch.long, device=device)
     mask_tensor = torch.tensor([mask], dtype=torch.float, device=device)
@@ -139,6 +145,7 @@ def compute_assistant_ppl(model, tokenizer, messages: list, tools_native: list,
     shift_labels = input_tensor[:, 1:].contiguous()  # [1, L-1]
     shift_mask = mask_tensor[:, 1:].contiguous()     # [1, L-1]
 
+    # cross_entropy(raw_logits) ≡ -log softmax(raw_logits)[label],T=1 标准 ppl
     loss_per_tok = F.cross_entropy(
         shift_logits.view(-1, shift_logits.size(-1)),
         shift_labels.view(-1),
@@ -148,7 +155,7 @@ def compute_assistant_ppl(model, tokenizer, messages: list, tools_native: list,
     masked_sum = (loss_per_tok * shift_mask).sum()
     masked_count = shift_mask.sum()
     if masked_count.item() == 0:
-        return float("inf"), 0, len(input_ids), truncated
+        return 1e10, 0, len(input_ids), truncated
 
     mean_loss = (masked_sum / masked_count).item()
     # 防 JSON 序列化:超大 loss 用 1e10 代替 inf(json.dumps inf 会报错)

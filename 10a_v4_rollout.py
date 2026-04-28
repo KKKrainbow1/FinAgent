@@ -189,8 +189,8 @@ def main():
     parser.add_argument("--output", type=str, required=True,
                         help="candidates jsonl 输出路径")
     parser.add_argument("--n_rollouts", type=int, default=4, help="每条 question 采样次数")
-    parser.add_argument("--temperature", type=float, default=1.0,
-                        help="teacher 采样温度(GRAPE 推荐 1.0,让 ppl 比较 make sense)")
+    parser.add_argument("--temperature", type=float, default=0.7,
+                        help="teacher 采样温度(0.7 让 teacher 稳定输出;ppl 计算与此解耦,在 10c 里固定用 temp=1 标准)")
     parser.add_argument("--pilot", type=int, default=0,
                         help="只跑前 N 条 question(0=全量)")
     parser.add_argument("--type", type=str, default="",
