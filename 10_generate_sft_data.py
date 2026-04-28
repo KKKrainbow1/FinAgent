@@ -1068,6 +1068,10 @@ def validate_sample(sample: dict) -> tuple:
 
     for i, step in enumerate(steps):
         action = step.get("action", "")
+        # V4: "finish" 是 V1-like sentinel(不调工具的 finish 步骤),不在 VALID_TOOLS,
+        # 但 generate_trajectory_v4 / 下游 Judge 需要它,跳过合法性检查
+        if action == "finish":
+            continue
         if action not in VALID_TOOLS:
             errors.append(f"TOOL: 第{i+1}步使用非法工具 '{action}'")
 
