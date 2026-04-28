@@ -97,11 +97,16 @@ def _extract_observations(plan: dict, max_chars: int = 6000) -> str:
 
 
 def _extract_answer(plan: dict, max_chars: int = 2000) -> str:
-    for step in plan.get('steps', []):
-        if step.get('action') == 'finish':
-            ans = step.get('action_input', '')
-            return ans[:max_chars] + ("...(截断)" if len(ans) > max_chars else "")
-    return ''
+    """V4: 优先 plan['final_answer'](无 finish sentinel);fallback 到 V1 steps[finish]。"""
+    ans = plan.get('final_answer', '') or ''
+    if not ans:
+        for step in plan.get('steps', []):
+            if step.get('action') == 'finish':
+                ans = step.get('action_input', '')
+                break
+    if not ans:
+        return ''
+    return ans[:max_chars] + ("...(截断)" if len(ans) > max_chars else "")
 
 
 # ============ 单次 LLM 调用 ============
