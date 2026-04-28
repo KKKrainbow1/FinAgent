@@ -1,24 +1,35 @@
 """
-FinAgent SFT V4 N-rollout 生成脚本(GRAPE 范式 Phase 1)
+FinAgent SFT V4 N-rollout 生成脚本(GRAPE 范式 Phase 1, AsyncOpenAI)
 
 ============================================================================
  设计目标
 ============================================================================
 
-对 v4_questions_dedup.jsonl 中每条 question 跑 N=4 次独立 rollout(temperature=1.0),
+对 v4_questions_dedup.jsonl 中每条 question 跑 N=4 次独立 rollout(temperature=0.7),
 每个 rollout 通过规则 D1-D10 初筛,输出 candidates 文件供下游 10b/10c 消费。
 
+  并发模型(AsyncOpenAI + asyncio.Semaphore):
+    - (qmeta, rollout_idx) 全部展开为 jobs
+    - asyncio.gather + Semaphore 限制并发数(默认 8)
+    - 每个 job 内部 ReAct 多步串行 await(单 rollout 内顺序不能乱)
+    - 跨 jobs 完全并发(I/O bound,单 OpenAI client 复用)
+
   GRAPE 范式(arxiv 2502.04194, NeurIPS 2025 Spotlight):
-    - 单 teacher × N 次采样 → 候选间风格可比(避免双 teacher 风格差异污染 ppl 比较)
+    - 单 teacher × N 次采样 → 候选间风格可比
     - 给质检过滤更大的选择空间(N=4 → 预期 2-4 条进 ppl select)
     - 后续 10b 跑 LLM Grounding + 简化 Judge 过滤错误峰
     - 后续 10c 用 base model(Qwen2.5-14B) 算 trajectory ppl,选最低
-      → q_SFT 在每个 mode 内部锐利对齐预训练分布
 
   与 10_generate_sft_data.py 的区别:
-    - 10:  N=1 rollout + 完整三层 Judge + regen,产 final SFT 数据
-    - 10a: N=4 rollout + 仅规则 D1-D10 初筛,产 candidates(不做 LLM Judge)
-           交由 10b 做 LLM Grounding + 简化 Judge,10c 做 ppl 选低
+    - 10:  N=1 rollout + 完整三层 Judge + regen,产 final SFT 数据(同步 OpenAI)
+    - 10a: N=4 rollout + 仅规则 D1-D10 初筛,产 candidates(AsyncOpenAI 并发)
+
+  为什么不复用 gen_sft.generate_trajectory_v4:
+    - 10 用同步 OpenAI 客户端,API call 串行
+    - 10a 用 AsyncOpenAI,需要 await 调用
+    - 在 10a 内复制 ReAct 循环逻辑,常量(SYSTEM_PROMPT_V4 / TOOLS_NATIVE / VALID_TOOLS
+      / MAX_RETRY / MAX_STEPS / GENERATION_HINTS / _validate_calc_expression / _eval_calc
+      / _tool_call_to_v2)全部复用 gen_sft 模块,逻辑等价
 
 ============================================================================
  输出 schema(每行一个 candidate)
@@ -30,25 +41,16 @@ FinAgent SFT V4 N-rollout 生成脚本(GRAPE 范式 Phase 1)
   "question":         str,
   "type":             str,
   "subtype":          str | None,
-  "metadata":         {              # 完整 question 元数据(stock/industry/metric_tag/...)
-    "stock_code":     str,
-    "stock_name":     str,
-    "industry":       str,
-    "metric_tag":     list,
-    "template_class": str,
-    "period":         str | None,
-    "source":         str,
-    ...
-  },
+  "metadata":         {...},         # 完整 question 元数据(stock/industry/...)
   "messages":         list,          # V4 chat messages(可直接进训练)
   "steps":            list,          # V1-like steps(兼容下游 Judge)
   "num_tool_steps":   int,
   "tools_used":       list,
   "retrieval_quality": bool,
   "rule_check": {
-    "passed":         bool,          # True = 进 10b
+    "passed":         bool,
     "score":          float,
-    "issues":         list           # [str, ...] 命中的规则点
+    "issues":         list
   }
 }
 
@@ -56,15 +58,15 @@ FinAgent SFT V4 N-rollout 生成脚本(GRAPE 范式 Phase 1)
  运行方式
 ============================================================================
 
-    # pilot(50 条 × N=4 = 200 rollout)
+    # pilot(50 条 × N=4 = 200 rollout, concurrency=8)
     python 10a_v4_rollout.py --questions ./data/sft/questions/v4_questions_dedup.jsonl \\
         --output ./data/sft/v4_pipeline/v4_candidates_pilot.jsonl \\
-        --n_rollouts 4 --temperature 1.0 --pilot 50
+        --n_rollouts 4 --temperature 0.7 --pilot 50 --concurrency 8
 
-    # 全量(1540 × N=4 = 6160 rollout)
+    # 全量(1540 × N=4 = 6160 rollout, concurrency=16)
     python 10a_v4_rollout.py --questions ./data/sft/questions/v4_questions_dedup.jsonl \\
         --output ./data/sft/v4_pipeline/v4_candidates.jsonl \\
-        --n_rollouts 4 --temperature 1.0
+        --n_rollouts 4 --temperature 0.7 --concurrency 16
 
     # 断点续传
     python 10a_v4_rollout.py --questions ... --output ... --n_rollouts 4 --resume
@@ -75,17 +77,17 @@ FinAgent SFT V4 N-rollout 生成脚本(GRAPE 范式 Phase 1)
 """
 
 import argparse
+import asyncio
 import importlib.util
 import json
 import logging
 import os
 import random
-import time
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
 
-from openai import OpenAI
+from openai import AsyncOpenAI
 
 
 # ============ 动态加载 10_generate_sft_data.py(文件名以数字开头无法直接 import)============
@@ -154,6 +156,142 @@ def append_jsonl(path: str, item: dict):
         f.write(json.dumps(item, ensure_ascii=False) + "\n")
 
 
+# ============ AsyncOpenAI 版 generate_trajectory_v4 ============
+# 复制 gen_sft.generate_trajectory_v4 的逻辑,把同步 client.chat.completions.create
+# 换成 AsyncOpenAI 的 await 调用。常量与辅助函数(_validate_calc_expression / _eval_calc
+# / _tool_call_to_v2 / SYSTEM_PROMPT_V4 / GENERATION_HINTS / TOOLS_NATIVE / MODEL /
+# MAX_RETRY / MAX_STEPS / VALID_TOOLS)全部从 gen_sft 模块取,与 10 严格等价。
+
+async def generate_trajectory_async(async_client: AsyncOpenAI, tools, question: str,
+                                    question_type: str, temperature: float = 0.7,
+                                    max_steps: int = None) -> dict:
+    """V4 Mode B 异步生成 — 与 gen_sft.generate_trajectory_v4 行为等价,
+    仅把 OpenAI 同步调用替换为 AsyncOpenAI await。"""
+    if max_steps is None:
+        max_steps = gen_sft.MAX_STEPS
+
+    user_content = f"## 用户问题\n{question}\n\n## 问题类型\n{question_type}"
+    user_content += f"\n{gen_sft.GENERATION_HINTS}"
+
+    messages = [
+        {"role": "system", "content": gen_sft.SYSTEM_PROMPT_V4},
+        {"role": "user", "content": user_content},
+    ]
+
+    steps = []
+    tools_used = []
+    retrieval_quality = True
+    finished = False
+
+    for step_num in range(max_steps):
+        tool_choice = "none" if step_num == max_steps - 1 else "auto"
+
+        msg = None
+        for retry in range(gen_sft.MAX_RETRY):
+            try:
+                response = await async_client.chat.completions.create(
+                    model=gen_sft.MODEL,
+                    messages=messages,
+                    tools=gen_sft.TOOLS_NATIVE,
+                    tool_choice=tool_choice,
+                    parallel_tool_calls=False,
+                    temperature=temperature,
+                    max_tokens=1500,
+                    extra_body={"enable_thinking": False},
+                )
+                msg = response.choices[0].message
+                break
+            except Exception as e:
+                logger.warning(f"LLM 调用失败 (step {step_num+1} retry {retry}): {e}")
+                await asyncio.sleep(1)
+        if msg is None:
+            return None
+
+        content = (msg.content or "").strip()
+        raw_tcs = msg.tool_calls or []
+
+        # 分支 1:不调工具 → finish
+        if not raw_tcs:
+            if not content:
+                return None
+            steps.append({"thought": "", "action": "finish", "action_input": content})
+            messages.append({"role": "assistant", "content": content})
+            finished = True
+            break
+
+        # 分支 2:有 tool_calls
+        tc = raw_tcs[0]
+        name = tc.function.name
+        if name not in gen_sft.VALID_TOOLS:
+            continue
+
+        try:
+            args_raw = tc.function.arguments
+            args_dict = json.loads(args_raw) if isinstance(args_raw, str) else args_raw
+            if not isinstance(args_dict, dict):
+                raise ValueError("arguments 不是 dict")
+        except Exception as e:
+            logger.warning(f"step {step_num+1} args 解析失败: {e}")
+            continue
+
+        if not content:
+            content = "(thought 缺失)"
+
+        # 执行工具(本地操作,直接同步调,不阻塞 event loop 太久)
+        if name == "calculate":
+            expr = args_dict.get("expression", "")
+            try:
+                expr_normalized = gen_sft._validate_calc_expression(expr)
+                observation = gen_sft._eval_calc(expr_normalized)
+                args_dict = {"expression": expr_normalized}
+            except ValueError:
+                continue
+            action_input_v1 = expr_normalized
+        else:
+            query = args_dict.get("query", "")
+            if not query:
+                continue
+            try:
+                obs_and_meta = tools.call(name, args_dict)
+                observation = obs_and_meta[0] if isinstance(obs_and_meta, tuple) else obs_and_meta
+            except Exception as e:
+                observation = f"[工具调用失败] {e}"
+            if "未找到" in observation or len(observation) < 50:
+                retrieval_quality = False
+            action_input_v1 = query
+
+        tools_used.append(name)
+        steps.append({
+            "thought": content,
+            "action": name,
+            "action_input": action_input_v1,
+            "observation": observation,
+        })
+        messages.append({
+            "role": "assistant",
+            "content": content,
+            "tool_calls": [gen_sft._tool_call_to_v2(tc, args_dict)],
+        })
+        messages.append({
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "content": observation,
+        })
+
+    if not finished:
+        return None
+
+    return {
+        "question": question,
+        "type": question_type,
+        "messages": messages,
+        "steps": steps,
+        "num_tool_steps": len(tools_used),
+        "tools_used": tools_used,
+        "retrieval_quality": retrieval_quality,
+    }
+
+
 def load_resume_state(output_path: str) -> tuple:
     """从已写入的 candidates 文件读取已完成的 (question_id, rollout_idx) 集合。
 
@@ -180,17 +318,88 @@ def load_resume_state(output_path: str) -> tuple:
     return seen_pairs, seen_qids
 
 
+# ============ 单 (qmeta, rollout_idx) 处理 worker ============
+
+async def process_one_rollout(qmeta: dict, r_idx: int,
+                              async_client: AsyncOpenAI, tools,
+                              args, write_lock: asyncio.Lock,
+                              out_path: str, stats: Counter):
+    """处理单个 (qmeta, r_idx) job:rollout → validate → rule_check → 写入。
+
+    并发安全:async_client / tools(retrieval) 是线程/协程安全;
+    stats 更新与文件写入在 write_lock 保护下做。
+    """
+    question_id = qmeta["__source_line__"]
+    question = qmeta["question"]
+    qtype = qmeta["type"]
+
+    async with write_lock:
+        stats["rollouts_total"] += 1
+
+    try:
+        plan = await generate_trajectory_async(
+            async_client=async_client,
+            tools=tools,
+            question=question,
+            question_type=qtype,
+            temperature=args.temperature,
+        )
+        if plan is None:
+            async with write_lock:
+                stats["rollouts_failed_react"] += 1
+            logger.warning(f"[q{question_id} r{r_idx}] react 失败")
+            return
+
+        passed_validation, validation_errors = gen_sft.validate_sample(plan)
+        if not passed_validation:
+            async with write_lock:
+                stats["rollouts_failed_validation"] += 1
+            logger.warning(f"[q{question_id} r{r_idx}] validation 失败: {validation_errors[:2]}")
+            return
+
+        rule_passed, rule_issues, rule_score = gen_sft.rule_based_quality_check(plan)
+        rule_check = {
+            "passed": rule_passed,
+            "score":  float(rule_score),
+            "issues": [i["detail"] for i in rule_issues],
+        }
+        if not rule_passed and not args.rule_check_keep_failed:
+            async with write_lock:
+                stats["rollouts_failed_rule_check"] += 1
+            logger.warning(
+                f"[q{question_id} r{r_idx}] rule_check 失败(score={rule_score:.2f}): "
+                f"{rule_check['issues'][:2]}"
+            )
+            return
+
+        candidate = build_candidate(question_id, r_idx, qmeta, plan, rule_check)
+        async with write_lock:
+            append_jsonl(out_path, candidate)
+            stats["rollouts_succeeded"] += 1
+            stats["rollouts_kept"] += 1
+        logger.info(
+            f"[q{question_id} r{r_idx}] keep "
+            f"(steps={plan['num_tool_steps']}, rule={rule_score:.2f})"
+        )
+    except Exception as e:
+        async with write_lock:
+            stats["rollouts_failed_react"] += 1
+        logger.error(f"[q{question_id} r{r_idx}] 未预期异常: {e}", exc_info=True)
+
+
 # ============ 主流程 ============
 
-def main():
-    parser = argparse.ArgumentParser(description="V4 N-rollout 生成 + 规则 D1-D10 初筛")
+async def main_async():
+    parser = argparse.ArgumentParser(description="V4 N-rollout(AsyncOpenAI)+ 规则 D1-D10 初筛")
     parser.add_argument("--questions", type=str, required=True,
                         help="question jsonl 路径(v4_questions_dedup.jsonl)")
     parser.add_argument("--output", type=str, required=True,
                         help="candidates jsonl 输出路径")
     parser.add_argument("--n_rollouts", type=int, default=4, help="每条 question 采样次数")
     parser.add_argument("--temperature", type=float, default=0.7,
-                        help="teacher 采样温度(0.7 让 teacher 稳定输出;ppl 计算与此解耦,在 10c 里固定用 temp=1 标准)")
+                        help="teacher 采样温度(0.7 让 teacher 稳定输出;ppl 在 10c 内固定 T=1)")
+    parser.add_argument("--concurrency", type=int, default=8,
+                        help="asyncio.Semaphore 并发数(默认 8,全量推荐 16)")
     parser.add_argument("--pilot", type=int, default=0,
                         help="只跑前 N 条 question(0=全量)")
     parser.add_argument("--type", type=str, default="",
@@ -213,58 +422,66 @@ def main():
     logger.addHandler(file_handler)
 
     logger.info("=" * 60)
-    logger.info("FinAgent V4 N-rollout(GRAPE Phase 1)")
-    logger.info(f"Questions: {args.questions}")
-    logger.info(f"Output:    {out_path}")
-    logger.info(f"N rollouts: {args.n_rollouts}  |  Temperature: {args.temperature}")
+    logger.info("FinAgent V4 N-rollout(GRAPE Phase 1, AsyncOpenAI)")
+    logger.info(f"Questions:    {args.questions}")
+    logger.info(f"Output:       {out_path}")
+    logger.info(f"N rollouts:   {args.n_rollouts}  |  Temperature: {args.temperature}")
+    logger.info(f"Concurrency:  {args.concurrency}")
     logger.info("=" * 60)
 
     # 初始化 client / tools
-    client = OpenAI()
-    gen_sft._mental_math_client = client          # 兼容 gen_sft 内部 hook
+    async_client = AsyncOpenAI()
     retriever = gen_sft.FinAgentRetriever()
     tools = gen_sft.FinAgentTools(retriever)
-    seed_grouped = gen_sft.load_seed_data(gen_sft.SEED_DATA_PATH)
-    logger.info(f"种子数据: {', '.join(f'{k}={len(v)}' for k, v in seed_grouped.items())}")
+    logger.info("[1/3] AsyncOpenAI / retriever / tools 初始化完成")
 
     # 加载 question
     questions = load_questions_full(args.questions)
     if args.type:
         questions = [q for q in questions if q.get("type") == args.type]
     if args.pilot > 0:
-        # pilot:按 type 分层抽样,而非简单 head
         random.shuffle(questions)
         type2qs = {}
         for q in questions:
             type2qs.setdefault(q["type"], []).append(q)
-        # 平均每 type 取 ceil(pilot / num_types)
         num_types = len(type2qs)
         per_type = max(1, args.pilot // num_types)
         sampled = []
-        for t, qs in type2qs.items():
+        for _, qs in type2qs.items():
             sampled.extend(qs[:per_type])
-        # 截到 pilot
+        # 不足 pilot 时从剩余里随机补足
+        if len(sampled) < args.pilot:
+            sampled_set = set(id(q) for q in sampled)
+            remaining = [q for q in questions if id(q) not in sampled_set]
+            random.shuffle(remaining)
+            sampled.extend(remaining[:args.pilot - len(sampled)])
         random.shuffle(sampled)
         questions = sampled[:args.pilot]
-        # 重新按 source 分布查看
         type_dist = Counter(q["type"] for q in questions)
-        logger.info(f"Pilot {len(questions)} 条,type 分布: {dict(type_dist)}")
+        logger.info(f"[2/3] Pilot {len(questions)} 条,type 分布: {dict(type_dist)}")
     else:
-        logger.info(f"全量 {len(questions)} 条")
+        logger.info(f"[2/3] 全量 {len(questions)} 条")
 
     # 断点续传
-    seen_pairs = set()    # {(qid, rid)} 已写入 candidate 的精确集合
+    seen_pairs = set()
     if args.resume:
         seen_pairs, seen_qids = load_resume_state(out_path)
         logger.info(f"[Resume] 已写 {len(seen_pairs)} candidates,覆盖 {len(seen_qids)} 个 question")
     else:
-        # 非 resume 模式,output 已存在则直接覆盖
         if os.path.exists(out_path):
             os.rename(out_path, out_path + ".bak." + datetime.now().strftime("%Y%m%d_%H%M%S"))
 
-    # 主循环
+    # 构造 jobs:展开 (qmeta, r_idx),跳过已写入
+    jobs = []
+    for qmeta in questions:
+        qid = qmeta["__source_line__"]
+        for r in range(args.n_rollouts):
+            if (qid, r) not in seen_pairs:
+                jobs.append((qmeta, r))
+    logger.info(f"[3/3] 总 jobs: {len(jobs)} (跳过 resume {sum(1 for q in questions for r in range(args.n_rollouts) if (q['__source_line__'], r) in seen_pairs)})")
+
+    # Stats + write lock
     stats = Counter({
-        "questions_total": 0,
         "rollouts_total": 0,
         "rollouts_succeeded": 0,
         "rollouts_failed_react": 0,
@@ -272,82 +489,44 @@ def main():
         "rollouts_failed_rule_check": 0,
         "rollouts_kept": 0,
     })
+    write_lock = asyncio.Lock()
 
-    for q_idx, qmeta in enumerate(questions):
-        # question_id = dedup 原始文件行号(load_questions_full 已注入 __source_line__)
-        question_id = qmeta["__source_line__"]
+    # Semaphore + gather
+    semaphore = asyncio.Semaphore(args.concurrency)
 
-        question = qmeta["question"]
-        qtype = qmeta["type"]
-        stats["questions_total"] += 1
+    async def bounded_worker(qmeta, r_idx):
+        async with semaphore:
+            await process_one_rollout(qmeta, r_idx, async_client, tools,
+                                      args, write_lock, out_path, stats)
 
-        if stats["questions_total"] % 10 == 1:
+    # 进度报告:每 N 个 done 打一次
+    async def progress_reporter():
+        last_done = 0
+        while True:
+            await asyncio.sleep(15)
+            done = stats["rollouts_total"]
+            if done == last_done:
+                continue
+            last_done = done
             kept = stats["rollouts_kept"]
-            tried = stats["rollouts_total"]
-            keep_rate = (kept / tried * 100) if tried else 0
+            keep_rate = (kept / done * 100) if done else 0
             logger.info(
-                f"[Progress] q={stats['questions_total']}/{len(questions)}"
-                f" | rollouts kept={kept}/{tried} ({keep_rate:.1f}%)"
+                f"[Progress] done={done}/{len(jobs)}, kept={kept} ({keep_rate:.1f}%) "
+                f"| react_fail={stats['rollouts_failed_react']} "
+                f"| valid_fail={stats['rollouts_failed_validation']} "
+                f"| rule_fail={stats['rollouts_failed_rule_check']}"
             )
 
-        # 每条 question 跑 N rollout
-        for r_idx in range(args.n_rollouts):
-            # Resume:精确跳过 (qid, rid) 已写入的 rollout
-            if (question_id, r_idx) in seen_pairs:
-                continue
-            stats["rollouts_total"] += 1
-            try:
-                plan = gen_sft.generate_trajectory_v4(
-                    client=client,
-                    tools=tools,
-                    question=question,
-                    question_type=qtype,
-                    seed_grouped=seed_grouped,
-                    temperature=args.temperature,
-                )
-                if plan is None:
-                    stats["rollouts_failed_react"] += 1
-                    logger.warning(f"[q{question_id} r{r_idx}] react 失败")
-                    continue
-
-                # validate(format)
-                passed_validation, validation_errors = gen_sft.validate_sample(plan)
-                if not passed_validation:
-                    stats["rollouts_failed_validation"] += 1
-                    logger.warning(f"[q{question_id} r{r_idx}] validation 失败: {validation_errors[:2]}")
-                    continue
-
-                # 规则质检 D1-D10
-                rule_passed, rule_issues, rule_score = gen_sft.rule_based_quality_check(plan)
-                rule_check = {
-                    "passed": rule_passed,
-                    "score":  float(rule_score),
-                    "issues": [i["detail"] for i in rule_issues],
-                }
-
-                if not rule_passed and not args.rule_check_keep_failed:
-                    stats["rollouts_failed_rule_check"] += 1
-                    logger.warning(
-                        f"[q{question_id} r{r_idx}] rule_check 失败(score={rule_score:.2f}): "
-                        f"{rule_check['issues'][:2]}"
-                    )
-                    continue
-
-                # 写入 candidate
-                candidate = build_candidate(question_id, r_idx, qmeta, plan, rule_check)
-                append_jsonl(out_path, candidate)
-                stats["rollouts_succeeded"] += 1
-                stats["rollouts_kept"] += 1
-                logger.info(
-                    f"[q{question_id} r{r_idx}] keep "
-                    f"(steps={plan['num_tool_steps']}, rule={rule_score:.2f})"
-                )
-            except Exception as e:
-                stats["rollouts_failed_react"] += 1
-                logger.error(f"[q{question_id} r{r_idx}] 未预期异常: {e}", exc_info=True)
-                continue
-
-            time.sleep(0.2)   # 防 rate limit
+    reporter_task = asyncio.create_task(progress_reporter())
+    try:
+        await asyncio.gather(*[bounded_worker(q, r) for q, r in jobs])
+    finally:
+        reporter_task.cancel()
+        try:
+            await reporter_task
+        except asyncio.CancelledError:
+            pass
+        await async_client.close()
 
     # 最终 stats
     stats_path = out_path.replace(".jsonl", "_stats.json")
@@ -355,6 +534,7 @@ def main():
         **dict(stats),
         "n_rollouts_per_question": args.n_rollouts,
         "temperature":             args.temperature,
+        "concurrency":             args.concurrency,
         "questions_file":          args.questions,
         "output_file":             out_path,
         "timestamp":               datetime.now().isoformat(),
@@ -371,6 +551,10 @@ def main():
     logger.info(f"输出: {out_path}")
     logger.info(f"Stats: {stats_path}")
     logger.info("=" * 60)
+
+
+def main():
+    asyncio.run(main_async())
 
 
 if __name__ == "__main__":
