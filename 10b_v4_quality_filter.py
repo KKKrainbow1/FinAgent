@@ -137,7 +137,11 @@ def call_judge_inline(client: OpenAI, question: str, observations: str,
             return json.loads(resp.choices[0].message.content)
         except Exception as e:
             last_err = e
-    return {"total": 0, "issues": [f"Judge 调用失败: {last_err}"], "reason": "调用失败"}
+            logger.warning(f"Judge call retry {attempt+1}/{max_retry} model={model}: "
+                           f"{type(e).__name__}: {str(e)[:300]}")
+    logger.error(f"Judge 调用全部失败 model={model} | last_err={type(last_err).__name__}: {last_err}")
+    return {"total": 0, "issues": [f"Judge 调用失败: {type(last_err).__name__}: {last_err}"],
+            "reason": "调用失败"}
 
 
 # ============ 处理单个 candidate ============
