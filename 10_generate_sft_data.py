@@ -856,7 +856,8 @@ def _eval_calc(expr: str) -> str:
 def generate_trajectory_v4(client: OpenAI, tools: FinAgentTools, question: str,
                            question_type: str, seed_grouped: dict = None,
                            extra_hint: str = "",
-                           max_steps: int = MAX_STEPS) -> dict:
+                           max_steps: int = MAX_STEPS,
+                           temperature: float = 0.7) -> dict:
     """V4 Mode B 生成引擎:原生 tool calling + content 强约束 thought + 全局 max_steps。
 
     流程:
@@ -911,7 +912,7 @@ def generate_trajectory_v4(client: OpenAI, tools: FinAgentTools, question: str,
                     tools=TOOLS_NATIVE,
                     tool_choice=tool_choice,
                     parallel_tool_calls=False,   # API 层硬约束一次一个工具,替代 prompt 软约束
-                    temperature=0.7,
+                    temperature=temperature,
                     max_tokens=1500,
                     extra_body={"enable_thinking": False},
                 )
