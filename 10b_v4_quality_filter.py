@@ -111,10 +111,10 @@ def candidate_to_plan(candidate: dict) -> dict:
 def call_judge_inline(client: OpenAI, question: str, observations: str,
                       answer: str, question_type: str, model: str,
                       max_retry: int = 3) -> dict:
-    """简化 Judge D2-D5 — 线程安全版(model 参数化,不动 gen_sft 全局变量)。
+    """简化 Judge D2-D5 — 线程安全版(client + model 参数化,不动 gen_sft 全局变量)。
 
-    复用 gen_sft.JUDGE_PROMPT_INLINE,自己发 API 调用,避免修改 gen_sft.JUDGE_MODEL
-    在 ThreadPoolExecutor 多线程下产生 race condition。
+    复用 gen_sft.JUDGE_PROMPT_INLINE,自己发 API 调用。client 单独传入(可与 grounding
+    用不同 endpoint:GPT-5.5 跨模型族审计防 self-preference bias)。
     """
     prompt = gen_sft.JUDGE_PROMPT_INLINE.format(
         question=question,
@@ -141,7 +141,8 @@ def call_judge_inline(client: OpenAI, question: str, observations: str,
 
 # ============ 处理单个 candidate ============
 
-def process_candidate(candidate: dict, client: OpenAI, judge_threshold: float,
+def process_candidate(candidate: dict, grounding_client: OpenAI, judge_client: OpenAI,
+                      judge_threshold: float,
                       grounding_model: str, judge_model: str,
                       qualified_path: str, rejected_path: str) -> str:
     """
@@ -152,10 +153,10 @@ def process_candidate(candidate: dict, client: OpenAI, judge_threshold: float,
     rid = candidate.get("rollout_idx", -1)
     plan = candidate_to_plan(candidate)
 
-    # ---- 第 1 关 LLM Grounding ----
+    # ---- 第 1 关 LLM Grounding(用 grounding_client / 默认百炼 qwen3-max)----
     try:
         grounding = llm_grounding_check(
-            client, plan,
+            grounding_client, plan,
             n_samples=1,
             model=grounding_model,
             temperature=0.3,
@@ -185,10 +186,9 @@ def process_candidate(candidate: dict, client: OpenAI, judge_threshold: float,
     qtype = plan["type"]
     question = plan["question"]
 
-    # finance_concept / reject 类 0 步直答,Judge 仍能跑(JUDGE_PROMPT_INLINE 不区分 type)
-    # 但答案 / observation 可能很短,judge 评分体系仍能给出合理分
+    # ---- 第 2 关 简化 Judge D2-D5(用 judge_client / 默认 GPT-5.5 跨模型族审计)----
     try:
-        judge_result = call_judge_inline(client, question, obs, answer, qtype, judge_model)
+        judge_result = call_judge_inline(judge_client, question, obs, answer, qtype, judge_model)
     except Exception as e:
         logger.error(f"[q{qid} r{rid}] judge 异常: {e}")
         candidate["judge_score"] = {"total": 0, "issues": [str(e)], "reason": "judge_exception"}
@@ -253,8 +253,14 @@ def main():
                         help="rejected candidates 输出路径(空=同目录 _rejected.jsonl)")
     parser.add_argument("--judge_threshold", type=float, default=4.0,
                         help="简化 Judge total 阈值(>=阈值通过,默认 4.0 与 10 一致)")
-    parser.add_argument("--grounding_model", type=str, default="qwen3-max")
-    parser.add_argument("--judge_model", type=str, default="qwen3-max")
+    parser.add_argument("--grounding_model", type=str, default="qwen3-max",
+                        help="第 1 关 grounding 模型(默认 qwen3-max,走百炼 endpoint)")
+    parser.add_argument("--judge_model", type=str, default="gpt-5.5",
+                        help="第 2 关 D2-D5 judge 模型(默认 gpt-5.5,跨模型族审计防 self-preference)")
+    parser.add_argument("--judge_api_key", type=str, default="",
+                        help="judge 端点 API key(默认从 env JUDGE_API_KEY 读;再回退 OPENAI_API_KEY)")
+    parser.add_argument("--judge_base_url", type=str, default="",
+                        help="judge 端点 base url(默认从 env JUDGE_BASE_URL 读;再回退 OPENAI_BASE_URL)")
     parser.add_argument("--workers", type=int, default=8, help="并发线程数")
     parser.add_argument("--resume", action="store_true",
                         help="跳过 qualified/rejected 文件中已处理的 (qid, rid)")
@@ -278,11 +284,13 @@ def main():
 
     logger.info("=" * 60)
     logger.info("V4 Quality Filter(GRAPE Phase 2)")
-    logger.info(f"Candidates: {args.candidates}")
-    logger.info(f"Qualified:  {qualified_path}")
-    logger.info(f"Rejected:   {rejected_path}")
-    logger.info(f"Threshold:  judge_total >= {args.judge_threshold}")
-    logger.info(f"Workers:    {args.workers}")
+    logger.info(f"Candidates:        {args.candidates}")
+    logger.info(f"Qualified:         {qualified_path}")
+    logger.info(f"Rejected:          {rejected_path}")
+    logger.info(f"Grounding model:   {args.grounding_model} (默认 endpoint)")
+    logger.info(f"Judge model:       {args.judge_model} (judge endpoint)")
+    logger.info(f"Threshold:         judge_total >= {args.judge_threshold}")
+    logger.info(f"Workers:           {args.workers}")
     logger.info("=" * 60)
 
     # 加载 candidates
@@ -304,8 +312,24 @@ def main():
     todo = [c for c in candidates if (c["question_id"], c["rollout_idx"]) not in seen]
     logger.info(f"待处理 {len(todo)} 条")
 
-    # OpenAI client(线程安全)
-    client = OpenAI()
+    # 双 client:grounding 走默认 endpoint(百炼),judge 走单独 endpoint(GPT-5.5)
+    grounding_client = OpenAI()
+    judge_api_key = args.judge_api_key or os.environ.get("JUDGE_API_KEY")
+    judge_base_url = args.judge_base_url or os.environ.get("JUDGE_BASE_URL")
+    if judge_api_key or judge_base_url:
+        # 显式分流 endpoint
+        judge_client = OpenAI(
+            api_key=judge_api_key or os.environ.get("OPENAI_API_KEY"),
+            base_url=judge_base_url or os.environ.get("OPENAI_BASE_URL"),
+        )
+        logger.info(f"  Judge client: 独立 endpoint(base_url={judge_base_url or 'default'})")
+    else:
+        # 未配置 judge 端点,与 grounding 共享(向后兼容)
+        judge_client = grounding_client
+        logger.warning(
+            "  未配置 JUDGE_API_KEY/JUDGE_BASE_URL,judge 与 grounding 共享 client。"
+            f"若 --judge_model={args.judge_model} 在默认 endpoint 不可用会报错。"
+        )
 
     stats = Counter({
         "total": 0, "qualified": 0,
@@ -316,7 +340,8 @@ def main():
     with ThreadPoolExecutor(max_workers=args.workers) as ex:
         futures = {
             ex.submit(
-                process_candidate, c, client, args.judge_threshold,
+                process_candidate, c, grounding_client, judge_client,
+                args.judge_threshold,
                 args.grounding_model, args.judge_model,
                 qualified_path, rejected_path,
             ): c
