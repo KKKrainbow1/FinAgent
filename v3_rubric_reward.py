@@ -70,13 +70,30 @@ logger = logging.getLogger(__name__)
 
 # ============ 配置 ============
 
+def _find_data_root() -> Path:
+    """自动检测 data/ 目录位置,兼容本地与服务器两种结构。
+
+    本地: backup/finagent_repo/v3_rubric_reward.py + backup/data/grpo  → here.parent / data
+    服务器: Finagent/v3_rubric_reward.py + Finagent/data/grpo          → here / data
+
+    用 data/grpo 作为探测信号(本地 finagent_repo/data 是空壳,无 grpo 子树)。
+    """
+    here = Path(__file__).resolve().parent
+    for candidate in (here / "data", here.parent / "data"):
+        if (candidate / "grpo").is_dir():
+            return candidate
+    return here.parent / "data"
+
+
+_DATA_ROOT = _find_data_root()
+
 V3_RUBRIC_DIR = Path(os.environ.get(
     "V3_REWARD_RUBRIC_DIR",
-    str(Path(__file__).resolve().parent.parent / "data/grpo/rubric_v3/final_rubrics"),
+    str(_DATA_ROOT / "grpo/rubric_v3/final_rubrics"),
 ))
 V3_QUESTIONS_PATH = Path(os.environ.get(
     "V3_QUESTIONS_PATH",
-    str(Path(__file__).resolve().parent.parent / "data/grpo/questions/grpo_questions_v3.jsonl"),
+    str(_DATA_ROOT / "grpo/questions/grpo_questions_v3.jsonl"),
 ))
 V3_JUDGE_MODEL = os.environ.get("V3_REWARD_JUDGE_MODEL", "gpt-5.5")
 V3_GT_MODEL = os.environ.get("V3_REWARD_GT_MODEL", "gpt-4o")
