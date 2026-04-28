@@ -109,14 +109,19 @@ logger = logging.getLogger("v4_rollout")
 # ============ 辅助 ============
 
 def load_questions_full(path: str) -> list:
-    """加载 question 完整 schema(保留 metadata 进 candidate)。"""
+    """加载 question 完整 schema(保留 metadata 进 candidate)。
+
+    每条 question 注入 __source_line__ = 0-indexed 行号,作为后续 question_id 主源,
+    保证无论 pilot / shuffle 后 question_id 仍能追回 dedup 原始行号。
+    """
     questions = []
     with open(path, "r", encoding="utf-8") as f:
-        for line in f:
+        for line_no, line in enumerate(f):
             line = line.strip()
             if not line:
                 continue
             q = json.loads(line)
+            q["__source_line__"] = line_no
             questions.append(q)
     return questions
 
@@ -124,7 +129,10 @@ def load_questions_full(path: str) -> list:
 def build_candidate(question_id: int, rollout_idx: int, question_meta: dict,
                     plan: dict, rule_check: dict) -> dict:
     """从 plan + rule_check 组装 candidate 行。"""
-    metadata = {k: v for k, v in question_meta.items() if k not in ("question", "type", "subtype")}
+    metadata = {
+        k: v for k, v in question_meta.items()
+        if k not in ("question", "type", "subtype", "__source_line__")
+    }
     return {
         "question_id":       question_id,
         "rollout_idx":       rollout_idx,
@@ -147,11 +155,15 @@ def append_jsonl(path: str, item: dict):
 
 
 def load_resume_state(output_path: str) -> tuple:
-    """从已写入的 candidates 文件读取最大 question_id,断点续传。"""
+    """从已写入的 candidates 文件读取已完成的 (question_id, rollout_idx) 集合。
+
+    用 set 而非 max_qid:question_id 是 dedup 行号(注入自 load_questions_full),
+    主循环顺序是 shuffle 后的,行号不单调,不能用 max_qid <= 截断。
+    """
+    seen_pairs = set()
+    seen_qids = set()
     if not os.path.exists(output_path):
-        return -1, 0
-    max_qid = -1
-    n_lines = 0
+        return seen_pairs, seen_qids
     with open(output_path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -160,12 +172,12 @@ def load_resume_state(output_path: str) -> tuple:
             try:
                 d = json.loads(line)
                 qid = d.get("question_id", -1)
-                if qid > max_qid:
-                    max_qid = qid
-                n_lines += 1
+                rid = d.get("rollout_idx", -1)
+                seen_pairs.add((qid, rid))
+                seen_qids.add(qid)
             except Exception:
                 continue
-    return max_qid, n_lines
+    return seen_pairs, seen_qids
 
 
 # ============ 主流程 ============
@@ -241,11 +253,10 @@ def main():
         logger.info(f"全量 {len(questions)} 条")
 
     # 断点续传
-    start_qid = -1
-    n_existing = 0
+    seen_pairs = set()    # {(qid, rid)} 已写入 candidate 的精确集合
     if args.resume:
-        start_qid, n_existing = load_resume_state(out_path)
-        logger.info(f"[Resume] 已写 {n_existing} candidates,从 question_id > {start_qid} 续跑")
+        seen_pairs, seen_qids = load_resume_state(out_path)
+        logger.info(f"[Resume] 已写 {len(seen_pairs)} candidates,覆盖 {len(seen_qids)} 个 question")
     else:
         # 非 resume 模式,output 已存在则直接覆盖
         if os.path.exists(out_path):
@@ -263,10 +274,8 @@ def main():
     })
 
     for q_idx, qmeta in enumerate(questions):
-        # 用 enumerate 索引作 question_id(等价于 dedup 文件中的 line index;pilot 模式下可能错位,用 source line 更准)
-        question_id = qmeta.get("__source_line__", q_idx)
-        if args.resume and question_id <= start_qid:
-            continue
+        # question_id = dedup 原始文件行号(load_questions_full 已注入 __source_line__)
+        question_id = qmeta["__source_line__"]
 
         question = qmeta["question"]
         qtype = qmeta["type"]
@@ -277,12 +286,15 @@ def main():
             tried = stats["rollouts_total"]
             keep_rate = (kept / tried * 100) if tried else 0
             logger.info(
-                f"[Progress] q={stats['questions_total']}/{len(questions) - (start_qid + 1 if args.resume else 0)}"
+                f"[Progress] q={stats['questions_total']}/{len(questions)}"
                 f" | rollouts kept={kept}/{tried} ({keep_rate:.1f}%)"
             )
 
         # 每条 question 跑 N rollout
         for r_idx in range(args.n_rollouts):
+            # Resume:精确跳过 (qid, rid) 已写入的 rollout
+            if (question_id, r_idx) in seen_pairs:
+                continue
             stats["rollouts_total"] += 1
             try:
                 plan = gen_sft.generate_trajectory_v4(

@@ -108,6 +108,37 @@ def candidate_to_plan(candidate: dict) -> dict:
     }
 
 
+def call_judge_inline(client: OpenAI, question: str, observations: str,
+                      answer: str, question_type: str, model: str,
+                      max_retry: int = 3) -> dict:
+    """简化 Judge D2-D5 — 线程安全版(model 参数化,不动 gen_sft 全局变量)。
+
+    复用 gen_sft.JUDGE_PROMPT_INLINE,自己发 API 调用,避免修改 gen_sft.JUDGE_MODEL
+    在 ThreadPoolExecutor 多线程下产生 race condition。
+    """
+    prompt = gen_sft.JUDGE_PROMPT_INLINE.format(
+        question=question,
+        question_type=question_type,
+        observations=observations if observations else "(无检索数据)",
+        answer=answer if answer else "(无回答)",
+    )
+    last_err = None
+    for attempt in range(max_retry):
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": prompt}],
+                response_format={"type": "json_object"},
+                temperature=0.1,
+                max_tokens=800,
+                extra_body={"enable_thinking": False},
+            )
+            return json.loads(resp.choices[0].message.content)
+        except Exception as e:
+            last_err = e
+    return {"total": 0, "issues": [f"Judge 调用失败: {last_err}"], "reason": "调用失败"}
+
+
 # ============ 处理单个 candidate ============
 
 def process_candidate(candidate: dict, client: OpenAI, judge_threshold: float,
@@ -157,13 +188,7 @@ def process_candidate(candidate: dict, client: OpenAI, judge_threshold: float,
     # finance_concept / reject 类 0 步直答,Judge 仍能跑(JUDGE_PROMPT_INLINE 不区分 type)
     # 但答案 / observation 可能很短,judge 评分体系仍能给出合理分
     try:
-        # 临时切换 gen_sft.JUDGE_MODEL(模块全局)
-        prev_judge_model = gen_sft.JUDGE_MODEL
-        gen_sft.JUDGE_MODEL = judge_model
-        try:
-            judge_result = gen_sft.judge_single_inline(client, question, obs, answer, qtype)
-        finally:
-            gen_sft.JUDGE_MODEL = prev_judge_model
+        judge_result = call_judge_inline(client, question, obs, answer, qtype, judge_model)
     except Exception as e:
         logger.error(f"[q{qid} r{rid}] judge 异常: {e}")
         candidate["judge_score"] = {"total": 0, "issues": [str(e)], "reason": "judge_exception"}

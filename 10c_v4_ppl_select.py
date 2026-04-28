@@ -151,7 +151,8 @@ def compute_assistant_ppl(model, tokenizer, messages: list, tools_native: list,
         return float("inf"), 0, len(input_ids), truncated
 
     mean_loss = (masked_sum / masked_count).item()
-    ppl = math.exp(mean_loss) if mean_loss < 30 else float("inf")
+    # 防 JSON 序列化:超大 loss 用 1e10 代替 inf(json.dumps inf 会报错)
+    ppl = math.exp(mean_loss) if mean_loss < 30 else 1e10
 
     return ppl, int(masked_count.item()), len(input_ids), truncated
 
@@ -250,8 +251,10 @@ def main():
         n_qs = sum(1 for v in by_qid.values() if len(v) == n_cand)
         logger.info(f"  qualified={n_cand}: {n_qs} 个 question")
 
-    # Resume:读已写入的 ppl_all
-    seen = set()
+    # Resume:读已写入的 ppl_all,把 (qid, rid) → ppl 提前回填到 qid_to_ppls
+    # 这样后面 select best 时已算的 candidate 也参与排序,不会"只在新算的里选 best"
+    qid_to_ppls = defaultdict(list)   # {qid: [(ppl, candidate)]}
+    resumed_keys = {}                 # {(qid, rid): ppl}
     if args.resume and os.path.exists(output_all_ppl):
         with open(output_all_ppl, "r", encoding="utf-8") as f:
             for line in f:
@@ -260,10 +263,18 @@ def main():
                     continue
                 try:
                     d = json.loads(line)
-                    seen.add((d["question_id"], d["rollout_idx"]))
+                    resumed_keys[(d["question_id"], d["rollout_idx"])] = d["base_ppl"]
                 except Exception:
                     continue
-        logger.info(f"  [Resume] 已算 {len(seen)} 条 ppl,跳过")
+        # 把 resumed ppl 与 candidate join,append 进 qid_to_ppls
+        n_resumed = 0
+        for qid, cands in by_qid.items():
+            for cand in cands:
+                key = (cand["question_id"], cand["rollout_idx"])
+                if key in resumed_keys:
+                    qid_to_ppls[qid].append((resumed_keys[key], cand))
+                    n_resumed += 1
+        logger.info(f"  [Resume] 已算 {len(resumed_keys)} 条 ppl,join 回 {n_resumed} 个 candidate")
     else:
         # 非 resume:备份旧文件
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
@@ -277,16 +288,13 @@ def main():
     n_done = 0
     n_truncated = 0
     n_failed = 0
-    qid_to_ppls = defaultdict(list)   # {qid: [(ppl, candidate)]}
 
     for qid in sorted(by_qid.keys()):
         for cand in by_qid[qid]:
             n_done += 1
             key = (cand["question_id"], cand["rollout_idx"])
-            if key in seen:
-                # resume 模式:从 output_all_ppl 把已算的 ppl 读回(但简化:直接跳过该 candidate,
-                # 不再选 best,要么完整重跑 ppl 要么完整 resume,中间状态不便维护;
-                # 实际中如果中断就重新跑全部,ppl 计算确定性高)
+            if key in resumed_keys:
+                # 已算过(resume 模式),ppl 已 join 回 qid_to_ppls,跳过 forward
                 continue
             try:
                 ppl, n_assistant, n_total_tok, truncated = compute_assistant_ppl(
