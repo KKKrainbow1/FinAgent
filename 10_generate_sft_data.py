@@ -472,18 +472,21 @@ def rule_based_quality_check(plan: dict) -> tuple:
 
     question = plan["question"]
     steps = plan["steps"]
+    # V4: 把 plan["final_answer"] 透传到 8 个用 get_finish_answer 的 D 维度,
+    # 避免 V4 schema(无 finish sentinel)下 D2-D10 trivially pass 的 bug
+    fa = plan.get("final_answer")
 
     all_issues = []
     all_issues.extend(check_thought_coherence(steps))
-    all_issues.extend(check_finish_depth(steps, question))
-    all_issues.extend(check_assertive_vs_hypothetical(steps))
+    all_issues.extend(check_finish_depth(steps, question, final_answer=fa))
+    all_issues.extend(check_assertive_vs_hypothetical(steps, final_answer=fa))
     all_issues.extend(check_observation_match(steps, question))
-    all_issues.extend(check_number_consistency(steps))
-    all_issues.extend(check_industry_adaptation(steps, question))
-    all_issues.extend(check_standard_consistency(steps))
-    all_issues.extend(check_dupont_correctness(steps))
-    all_issues.extend(check_time_consistency(steps))
-    all_issues.extend(check_risk_specificity(steps, question))
+    all_issues.extend(check_number_consistency(steps, final_answer=fa))
+    all_issues.extend(check_industry_adaptation(steps, question, final_answer=fa))
+    all_issues.extend(check_standard_consistency(steps, final_answer=fa))
+    all_issues.extend(check_dupont_correctness(steps, final_answer=fa))
+    all_issues.extend(check_time_consistency(steps, final_answer=fa))
+    all_issues.extend(check_risk_specificity(steps, question, final_answer=fa))
 
     score = score_sample(all_issues)
     has_critical = any(i["type"] in CRITICAL_ISSUE_TYPES for i in all_issues)
@@ -1076,9 +1079,9 @@ def validate_sample(sample: dict) -> tuple:
         if not step.get("observation"):
             errors.append(f"OBS: 第{i+1}步缺少 observation")
 
-    # 答案数字溯源(reject 类不查,answer 可能是拒答语)
+    # 答案数字溯源(reject / 0 步直答类不查 — 无 obs 可对照,如 finance_concept)
     qtype = sample.get("type", "")
-    if qtype != "reject" and final_answer and final_answer != "PLACEHOLDER":
+    if qtype != "reject" and steps and final_answer and final_answer != "PLACEHOLDER":
         answer_nums = set(re.findall(r'\d+\.?\d*', final_answer))
         obs_text = " ".join(s.get("observation", "") for s in steps if s.get("observation"))
         obs_nums = set(re.findall(r'\d+\.?\d*', obs_text))
@@ -1087,10 +1090,10 @@ def validate_sample(sample: dict) -> tuple:
             if coverage < 0.5:
                 errors.append(f"CONSISTENCY: 答案数字溯源率仅 {coverage:.0%}")
 
-    # V4:steps 数 = 实际工具调用数(0 步直答合法 — finance_concept / reject 类)
+    # V4:steps 数 = 实际工具调用数(0 步直答合法,上限对齐 MAX_STEPS=10)
     num_steps = len(steps)
-    if num_steps > 6:
-        errors.append(f"STEPS: 步数过多({num_steps})")
+    if num_steps > MAX_STEPS:
+        errors.append(f"STEPS: 步数过多({num_steps} > {MAX_STEPS})")
 
     if not sample.get("retrieval_quality", True):
         errors.append("RETRIEVAL: 检索返回结果相关性低")
