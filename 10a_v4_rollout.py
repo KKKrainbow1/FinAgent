@@ -171,12 +171,14 @@ async def generate_trajectory_async(async_client: AsyncOpenAI, tools, question: 
     if max_steps is None:
         max_steps = gen_sft.MAX_STEPS
 
-    user_content = f"## 用户问题\n{question}\n\n## 问题类型\n{question_type}"
-    user_content += f"\n{gen_sft.GENERATION_HINTS}"
+    # Teacher 见 full user(含 type + GENERATION_HINTS,按规生成);
+    # 训练 messages 里的 user 末尾会替换为裸 question,对齐 react_agent 推理。
+    user_content_full = f"## 用户问题\n{question}\n\n## 问题类型\n{question_type}"
+    user_content_full += f"\n{gen_sft.GENERATION_HINTS}"
 
     messages = [
         {"role": "system", "content": gen_sft.SYSTEM_PROMPT_V4},
-        {"role": "user", "content": user_content},
+        {"role": "user", "content": user_content_full},
     ]
 
     steps = []
@@ -283,10 +285,18 @@ async def generate_trajectory_async(async_client: AsyncOpenAI, tools, question: 
     if not finished:
         return None
 
+    # 训练 messages:把 user[1] 替换为裸 question(对齐 react_agent 推理),
+    # 保留 system + 后续 assistant/tool 步不变。Teacher 已用 full user 跑完,
+    # ReAct trajectory 不变,只是写入训练数据时去掉生成期 hint。
+    messages_for_training = [
+        messages[0],
+        {"role": "user", "content": question},
+    ] + messages[2:]
+
     return {
         "question": question,
         "type": question_type,
-        "messages": messages,
+        "messages": messages_for_training,
         "steps": steps,
         "num_tool_steps": len(tools_used),
         "tools_used": tools_used,

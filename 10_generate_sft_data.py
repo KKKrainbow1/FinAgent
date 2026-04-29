@@ -884,17 +884,16 @@ def generate_trajectory_v4(client: OpenAI, tools: FinAgentTools, question: str,
       - calculate 单阶段(不再调 CALC_FILL_PROMPT 二次)
       - 不再有"finish"虚拟工具(不调工具即 finish)
     """
-    # 构造首轮 user message
-    # 注意:GENERATION_HINTS 只在生成期注入 user prompt,推理时 react_agent 不注入,
-    # 保持训-推 system prompt 一致。但 user 末尾的 hint 会进训练数据,模型见过。
-    user_content = f"## 用户问题\n{question}\n\n## 问题类型\n{question_type}"
-    user_content += f"\n{GENERATION_HINTS}"
+    # Teacher 见 full user(含 type + GENERATION_HINTS + extra_hint),按规生成。
+    # 训练 messages 里 user 会替换为裸 question(对齐 react_agent 推理,见 return 前)。
+    user_content_full = f"## 用户问题\n{question}\n\n## 问题类型\n{question_type}"
+    user_content_full += f"\n{GENERATION_HINTS}"
     if extra_hint:
-        user_content += f"\n\n## 重要提示\n{extra_hint}"
+        user_content_full += f"\n\n## 重要提示\n{extra_hint}"
 
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT_V4},
-        {"role": "user", "content": user_content},
+        {"role": "user", "content": user_content_full},
     ]
 
     steps = []                    # V1-like [{thought, action, action_input, observation}]
@@ -1024,10 +1023,16 @@ def generate_trajectory_v4(client: OpenAI, tools: FinAgentTools, question: str,
         logger.warning(f"max_steps={max_steps} 耗尽仍未 finish")
         return None
 
+    # 训练 messages:user[1] 替换为裸 question(对齐推理),其余不变
+    messages_for_training = [
+        messages[0],
+        {"role": "user", "content": question},
+    ] + messages[2:]
+
     return {
         "question": question,
         "type": question_type,
-        "messages": messages,
+        "messages": messages_for_training,
         "steps": steps,
         "num_tool_steps": len(tools_used),
         "tools_used": tools_used,
