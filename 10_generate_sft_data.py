@@ -970,6 +970,7 @@ def generate_trajectory_v4(client: OpenAI, tools: FinAgentTools, question: str,
             content = "(thought 缺失)"
 
         # ---- 执行工具 ----
+        retrieved_chunks = None
         if name == "calculate":
             expr = args_dict.get("expression", "")
             try:
@@ -987,7 +988,10 @@ def generate_trajectory_v4(client: OpenAI, tools: FinAgentTools, question: str,
                 continue
             try:
                 obs_and_meta = tools.call(name, args_dict)
-                observation = obs_and_meta[0] if isinstance(obs_and_meta, tuple) else obs_and_meta
+                if isinstance(obs_and_meta, tuple):
+                    observation, retrieved_chunks = obs_and_meta
+                else:
+                    observation = obs_and_meta
             except Exception as e:
                 observation = f"[工具调用失败] {e}"
                 logger.warning(f"工具调用失败 [{name}({args_dict})]: {e}")
@@ -999,12 +1003,15 @@ def generate_trajectory_v4(client: OpenAI, tools: FinAgentTools, question: str,
         tools_used.append(name)
 
         # ---- 记录 steps(V1 风格)和 messages(V2)----
-        steps.append({
+        step_record = {
             "thought": content,
             "action": name,
             "action_input": action_input_v1,
             "observation": observation,
-        })
+        }
+        if retrieved_chunks is not None:
+            step_record["retrieved_chunks"] = retrieved_chunks
+        steps.append(step_record)
         messages.append({
             "role": "assistant",
             "content": content,

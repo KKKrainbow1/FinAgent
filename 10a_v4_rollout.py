@@ -89,6 +89,8 @@ from pathlib import Path
 
 from openai import AsyncOpenAI
 
+from retrieval_quality_check import check_retrieval_grounding
+
 
 # ============ 动态加载 10_generate_sft_data.py(文件名以数字开头无法直接 import)============
 
@@ -129,13 +131,14 @@ def load_questions_full(path: str) -> list:
 
 
 def build_candidate(question_id: int, rollout_idx: int, question_meta: dict,
-                    plan: dict, rule_check: dict) -> dict:
-    """从 plan + rule_check 组装 candidate 行。"""
+                    plan: dict, rule_check: dict,
+                    retrieval_check: dict = None) -> dict:
+    """从 plan + rule_check + retrieval_check 组装 candidate 行。"""
     metadata = {
         k: v for k, v in question_meta.items()
         if k not in ("question", "type", "subtype", "__source_line__")
     }
-    return {
+    out = {
         "question_id":       question_id,
         "rollout_idx":       rollout_idx,
         "question":          plan["question"],
@@ -150,6 +153,9 @@ def build_candidate(question_id: int, rollout_idx: int, question_meta: dict,
         "final_answer":      plan.get("final_answer", ""),
         "rule_check":        rule_check,
     }
+    if retrieval_check is not None:
+        out["retrieval_check"] = retrieval_check
+    return out
 
 
 def append_jsonl(path: str, item: dict):
@@ -242,6 +248,7 @@ async def generate_trajectory_async(async_client: AsyncOpenAI, tools, question: 
             content = "(thought 缺失)"
 
         # 执行工具(本地操作,直接同步调,不阻塞 event loop 太久)
+        retrieved_chunks = None
         if name == "calculate":
             expr = args_dict.get("expression", "")
             try:
@@ -257,7 +264,10 @@ async def generate_trajectory_async(async_client: AsyncOpenAI, tools, question: 
                 continue
             try:
                 obs_and_meta = tools.call(name, args_dict)
-                observation = obs_and_meta[0] if isinstance(obs_and_meta, tuple) else obs_and_meta
+                if isinstance(obs_and_meta, tuple):
+                    observation, retrieved_chunks = obs_and_meta
+                else:
+                    observation = obs_and_meta
             except Exception as e:
                 observation = f"[工具调用失败] {e}"
             if "未找到" in observation or len(observation) < 50:
@@ -265,12 +275,15 @@ async def generate_trajectory_async(async_client: AsyncOpenAI, tools, question: 
             action_input_v1 = query
 
         tools_used.append(name)
-        steps.append({
+        step_record = {
             "thought": content,
             "action": name,
             "action_input": action_input_v1,
             "observation": observation,
-        })
+        }
+        if retrieved_chunks is not None:
+            step_record["retrieved_chunks"] = retrieved_chunks
+        steps.append(step_record)
         messages.append({
             "role": "assistant",
             "content": content,
@@ -385,7 +398,22 @@ async def process_one_rollout(qmeta: dict, r_idx: int,
             )
             return
 
-        candidate = build_candidate(question_id, r_idx, qmeta, plan, rule_check)
+        # Retrieval grounding(question metadata vs retrieved chunk meta)
+        retrieval_passed, retrieval_issues = check_retrieval_grounding(plan, qmeta)
+        retrieval_check = {
+            "passed": retrieval_passed,
+            "issues": retrieval_issues,
+        }
+        if not retrieval_passed and not args.retrieval_check_keep_failed:
+            async with write_lock:
+                stats["rollouts_failed_retrieval_check"] += 1
+            logger.warning(
+                f"[q{question_id} r{r_idx}] retrieval_check 失败: {retrieval_issues}"
+            )
+            return
+
+        candidate = build_candidate(question_id, r_idx, qmeta, plan, rule_check,
+                                     retrieval_check=retrieval_check)
         async with write_lock:
             append_jsonl(out_path, candidate)
             stats["rollouts_succeeded"] += 1
@@ -421,6 +449,8 @@ async def main_async():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--rule_check_keep_failed", action="store_true",
                         help="规则质检 fail 也写入 candidates(默认丢弃,debug 用)")
+    parser.add_argument("--retrieval_check_keep_failed", action="store_true",
+                        help="retrieval grounding fail 也写入 candidates(默认丢弃,debug 用)")
     args = parser.parse_args()
 
     random.seed(args.seed)
@@ -500,6 +530,7 @@ async def main_async():
         "rollouts_failed_react": 0,
         "rollouts_failed_validation": 0,
         "rollouts_failed_rule_check": 0,
+        "rollouts_failed_retrieval_check": 0,
         "rollouts_kept": 0,
     })
     write_lock = asyncio.Lock()
@@ -527,7 +558,8 @@ async def main_async():
                 f"[Progress] done={done}/{len(jobs)}, kept={kept} ({keep_rate:.1f}%) "
                 f"| react_fail={stats['rollouts_failed_react']} "
                 f"| valid_fail={stats['rollouts_failed_validation']} "
-                f"| rule_fail={stats['rollouts_failed_rule_check']}"
+                f"| rule_fail={stats['rollouts_failed_rule_check']} "
+                f"| retrieval_fail={stats['rollouts_failed_retrieval_check']}"
             )
 
     reporter_task = asyncio.create_task(progress_reporter())
