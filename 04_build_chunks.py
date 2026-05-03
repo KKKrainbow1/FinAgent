@@ -164,7 +164,7 @@ def build_report_chunks(report_path: str,
         if pdf_file:
             hit_count += 1
 
-        # 构建自然语言描述
+        # 构建自然语言描述(V3.5:加统一 chunk head 让 LLM 一眼识别出处)
         text_parts = [f"{name}({code}) 研报：{title}"]
 
         if institution and institution != 'nan':
@@ -182,7 +182,15 @@ def build_report_chunks(report_path: str,
         if eps_parts:
             text_parts.append("盈利预测：" + "；".join(eps_parts))
 
-        text = "\n".join(text_parts)
+        body = "\n".join(text_parts)
+        # V3.5 chunk head:[公司(代码) · 机构 · 日期 · 报告标题]
+        head_meta = {
+            'stock_name': name, 'stock_code': code,
+            'institution': institution, 'date': date,
+            'report_title': title,
+        }
+        head = _make_chunk_head(head_meta)
+        text = (head + "\n" + body) if head else body
 
         # 显式 chunk_id(code + date + institution + title 的 md5 前 12 字符)
         # md5 确定性(不受 PYTHONHASHSEED 影响),48-bit 空间,10K 条全库碰撞概率 <0.001%
@@ -603,15 +611,47 @@ def _collect_sections(blocks: list[dict], pdf_stem: str) -> list[dict]:
     return sections
 
 
+def _make_chunk_head(metadata: dict, section_title: str = "") -> str:
+    """统一 chunk head 格式(V3.5):
+        [公司名(代码) · 出品机构 · 日期 · 报告标题 · 章节:章节标题]
+
+    设计:
+      - 4-5 个核心字段 LLM 看一眼就知道 chunk 出处
+      - 机构名进 head 让 LLM 在多机构同期 query 中能识别"这是哪家观点"
+        (RRF 不强制 institution dedup,top-K 可能含同一机构多条)
+      - section_title 仅 prose chunk 给(其他 chunk 留空 → 不出现这一段)
+      - 字段都有长度上限防 head 过长稀释 BGE-m3 dense 信号
+    """
+    name = (metadata.get('stock_name') or '').strip()
+    code = (metadata.get('stock_code') or '').strip()
+    inst = (metadata.get('institution') or '').strip()
+    date = (metadata.get('date') or '').strip()[:10]
+    rtitle = (metadata.get('report_title') or '').strip()
+    parts = []
+    if name and code:
+        parts.append(f"{name}({code})")
+    elif name:
+        parts.append(name)
+    if inst and inst.lower() != 'nan':
+        parts.append(inst[:32])
+    if date:
+        parts.append(date)
+    if rtitle:
+        parts.append(rtitle[:80])
+    if section_title:
+        parts.append(f"章节:{section_title[:60]}")
+    return "[" + " · ".join(parts) + "]" if parts else ""
+
+
 def _section_chunk(section: dict, base_metadata: dict,
                    max_section_chars: int = 3000, min_section_chars: int = 20) -> list[dict]:
     """
     V3.5:Section 即 Chunk —— section_text 整段直接作一条 chunk,不再切 fixed_window child。
 
     Chunk text 加 head 锚定:
-        [公司名(代码) · 日期 · 报告标题 · 章节:章节标题] {section_text}
-    BGE-m3 dense embedding 把"哪家公司哪份研报哪一节"信号融进 vector,对带公司名/简称
-    的 query 命中精度有提升。
+        [公司名(代码) · 出品机构 · 日期 · 报告标题 · 章节:章节标题] {section_text}
+    BGE-m3 dense embedding 把"哪家公司哪份研报哪一节出品机构"信号融进 vector;
+    LLM 看到 chunk 时能直接识别来源(尤其多机构同期 query 必看)。
 
     返回 0 或 1 条 chunk(过短的 section 直接丢)。
     """
@@ -622,27 +662,11 @@ def _section_chunk(section: dict, base_metadata: dict,
 
     sid = section['id']
     stitle = (section.get('title') or '').strip()
-
-    # Chunk head:[公司(代码) · 日期 · 报告标题 · 章节:章节标题]
-    name = (base_metadata.get('stock_name') or '').strip()
-    code = (base_metadata.get('stock_code') or '').strip()
-    date = (base_metadata.get('date') or '').strip()[:10]
-    rtitle = (base_metadata.get('report_title') or '').strip()
-    head_parts = []
-    if name and code:
-        head_parts.append(f"{name}({code})")
-    elif name:
-        head_parts.append(name)
-    if date:
-        head_parts.append(date)
-    if rtitle:
-        head_parts.append(rtitle[:80])
-    if stitle:
-        head_parts.append(f"章节:{stitle[:60]}")
-    head = "[" + " · ".join(head_parts) + "] " if head_parts else ""
+    head = _make_chunk_head(base_metadata, section_title=stitle)
+    head_str = (head + " ") if head else ""
 
     return [{
-        'text': head + text,
+        'text': head_str + text,
         'metadata': {
             **base_metadata,
             'chunk_id':     sid,                     # PK = section_id(业务语义,可追溯)

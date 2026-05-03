@@ -69,27 +69,36 @@ COLL_NAMES = {k: k for k in DB_PATHS}
 
 # ============ 数据收集(从 jsonl → 5 个分桶 list) ============
 
-def _make_section_head(m: dict) -> str:
-    """prose section chunk head,V3.5 BGE-m3 dense 锚定:
-        [公司名(代码) · 日期 · 报告标题 · 章节:章节标题]
+def _make_chunk_head(m: dict, section_title: str = "") -> str:
+    """统一 chunk head(V3.5):
+        [公司名(代码) · 出品机构 · 日期 · 报告标题 · 章节:章节标题]
+    机构进 head 让 LLM 在多机构同期 query 中能识别"这是哪家观点"。
+    section_title 仅 prose chunk 给(其他 chunk 留空 → 不出现这一段)。
     """
     name = (m.get("stock_name") or "").strip()
     code = (m.get("stock_code") or "").strip()
+    inst = (m.get("institution") or "").strip()
     date = ((m.get("date") or "")[:10]).strip()
     rtitle = (m.get("report_title") or "").strip()
-    stitle = (m.get("section_title") or "").strip()
     parts = []
     if name and code:
         parts.append(f"{name}({code})")
     elif name:
         parts.append(name)
+    if inst and inst.lower() != "nan":
+        parts.append(inst[:32])
     if date:
         parts.append(date)
     if rtitle:
         parts.append(rtitle[:80])
-    if stitle:
-        parts.append(f"章节:{stitle[:60]}")
+    if section_title:
+        parts.append(f"章节:{section_title[:60]}")
     return "[" + " · ".join(parts) + "]" if parts else ""
+
+
+# 兼容旧 API
+def _make_section_head(m: dict) -> str:
+    return _make_chunk_head(m, section_title=(m.get("section_title") or "").strip())
 
 
 def collect_buckets() -> dict:
@@ -109,9 +118,15 @@ def collect_buckets() -> dict:
                 st = m.get("source_type")
 
                 if st == "report":
+                    # V3.5:给 report meta chunk text 前缀加统一 head(若 04 旧版 jsonl 没加 head 时补上)
+                    body = d.get("text") or ""
+                    head = _make_chunk_head(m)
+                    # 检测 body 是否已含 [...] head 前缀,避免双重 head
+                    if head and not body.lstrip().startswith("["):
+                        body = head + "\n" + body
                     buckets["report_meta"].append({
                         "chunk_id":     m.get("chunk_id") or "",
-                        "text":         (d.get("text") or "")[:1000],
+                        "text":         body[:1500],   # max 提到 1500 留给 head
                         "stock_code":   m.get("stock_code") or "",
                         "stock_name":   m.get("stock_name") or "",
                         "institution":  m.get("institution") or "",
@@ -126,7 +141,7 @@ def collect_buckets() -> dict:
                     if not sid or not sec_text or sid in seen_sections:
                         continue
                     seen_sections.add(sid)
-                    head = _make_section_head(m)
+                    head = _make_chunk_head(m, section_title=(m.get("section_title") or "").strip())
                     full_text = f"{head} {sec_text}" if head else sec_text
                     buckets["report_section"].append({
                         "chunk_id":     sid,
@@ -216,7 +231,7 @@ def _build_schema_meta(client):
     s.add_field("chunk_id",     DataType.VARCHAR, max_length=192, is_primary=True)
     s.add_field("dense",        DataType.FLOAT_VECTOR, dim=DIM)
     s.add_field("sparse",       DataType.SPARSE_FLOAT_VECTOR)
-    s.add_field("text",         DataType.VARCHAR, max_length=1024)
+    s.add_field("text",         DataType.VARCHAR, max_length=2048)  # head + body 留 buffer
     s.add_field("stock_code",   DataType.VARCHAR, max_length=16)
     s.add_field("stock_name",   DataType.VARCHAR, max_length=64)
     s.add_field("institution",  DataType.VARCHAR, max_length=64)
