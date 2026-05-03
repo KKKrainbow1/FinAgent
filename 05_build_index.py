@@ -182,9 +182,16 @@ def collect_buckets() -> dict:
                     continue
                 if m.get("chunk_method") != "table_narrative":
                     continue   # row_fact 不灌库
+                # V3.5:表格 chunk text 也加统一 head(跟 meta / section 一致),
+                # 让 LLM 解析"哪家机构"规则统一。caption 里嵌的"(民生证券 2025-03-18)"
+                # 会跟 head 信息冗余但无害(LLM 看 head 即可,body 是表格数据)
+                tab_body = (d.get("text") or "")[:3800]
+                tab_head = _make_chunk_head(m)
+                if tab_head and not tab_body.lstrip().startswith("["):
+                    tab_body = tab_head + "\n" + tab_body
                 buckets["report_tabular"].append({
                     "chunk_id":     m.get("parent_id") or "",  # narrative 1 个 / 表 → parent_id 当 chunk_id
-                    "text":         (d.get("text") or "")[:4000],
+                    "text":         tab_body[:4000],
                     "stock_code":   m.get("stock_code") or "",
                     "stock_name":   m.get("stock_name") or "",
                     "industry":     m.get("industry") or "",
