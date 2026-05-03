@@ -1,395 +1,429 @@
 """
-FinAgent Step 5 (V3 · Milvus Lite 版): 建 Milvus 索引
+FinAgent Step 5 (V3.5 · 多 Collection 版): 建 5 个独立 Milvus collection
 
-目标架构(对照 docs/Finagent项目介绍.md 第 4 节):
-  单 collection + 5 种 source_type + scalar filter 路由 + Parent 冗余在 Child metadata
+V3 单 collection → V3.5 多 collection 演进(2026-05-03):
+  - 5 工具(search_report_meta / search_report_content / search_financial /
+            search_industry / calculate)对应 4 个独立 collection(meta + section + tabular + financial + industry)
+  - 每 collection schema 精简(只放该类用得着的字段),索引体积锐减
+  - 工具语义 ↔ collection 语义 1:1 对应,运维 / 调试 / 重建独立
+  - prose 切分改 section 整段(删 fixed_window),table_row_fact 仍 filter
 
 输入:
-  data/processed/all_chunks.jsonl                     (04 产出:report/financial/industry + prose Child)
-  data/processed/tabular_chunks_mineru.jsonl          (06 --source mineru_cleaned 产出:table Child)
-  data/processed/industry_alias_entities.jsonl        (Phase 3 产出:255 别名,可选)
+  data/processed/all_chunks.jsonl              (04 产出:report meta / report_fulltext section / financial / industry)
+  data/processed/tabular_chunks_mineru.jsonl   (06 产出:table_narrative + table_row_fact;后者 filter)
+  data/processed/industry_alias_entities.jsonl (Phase 3 产出:255 别名 entity,可选)
 
-输出:
-  data/processed/milvus_finagent.db                   (Milvus Lite 单文件,含 dense + learned sparse)
+输出(5 个独立 .db):
+  data/processed/milvus_report_meta.db        → collection 'report_meta'      (~10K 条)
+  data/processed/milvus_report_section.db     → collection 'report_section'   (~7K 条,section 整段 + chunk head)
+  data/processed/milvus_report_tabular.db     → collection 'report_tabular'   (~10K 条,table_narrative)
+  data/processed/milvus_financial.db          → collection 'financial'        (~6K 条)
+  data/processed/milvus_industry.db           → collection 'industry_alias'   (~285 条)
 
-  注:旧版 data/processed/bm25_ef.pkl 已废弃(bge-m3 自带 learned sparse 替代 jieba/BM25)。
-
-Schema / index 策略详见 docs/Chunk_Alignment_20260420.md 14 节。
+总:~33K chunks(单 collection 版 ~42K),索引体积 2.3 GB → ~300 MB。
 
 用法:
     python 05_build_index.py
     python 05_build_index.py --hnsw          # Standalone 部署切 HNSW(Lite 只能用 FLAT)
-    python 05_build_index.py --limit 1000    # 原型:只插 1000 条
-    python 05_build_index.py --uri http://localhost:19530   # 连 Standalone
+    python 05_build_index.py --limit 1000    # 原型:每 collection 限流 1000 条
+    python 05_build_index.py --only report_section  # 只重建指定 collection
 """
 import argparse
 import json
 import logging
-from collections import Counter
+import re
+import time
 from pathlib import Path
-
-from tqdm import tqdm
+from typing import Optional
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
 logger = logging.getLogger(__name__)
 
+
 def _find_project_root() -> Path:
-    """兼容 Mac(backup/finagent_repo/ 两层嵌套)和服务器(Finagent/ 一层)两种结构"""
     here = Path(__file__).resolve()
     for cand in (here.parent, here.parent.parent):
         if (cand / "data").is_dir():
             return cand
     return here.parent
 
+
 ROOT = _find_project_root()
-
-# ============ 配置 ============
-COLLECTION = "finagent"
-DB_PATH = ROOT / "data/processed/milvus_finagent.db"
-EMBEDDING_MODEL = "./models/bge-m3"
 DIM = 1024
+EMBEDDING_MODEL = "./models/bge-m3"
 
-CHUNK_SOURCES = [
-    ROOT / "data/processed/all_chunks.jsonl",
-    ROOT / "data/processed/tabular_chunks_mineru.jsonl",
-    ROOT / "data/processed/industry_alias_entities.jsonl",
-]
+DATA_DIR = ROOT / "data/processed"
+ALL_CHUNKS = DATA_DIR / "all_chunks.jsonl"
+TAB_CHUNKS = DATA_DIR / "tabular_chunks_mineru.jsonl"
+INDUSTRY_ALIAS_FILE = DATA_DIR / "industry_alias_entities.jsonl"
+
+DB_PATHS = {
+    "report_meta":     DATA_DIR / "milvus_report_meta.db",
+    "report_section":  DATA_DIR / "milvus_report_section.db",
+    "report_tabular":  DATA_DIR / "milvus_report_tabular.db",
+    "financial":       DATA_DIR / "milvus_financial.db",
+    "industry_alias":  DATA_DIR / "milvus_industry.db",
+}
+COLL_NAMES = {k: k for k in DB_PATHS}
 
 
-# ============ 加载 chunks ============
+# ============ 数据收集(从 jsonl → 5 个分桶 list) ============
 
-def load_all_chunks() -> list[dict]:
-    """从所有源加载 chunks,filter 掉 table_row_fact(实证无贡献,占 80% 空间)"""
-    all_chunks = []
-    for p in CHUNK_SOURCES:
-        if not p.exists():
-            logger.warning(f"⚠️  {p.name} 不存在,跳过")
-            continue
-        n = 0
-        with open(p, encoding='utf-8') as f:
+def _make_section_head(m: dict) -> str:
+    """prose section chunk head,V3.5 BGE-m3 dense 锚定:
+        [公司名(代码) · 日期 · 报告标题 · 章节:章节标题]
+    """
+    name = (m.get("stock_name") or "").strip()
+    code = (m.get("stock_code") or "").strip()
+    date = ((m.get("date") or "")[:10]).strip()
+    rtitle = (m.get("report_title") or "").strip()
+    stitle = (m.get("section_title") or "").strip()
+    parts = []
+    if name and code:
+        parts.append(f"{name}({code})")
+    elif name:
+        parts.append(name)
+    if date:
+        parts.append(date)
+    if rtitle:
+        parts.append(rtitle[:80])
+    if stitle:
+        parts.append(f"章节:{stitle[:60]}")
+    return "[" + " · ".join(parts) + "]" if parts else ""
+
+
+def collect_buckets() -> dict:
+    """从 3 个 jsonl 源读取,按 source_type / chunk_method 分到 5 个桶。
+    table_row_fact filter 掉(05 历史决策,索引瘦身 80%,实证 P@5 持平)。
+    section dedup by section_id(同一 section 多个 fixed_window child → 合并为 1 个 section chunk)。
+    """
+    buckets = {k: [] for k in DB_PATHS.keys()}
+    seen_sections: set[str] = set()
+
+    # all_chunks.jsonl: report meta + financial + industry + report_fulltext (section 源)
+    if ALL_CHUNKS.exists():
+        with open(ALL_CHUNKS, encoding="utf-8") as f:
             for line in f:
-                all_chunks.append(json.loads(line))
-                n += 1
-        logger.info(f"  + {p.name}: {n} 条")
+                d = json.loads(line)
+                m = d.get("metadata", {})
+                st = m.get("source_type")
 
-    # Filter: table_row_fact 不索引
-    # 依据:qwen3-max 严格 judge ablation(30 条 query,P@5 对比):
-    #   with row_fact + rerank:    10/30 (33%)  ← 原 baseline
-    #   with row_fact + no rerank: 16/30 (53%)
-    #   no  row_fact + no rerank:  16/30 (53%)  ← 完全等价,row_fact 无贡献
-    #   no  row_fact + rerank:      8/30 (27%)  ← 最差
-    # row_fact 保留在 tabular_chunks_mineru.jsonl(未来可回滚),只是不进 Milvus 索引
-    before = len(all_chunks)
-    all_chunks = [c for c in all_chunks
-                   if c.get('metadata', {}).get('chunk_method') != 'table_row_fact']
-    filtered = before - len(all_chunks)
-    logger.info(f"  过滤 table_row_fact: {before} → {len(all_chunks)}(去掉 {filtered} 条)")
-    return all_chunks
+                if st == "report":
+                    buckets["report_meta"].append({
+                        "chunk_id":     m.get("chunk_id") or "",
+                        "text":         (d.get("text") or "")[:1000],
+                        "stock_code":   m.get("stock_code") or "",
+                        "stock_name":   m.get("stock_name") or "",
+                        "institution":  m.get("institution") or "",
+                        "date":         m.get("date") or "",
+                        "rating":       m.get("rating") or "",
+                        "report_title": (m.get("report_title") or "")[:512],
+                        "pdf_file":     m.get("pdf_file") or "",
+                    })
+                elif st == "report_fulltext":
+                    sid = m.get("section_id")
+                    sec_text = m.get("section_text") or ""
+                    if not sid or not sec_text or sid in seen_sections:
+                        continue
+                    seen_sections.add(sid)
+                    head = _make_section_head(m)
+                    full_text = f"{head} {sec_text}" if head else sec_text
+                    buckets["report_section"].append({
+                        "chunk_id":     sid,
+                        "text":         full_text[:8000],
+                        "stock_code":   m.get("stock_code") or "",
+                        "stock_name":   m.get("stock_name") or "",
+                        "industry":     m.get("industry") or "",
+                        "date":         m.get("date") or "",
+                        "report_title": (m.get("report_title") or "")[:512],
+                        "section_id":   sid,
+                        "section_title":(m.get("section_title") or "")[:512],
+                        "page_idx":     int(m.get("page_idx") or -1),
+                        "pdf_file":     m.get("pdf_file") or "",
+                    })
+                elif st == "financial":
+                    buckets["financial"].append({
+                        "chunk_id":   m.get("chunk_id") or "",
+                        "text":       (d.get("text") or "")[:2000],
+                        "stock_code": m.get("stock_code") or "",
+                        "stock_name": m.get("stock_name") or "",
+                        "date":       m.get("date") or "",
+                        "data_type":  m.get("data_type") or "",
+                        "metric_class": m.get("metric_class") or m.get("data_type") or "",
+                    })
+                elif st == "industry":
+                    # industry chunk 也走 industry_alias collection(每行业一条聚合 chunk)
+                    # industry_alias_entities.jsonl 是 alias entity(255 条,每个 alias 一行),
+                    # 我们也灌进去,保持向量索引检索能力
+                    pass  # industry comparison chunk 由 industry_alias_entities 文件主导
+
+    # tabular_chunks_mineru.jsonl: table_narrative(row_fact filter)
+    if TAB_CHUNKS.exists():
+        with open(TAB_CHUNKS, encoding="utf-8") as f:
+            for line in f:
+                d = json.loads(line)
+                m = d.get("metadata", {})
+                if m.get("source_type") != "report_tabular":
+                    continue
+                if m.get("chunk_method") != "table_narrative":
+                    continue   # row_fact 不灌库
+                buckets["report_tabular"].append({
+                    "chunk_id":     m.get("parent_id") or "",  # narrative 1 个 / 表 → parent_id 当 chunk_id
+                    "text":         (d.get("text") or "")[:4000],
+                    "stock_code":   m.get("stock_code") or "",
+                    "stock_name":   m.get("stock_name") or "",
+                    "industry":     m.get("industry") or "",
+                    "date":         m.get("date") or "",
+                    "report_title": (m.get("report_title") or "")[:512],
+                    "chunk_method": "table_narrative",
+                    "parent_id":    m.get("parent_id") or "",
+                    "parent_md":    (m.get("parent_md") or m.get("table_md") or "")[:8000],
+                    "table_caption":(m.get("caption") or m.get("table_caption") or "")[:512],
+                    "table_footnote":(m.get("footnote") or m.get("table_footnote") or "")[:1024],
+                    "page_idx":     int(m.get("page_idx") or -1),
+                    "pdf_file":     m.get("pdf_file") or "",
+                })
+
+    # industry_alias_entities.jsonl: 255 alias entity
+    if INDUSTRY_ALIAS_FILE.exists():
+        with open(INDUSTRY_ALIAS_FILE, encoding="utf-8") as f:
+            for line in f:
+                d = json.loads(line)
+                m = d.get("metadata", {})
+                stock_codes = m.get("stock_codes")
+                if isinstance(stock_codes, list):
+                    stock_codes = ",".join(stock_codes)
+                buckets["industry_alias"].append({
+                    "chunk_id":     m.get("chunk_id") or "",
+                    "text":         (d.get("text") or "")[:512],
+                    "industry":     m.get("industry") or "",
+                    "stock_codes":  (stock_codes or "")[:1024],
+                    "company_count":int(m.get("company_count") or 0),
+                    "section_text": (m.get("section_text") or "")[:4000],
+                    "pdf_file":     m.get("pdf_file") or "",
+                })
+
+    for k, v in buckets.items():
+        logger.info(f"  bucket {k}: {len(v)} 条")
+    return buckets
 
 
-# ============ Schema ============
+# ============ 5 个 collection schema ============
 
-def build_schema(client):
-    """Schema 见 docs/Chunk_Alignment_20260420.md 14.2 节"""
+def _build_schema_meta(client):
     from pymilvus import DataType
-    schema = client.create_schema(auto_id=False, enable_dynamic_field=False)
-
-    # 主键 + 双向量
-    schema.add_field("chunk_id",      DataType.VARCHAR, is_primary=True, max_length=256)
-    schema.add_field("dense",         DataType.FLOAT_VECTOR, dim=DIM)
-    schema.add_field("sparse",        DataType.SPARSE_FLOAT_VECTOR)
-
-    # 内容
-    schema.add_field("text",          DataType.VARCHAR, max_length=4096)
-
-    # Scalar (filter/group_by 用,各 source_type 共享)
-    # milvus-lite 不支持 nullable(PR #332 至今未合并),全部用 sentinel:VARCHAR="",INT16=-1
-    schema.add_field("source_type",   DataType.VARCHAR, max_length=32)
-    schema.add_field("chunk_method",  DataType.VARCHAR, max_length=32)
-    schema.add_field("stock_code",    DataType.VARCHAR, max_length=16)
-    schema.add_field("stock_name",    DataType.VARCHAR, max_length=64)
-    schema.add_field("institution",   DataType.VARCHAR, max_length=128)
-    schema.add_field("date",          DataType.VARCHAR, max_length=24)
-    schema.add_field("industry",      DataType.VARCHAR, max_length=64)
-    schema.add_field("rating",        DataType.VARCHAR, max_length=32)
-    schema.add_field("report_title",  DataType.VARCHAR, max_length=256)
-    schema.add_field("page_idx",      DataType.INT16)
-    # 原始 PDF 文件名(_external_rrf 按 pdf_file 聚合用,同 PDF 多 chunk 共享 RRF 分数)
-    schema.add_field("pdf_file",      DataType.VARCHAR, max_length=256)
-    # 解析器 / 数据类型 / 表格类型 等语义标签(之前被 enable_dynamic_field=False silent drop)
-    schema.add_field("parser",          DataType.VARCHAR, max_length=32)
-    schema.add_field("data_type",       DataType.VARCHAR, max_length=32)
-    schema.add_field("chunk_index",     DataType.INT16)
-    schema.add_field("table_type",      DataType.VARCHAR, max_length=64)
-    schema.add_field("header_type",     DataType.VARCHAR, max_length=32)
-    schema.add_field("current_section", DataType.VARCHAR, max_length=256)
-
-    # Parent-Child 关联 + 冗余(Table;建库时 HTML→Markdown,密度 ×3-5,8192 够用)
-    schema.add_field("parent_id",      DataType.VARCHAR, max_length=256)
-    schema.add_field("parent_md",      DataType.VARCHAR, max_length=8192)
-    schema.add_field("table_caption",  DataType.VARCHAR, max_length=512)
-    schema.add_field("table_footnote", DataType.VARCHAR, max_length=512)
-
-    # Parent-Child 关联 + 冗余(Prose)
-    schema.add_field("section_id",    DataType.VARCHAR, max_length=256)
-    schema.add_field("section_title", DataType.VARCHAR, max_length=256)
-    schema.add_field("section_text",  DataType.VARCHAR, max_length=8192)
-
-    # Industry(V3 alias + industry_comparison 聚合)
-    schema.add_field("stock_codes",   DataType.VARCHAR, max_length=2048)
-    schema.add_field("company_count", DataType.INT16)
-
-    return schema
+    s = client.create_schema(auto_id=False, enable_dynamic_field=False)
+    s.add_field("chunk_id",     DataType.VARCHAR, max_length=192, is_primary=True)
+    s.add_field("dense",        DataType.FLOAT_VECTOR, dim=DIM)
+    s.add_field("sparse",       DataType.SPARSE_FLOAT_VECTOR)
+    s.add_field("text",         DataType.VARCHAR, max_length=1024)
+    s.add_field("stock_code",   DataType.VARCHAR, max_length=16)
+    s.add_field("stock_name",   DataType.VARCHAR, max_length=64)
+    s.add_field("institution",  DataType.VARCHAR, max_length=64)
+    s.add_field("date",         DataType.VARCHAR, max_length=32)
+    s.add_field("rating",       DataType.VARCHAR, max_length=32)
+    s.add_field("report_title", DataType.VARCHAR, max_length=512)
+    s.add_field("pdf_file",     DataType.VARCHAR, max_length=128)
+    return s
 
 
-def build_index_params(client, use_hnsw: bool = False):
-    """
-    Lite 默认用 FLAT(精确,~20ms / 335K 单查)
-    Standalone 传 --hnsw 切 HNSW(~5ms,98%+ 召回)
-    """
-    params = client.prepare_index_params()
+def _build_schema_section(client):
+    from pymilvus import DataType
+    s = client.create_schema(auto_id=False, enable_dynamic_field=False)
+    s.add_field("chunk_id",     DataType.VARCHAR, max_length=192, is_primary=True)
+    s.add_field("dense",        DataType.FLOAT_VECTOR, dim=DIM)
+    s.add_field("sparse",       DataType.SPARSE_FLOAT_VECTOR)
+    s.add_field("text",         DataType.VARCHAR, max_length=8000)
+    s.add_field("stock_code",   DataType.VARCHAR, max_length=16)
+    s.add_field("stock_name",   DataType.VARCHAR, max_length=64)
+    s.add_field("industry",     DataType.VARCHAR, max_length=64)
+    s.add_field("date",         DataType.VARCHAR, max_length=32)
+    s.add_field("report_title", DataType.VARCHAR, max_length=512)
+    s.add_field("section_id",   DataType.VARCHAR, max_length=192)
+    s.add_field("section_title",DataType.VARCHAR, max_length=512)
+    s.add_field("page_idx",     DataType.INT32)
+    s.add_field("pdf_file",     DataType.VARCHAR, max_length=128)
+    return s
 
+
+def _build_schema_tabular(client):
+    from pymilvus import DataType
+    s = client.create_schema(auto_id=False, enable_dynamic_field=False)
+    s.add_field("chunk_id",     DataType.VARCHAR, max_length=192, is_primary=True)
+    s.add_field("dense",        DataType.FLOAT_VECTOR, dim=DIM)
+    s.add_field("sparse",       DataType.SPARSE_FLOAT_VECTOR)
+    s.add_field("text",         DataType.VARCHAR, max_length=4000)
+    s.add_field("stock_code",   DataType.VARCHAR, max_length=16)
+    s.add_field("stock_name",   DataType.VARCHAR, max_length=64)
+    s.add_field("industry",     DataType.VARCHAR, max_length=64)
+    s.add_field("date",         DataType.VARCHAR, max_length=32)
+    s.add_field("report_title", DataType.VARCHAR, max_length=512)
+    s.add_field("chunk_method", DataType.VARCHAR, max_length=32)
+    s.add_field("parent_id",    DataType.VARCHAR, max_length=192)
+    s.add_field("parent_md",    DataType.VARCHAR, max_length=8000)
+    s.add_field("table_caption",DataType.VARCHAR, max_length=512)
+    s.add_field("table_footnote",DataType.VARCHAR, max_length=1024)
+    s.add_field("page_idx",     DataType.INT32)
+    s.add_field("pdf_file",     DataType.VARCHAR, max_length=128)
+    return s
+
+
+def _build_schema_financial(client):
+    from pymilvus import DataType
+    s = client.create_schema(auto_id=False, enable_dynamic_field=False)
+    s.add_field("chunk_id",     DataType.VARCHAR, max_length=192, is_primary=True)
+    s.add_field("dense",        DataType.FLOAT_VECTOR, dim=DIM)
+    s.add_field("sparse",       DataType.SPARSE_FLOAT_VECTOR)
+    s.add_field("text",         DataType.VARCHAR, max_length=2000)
+    s.add_field("stock_code",   DataType.VARCHAR, max_length=16)
+    s.add_field("stock_name",   DataType.VARCHAR, max_length=64)
+    s.add_field("date",         DataType.VARCHAR, max_length=32)
+    s.add_field("data_type",    DataType.VARCHAR, max_length=64)
+    s.add_field("metric_class", DataType.VARCHAR, max_length=64)
+    return s
+
+
+def _build_schema_industry(client):
+    from pymilvus import DataType
+    s = client.create_schema(auto_id=False, enable_dynamic_field=False)
+    s.add_field("chunk_id",     DataType.VARCHAR, max_length=128, is_primary=True)
+    s.add_field("dense",        DataType.FLOAT_VECTOR, dim=DIM)
+    s.add_field("sparse",       DataType.SPARSE_FLOAT_VECTOR)
+    s.add_field("text",         DataType.VARCHAR, max_length=512)
+    s.add_field("industry",     DataType.VARCHAR, max_length=64)
+    s.add_field("stock_codes",  DataType.VARCHAR, max_length=1024)
+    s.add_field("company_count",DataType.INT32)
+    s.add_field("section_text", DataType.VARCHAR, max_length=4000)
+    s.add_field("pdf_file",     DataType.VARCHAR, max_length=128)
+    return s
+
+
+SCHEMA_BUILDERS = {
+    "report_meta":     _build_schema_meta,
+    "report_section":  _build_schema_section,
+    "report_tabular":  _build_schema_tabular,
+    "financial":       _build_schema_financial,
+    "industry_alias":  _build_schema_industry,
+}
+
+INDEX_FIELDS = {
+    "report_meta":     ["stock_code", "date"],
+    "report_section":  ["stock_code", "section_id"],
+    "report_tabular":  ["stock_code", "parent_id", "date"],
+    "financial":       ["stock_code", "data_type"],
+    "industry_alias":  ["industry"],
+}
+
+
+def _sparse_row_to_dict(sp_raw, j: int) -> dict:
+    """从 BGE-m3 单 batch sparse(scipy csr / list[dict])里取第 j 行 → {int: float} 升序 dict。"""
+    if isinstance(sp_raw, list):
+        return {int(k): float(v) for k, v in sp_raw[j].items()}
+    if hasattr(sp_raw, "tocsr"):
+        csr = sp_raw.tocsr()
+        if hasattr(csr, "indptr") and csr.shape[0] > j:
+            start = int(csr.indptr[j]); end = int(csr.indptr[j + 1])
+            return dict(sorted(((int(k), float(v)) for k, v in
+                                zip(csr.indices[start:end], csr.data[start:end])),
+                               key=lambda x: x[0]))
+    if hasattr(sp_raw, "indices") and hasattr(sp_raw, "data"):
+        return dict(sorted(((int(k), float(v)) for k, v in zip(sp_raw.indices, sp_raw.data)),
+                           key=lambda x: x[0]))
+    return {}
+
+
+def build_one(coll_key: str, rows: list[dict], ef, batch: int = 32,
+              use_hnsw: bool = False) -> None:
+    from pymilvus import MilvusClient
+    db_path = DB_PATHS[coll_key]
+    coll_name = COLL_NAMES[coll_key]
+
+    if not rows:
+        logger.warning(f"[{coll_key}] 0 rows,skip")
+        return
+
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    client = MilvusClient(str(db_path))
+    if coll_name in client.list_collections():
+        client.drop_collection(coll_name)
+    schema = SCHEMA_BUILDERS[coll_key](client)
+    index_params = client.prepare_index_params()
     if use_hnsw:
-        params.add_index(field_name="dense", index_type="HNSW", metric_type="COSINE",
-                         params={"M": 16, "efConstruction": 200})
-        logger.info("  dense 用 HNSW(Standalone)")
+        index_params.add_index(field_name="dense", index_type="HNSW", metric_type="COSINE",
+                               params={"M": 16, "efConstruction": 200})
     else:
-        params.add_index(field_name="dense", index_type="FLAT", metric_type="COSINE")
-        logger.info("  dense 用 FLAT(Lite)")
+        index_params.add_index(field_name="dense", index_type="FLAT", metric_type="COSINE")
+    index_params.add_index(field_name="sparse", index_type="SPARSE_INVERTED_INDEX", metric_type="IP")
+    for f in INDEX_FIELDS[coll_key]:
+        index_params.add_index(field_name=f, index_type="INVERTED")
+    client.create_collection(coll_name, schema=schema, index_params=index_params)
+    logger.info(f"  [{coll_key}] '{coll_name}' @ {db_path} 创建,{len(rows)} 条待灌")
 
-    params.add_index(field_name="sparse", index_type="SPARSE_INVERTED_INDEX", metric_type="IP")
-    # Scalar 索引:Lite 支持 INVERTED,加速 filter / group_by
-    for scalar in ("source_type", "stock_code", "parent_id", "section_id", "industry"):
-        params.add_index(field_name=scalar, index_type="INVERTED")
+    inserted = 0
+    t0 = time.time()
+    for i in range(0, len(rows), batch):
+        batch_rows = rows[i : i + batch]
+        texts = [r["text"] for r in batch_rows]
+        out = ef.encode_documents(texts)
+        rows_to_insert = []
+        for j, r in enumerate(batch_rows):
+            d_vec = out["dense"][j]
+            d_list = d_vec.tolist() if hasattr(d_vec, "tolist") else list(d_vec)
+            sp = _sparse_row_to_dict(out["sparse"], j)
+            if not sp:
+                sp = {0: 1e-6}
+            row = dict(r)
+            row["dense"] = d_list
+            row["sparse"] = sp
+            rows_to_insert.append(row)
+        client.insert(coll_name, rows_to_insert)
+        inserted += len(rows_to_insert)
+        if (inserted % (batch * 10) == 0) or inserted == len(rows):
+            elapsed = time.time() - t0
+            rate = inserted / max(elapsed, 1e-3)
+            eta = (len(rows) - inserted) / max(rate, 1e-3)
+            logger.info(f"    [{coll_key}] inserted {inserted}/{len(rows)}  ({rate:.1f}/s, ETA {eta:.0f}s)")
 
-    return params
+    client.flush(coll_name)
+    stats = client.get_collection_stats(coll_name)
+    logger.info(f"  ✅ [{coll_key}] done. row_count = {stats.get('row_count')}")
 
-
-# ============ chunk → Milvus row ============
-
-def _truncate(s, max_len):
-    """None-safe 截断"""
-    if s is None:
-        return None
-    s = str(s)
-    return s[:max_len] if len(s) > max_len else s
-
-
-def _varchar(s, max_len):
-    """VARCHAR sentinel:None / 空串 → "",避免 milvus-lite 不支持 nullable 的限制"""
-    if s is None:
-        return ""
-    return _truncate(s, max_len)
-
-
-# INT16 sentinel:page_idx / chunk_index / company_count 缺失时用 -1
-# 业务上 page_idx 最小 0、chunk_index 最小 0、company_count 最小 2,-1 不会与真实值冲突
-_INT_MISSING = -1
-
-
-def _csr_row_to_dict(csr, row_idx):
-    """
-    scipy.sparse.csr_array 的一行 → Milvus 可接受的 {col_idx: value} dict
-    Milvus 要求 sparse key 升序,csr.indices 对单行通常升序(scipy 规范),但 sorted 兜底更安全
-    """
-    start = csr.indptr[row_idx]
-    end = csr.indptr[row_idx + 1]
-    pairs = sorted(
-        ((int(k), float(v)) for k, v in zip(csr.indices[start:end], csr.data[start:end])),
-        key=lambda kv: kv[0],
-    )
-    return dict(pairs)
-
-
-def chunk_to_row(chunk: dict, global_idx: int,
-                 dense_vec, sparse_csr, sparse_row_idx: int) -> dict:
-    """把 chunk dict 摊平成 Milvus row(14.4 节字段映射)"""
-    m = chunk.get('metadata', {})
-    source_type = m.get('source_type', 'unknown')
-
-    # chunk_id:优先 metadata 里的,否则用 global_idx 保证唯一
-    chunk_id = m.get('chunk_id') or f"{source_type}_{global_idx:08d}"
-
-    # stock_codes 可能是 list[str],转成逗号分隔字符串
-    stock_codes = m.get('stock_codes')
-    if isinstance(stock_codes, list):
-        stock_codes = ','.join(stock_codes)
-
-    # INT16 缺失用 -1 sentinel(page_idx/chunk_index 业务范围 ≥0,company_count ≥2)
-    page_idx = m.get('page_idx')
-    page_idx = int(page_idx) if page_idx is not None else _INT_MISSING
-    company_count = m.get('company_count')
-    company_count = int(company_count) if company_count is not None else _INT_MISSING
-    chunk_index = m.get('chunk_index')
-    chunk_index = int(chunk_index) if chunk_index is not None else _INT_MISSING
-
-    dense_list = dense_vec.tolist() if hasattr(dense_vec, 'tolist') else list(dense_vec)
-
-    return {
-        # 必填:chunk_id / text / source_type
-        "chunk_id":       _truncate(chunk_id, 256),
-        "dense":          dense_list,
-        "sparse":         _csr_row_to_dict(sparse_csr, sparse_row_idx),
-        "text":           _truncate(chunk.get('text', ''), 4096),
-        "source_type":    _truncate(source_type, 32),
-        # 可选 VARCHAR:缺失用 "" sentinel(查询侧 `x or ''` / `if x:` 已是 null-safe)
-        "chunk_method":   _varchar(m.get('chunk_method'),   32),
-        "stock_code":     _varchar(m.get('stock_code'),     16),
-        "stock_name":     _varchar(m.get('stock_name'),     64),
-        "institution":    _varchar(m.get('institution'),    128),
-        "date":           _varchar(m.get('date'),           24),
-        "industry":       _varchar(m.get('industry'),       64),
-        "rating":         _varchar(m.get('rating'),         32),
-        "report_title":   _varchar(m.get('report_title'),   256),
-        "page_idx":       page_idx,
-        "pdf_file":       _varchar(m.get('pdf_file'),       256),
-        "parser":         _varchar(m.get('parser'),          32),
-        "data_type":      _varchar(m.get('data_type'),       32),
-        "chunk_index":    chunk_index,
-        "table_type":     _varchar(m.get('table_type'),      64),
-        "header_type":    _varchar(m.get('header_type'),     32),
-        "current_section":_varchar(m.get('current_section'), 256),
-        "parent_id":      _varchar(m.get('parent_id'),      256),
-        "parent_md":      _varchar(m.get('parent_md'),        8192),
-        "table_caption":  _varchar(m.get('table_caption') or m.get('caption'), 512),
-        "table_footnote": _varchar(m.get('table_footnote'),   512),
-        "section_id":     _varchar(m.get('section_id'),     256),
-        "section_title":  _varchar(m.get('section_title'),  256),
-        "section_text":   _varchar(m.get('section_text'),   8192),
-        "stock_codes":    _varchar(stock_codes,             2048),
-        "company_count":  company_count,
-    }
-
-
-# ============ 主流程 ============
 
 def main():
-    parser = argparse.ArgumentParser(description="建 Milvus Lite 索引")
+    parser = argparse.ArgumentParser(description="V3.5 多 collection Milvus build")
     parser.add_argument('--hnsw', action='store_true',
                         help='用 HNSW dense 索引(Standalone),默认 FLAT(Lite)')
     parser.add_argument('--limit', type=int, default=0,
-                        help='限制 chunks 数量(用于原型)')
-    parser.add_argument('--batch', type=int, default=500,
-                        help='每批 insert 大小')
-    parser.add_argument('--uri', type=str, default=None,
-                        help='覆盖 URI(连 Standalone 用 http://localhost:19530)')
+                        help='每 collection 限流(原型用)')
+    parser.add_argument('--batch', type=int, default=32,
+                        help='encode + insert batch size')
+    parser.add_argument('--only', type=str, default=None,
+                        help='只 build 指定 collection (report_meta / report_section / report_tabular / financial / industry_alias)')
+    parser.add_argument('--device', type=str, default="cuda:0",
+                        help='BGE-m3 device,默认 cuda:0')
     args = parser.parse_args()
 
-    # ─── 1. 加载 chunks ───
-    logger.info("加载 chunks:")
-    chunks = load_all_chunks()
-    if not chunks:
-        logger.error("❌ 没有 chunks 可以导入,退出")
-        return
-    logger.info(f"总 chunks: {len(chunks)}")
-    if args.limit > 0:
-        chunks = chunks[:args.limit]
-        logger.info(f"原型模式:限流到 {len(chunks)}")
+    logger.info(f"V3.5 多 collection build 开始,output dir={DATA_DIR}")
+    buckets = collect_buckets()
 
-    dist = Counter(c.get('metadata', {}).get('source_type', '?') for c in chunks)
-    logger.info(f"source_type 分布: {dict(dist)}")
+    if args.limit:
+        for k in buckets:
+            buckets[k] = buckets[k][: args.limit]
+        logger.info(f"limit={args.limit} 生效")
 
-    # 与 Milvus text 字段(VARCHAR 4096)对齐,避免 encode 看到的内容比存储的短
-    texts = [(c.get('text') or '')[:4096] for c in chunks]
-
-    # ─── 2. bge-m3 一次输出 dense + native sparse(替代 BGE + jieba/BM25 两路) ───
-    logger.info(f"加载 bge-m3: {EMBEDDING_MODEL}")
     from pymilvus.model.hybrid import BGEM3EmbeddingFunction
-    m3_ef = BGEM3EmbeddingFunction(
-        model_name=EMBEDDING_MODEL, device="cuda:0", use_fp16=True,
-    )
+    logger.info(f"加载 bge-m3: {EMBEDDING_MODEL} (device={args.device})")
+    ef = BGEM3EmbeddingFunction(model_name=EMBEDDING_MODEL, device=args.device, use_fp16=True)
 
-    logger.info(f"encode {len(texts)} 条 dense+sparse(bge-m3)...")
-    docs_emb = m3_ef.encode_documents(texts)
+    # 由小到大顺序,先验证 schema 没问题再跑大集合
+    order = ["industry_alias", "financial", "report_meta", "report_tabular", "report_section"]
+    for key in order:
+        if args.only and args.only != key:
+            continue
+        build_one(key, buckets[key], ef, batch=args.batch, use_hnsw=args.hnsw)
 
-    # 兼容:dense 可能是 list[np.ndarray] 或 np.ndarray(pymilvus 版本差异)
-    import numpy as np
-    dense_raw = docs_emb["dense"]
-    dense_vecs = np.array(dense_raw) if isinstance(dense_raw, list) else dense_raw
-
-    # 兼容:sparse 可能是 list[dict] 或 scipy csr/coo,统一转 csr_matrix
-    sparse_raw = docs_emb["sparse"]
-    if isinstance(sparse_raw, list) and sparse_raw and isinstance(sparse_raw[0], dict):
-        from scipy.sparse import csr_matrix
-        rows_i, cols_i, data_v = [], [], []
-        max_col = 0
-        for i_row, d in enumerate(sparse_raw):
-            for k, v in d.items():
-                rows_i.append(i_row)
-                cols_i.append(int(k))
-                data_v.append(float(v))
-                if int(k) > max_col:
-                    max_col = int(k)
-        sparse_csr = csr_matrix((data_v, (rows_i, cols_i)),
-                                 shape=(len(sparse_raw), max_col + 1))
-    else:
-        # 已经是 scipy sparse,转 csr 以便 chunk_to_row 里的 _csr_row_to_dict 使用 indptr
-        sparse_csr = sparse_raw.tocsr() if hasattr(sparse_raw, 'tocsr') else sparse_raw
-
-    logger.info(f"encode 完成 dense={dense_vecs.shape} sparse_nnz={sparse_csr.nnz}")
-
-    # ─── 3. 建 Milvus collection ───
-    from pymilvus import MilvusClient
-    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
-
-    uri = args.uri or str(DB_PATH)
-    logger.info(f"连接 Milvus: {uri}")
-    client = MilvusClient(uri=uri)
-
-    if client.has_collection(COLLECTION):
-        logger.info(f"⚠️  collection {COLLECTION!r} 已存在,drop 重建")
-        client.drop_collection(COLLECTION)
-
-    schema = build_schema(client)
-    index_params = build_index_params(client, use_hnsw=args.hnsw)
-    client.create_collection(
-        collection_name=COLLECTION,
-        schema=schema,
-        index_params=index_params,
-    )
-    logger.info(f"✅ collection {COLLECTION!r} 创建完成")
-
-    # ─── 5. 批量 insert ───
-    logger.info(f"批量 insert(batch={args.batch})...")
-    buffer = []
-    n_inserted = 0
-    for i, c in enumerate(tqdm(chunks, desc="insert")):
-        row = chunk_to_row(c, i, dense_vecs[i], sparse_csr, i)
-        buffer.append(row)
-        if len(buffer) >= args.batch:
-            client.insert(collection_name=COLLECTION, data=buffer)
-            n_inserted += len(buffer)
-            buffer = []
-    if buffer:
-        client.insert(collection_name=COLLECTION, data=buffer)
-        n_inserted += len(buffer)
-
-    logger.info(f"✅ insert 完成:{n_inserted} 条")
-
-    # ─── 6. flush + sanity check ───
-    try:
-        client.flush(collection_name=COLLECTION)
-    except Exception:
-        pass   # Lite 可能没有 flush API
-
-    try:
-        sample = client.query(
-            collection_name=COLLECTION,
-            filter='source_type != ""',
-            output_fields=["source_type"],
-            limit=5,
-        )
-        logger.info(f"sanity check: 命中 {len(sample)} 条 source_type 样本")
-    except Exception as e:
-        logger.warning(f"sanity check 跳过: {e}")
-
-    logger.info("=" * 60)
-    logger.info("✅ 建索引完成")
-    logger.info(f"   DB 路径:     {DB_PATH}")
-    logger.info(f"   Embedding:   bge-m3 (1024 维, dense+learned sparse)")
-    logger.info(f"   索引 backend: {'HNSW(Standalone)' if args.hnsw else 'FLAT(Lite)'}")
-    logger.info("下一步: 跑 hybrid_search.py 做召回验证")
+    logger.info("✅ 全部 collection build 完成")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

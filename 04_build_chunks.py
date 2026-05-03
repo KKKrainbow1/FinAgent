@@ -522,20 +522,25 @@ def _table_aware_chunks(text: str, metadata: dict,
     return chunks
 
 
-# ============ MinerU Prose Parent-Child + fixed_window Chunking（2026-04-20 V3） ============
+# ============ MinerU Prose Section-level Chunking(2026-05-03 V3.5) ============
 #
 # 历史演进:
 #   V1 (Marker)  : 512 字滑窗 + 64 overlap
 #   V2           : Block-native + Rule-based(35 个主题词切)
-#   V3 (当前)    : **Parent-Child 解耦** — section 整段作 Parent,section 内 fixed_window 300+60 切 Child
+#   V3           : Parent-Child 解耦 — section 整段作 Parent,section 内 fixed_window 300+60 切 Child
+#   V3.5(当前)   : **Section 即 Chunk** — section_text 整段直接作 chunk(BGE-m3 8192 token 装得下),
+#                  删 fixed_window 滑窗 + 删 enrich_with_parent prose 分支
 #
-# 为什么 V3:
-#   - Embedding 和 LLM 阅读的目标天然冲突(embedding 想短 / LLM 想长)
-#   - V2 切碎后 LLM 看不到 "首先→其次→综上" 完整论述链,容易编造结论
-#   - V3 和表格 Parent-Child 完全同构:Child 做 embedding / Parent 给 LLM
+# 为什么 V3.5:
+#   - V3 fixed_window 300 字符 child + 命中后拼回 section_text 走了一次 child→parent 的弯路;
+#     section_text 已经冗余在每条 child metadata,LLM 看的本来就是 section_text → 直接用 section 做 chunk 更直接
+#   - V3 16,197 child 重复嵌入同一份 section_text(双重计数 RRF 累加扭曲);
+#     V3.5 直接 7,010 section,索引更瘦,语义信号更聚焦
+#   - 实测(本地 50 query 召回质量评分 V3 vs V3.5):2.23/3 持平,但 V3.5 架构更简洁
 #
-# Section 边界:MinerU 的 text_level=1 标记
-# 详见 docs/Finagent项目介绍.md 3.6 / Chunk_Alignment 12 节
+# Section 边界:MinerU 的 text_level=1 标记(整章级别,平均 4.8 sec/PDF)
+# Chunk head:[公司(代码) · 日期 · 报告标题 · 章节:章节标题] 锚定 BGE-m3 dense embedding
+# 详见 docs/RAG部分实验和总结/Finagent项目RAG数据库部分.md V3.5 章节
 
 # 复用 03d 的作者签名正则,避免假 text_level=1 作 section 锚点
 _RE_AUTHOR_TITLE_SECTION = re.compile(
@@ -598,65 +603,63 @@ def _collect_sections(blocks: list[dict], pdf_stem: str) -> list[dict]:
     return sections
 
 
-def _fixed_window_chunks(section: dict, base_metadata: dict,
-                         chunk_size: int = 300, overlap: int = 60) -> list[dict]:
+def _section_chunk(section: dict, base_metadata: dict,
+                   max_section_chars: int = 3000, min_section_chars: int = 20) -> list[dict]:
     """
-    Section 内固定窗口 + overlap 切 Child。
-    每个 Child 的 metadata 冗余存 section 的 id / title / text(Parent-Child zero-join)。
+    V3.5:Section 即 Chunk —— section_text 整段直接作一条 chunk,不再切 fixed_window child。
+
+    Chunk text 加 head 锚定:
+        [公司名(代码) · 日期 · 报告标题 · 章节:章节标题] {section_text}
+    BGE-m3 dense embedding 把"哪家公司哪份研报哪一节"信号融进 vector,对带公司名/简称
+    的 query 命中精度有提升。
+
+    返回 0 或 1 条 chunk(过短的 section 直接丢)。
     """
-    text = section['text'].strip()
+    text = (section.get('text') or '').strip()
+    if len(text) < min_section_chars:
+        return []
+    text = text[:max_section_chars]
+
     sid = section['id']
-    section_meta = {
-        **base_metadata,
-        'section_id':    sid,
-        'section_title': section['title'],
-        'section_text':  text[:3000],       # 冗余存 Parent,最长 3000 字防过长
-        'page_idx':      section.get('page_idx', -1),
-    }
+    stitle = (section.get('title') or '').strip()
 
-    # 前缀注入 [股票名 日期 研报标题]:embedding + BM25 都能看到 chunk 来源身份,
-    # 解决 Q28/Q35/Q36 跨股召回(正文 chunk 里股票名不出现 → 同类财务叙述被 ANN 混选)
-    header_parts = [
-        base_metadata.get('stock_name') or '',
-        base_metadata.get('date') or '',
-        base_metadata.get('report_title') or '',
-    ]
-    header_parts = [p for p in header_parts if p]
-    header = f"[{' '.join(header_parts)}] " if header_parts else ""
+    # Chunk head:[公司(代码) · 日期 · 报告标题 · 章节:章节标题]
+    name = (base_metadata.get('stock_name') or '').strip()
+    code = (base_metadata.get('stock_code') or '').strip()
+    date = (base_metadata.get('date') or '').strip()[:10]
+    rtitle = (base_metadata.get('report_title') or '').strip()
+    head_parts = []
+    if name and code:
+        head_parts.append(f"{name}({code})")
+    elif name:
+        head_parts.append(name)
+    if date:
+        head_parts.append(date)
+    if rtitle:
+        head_parts.append(rtitle[:80])
+    if stitle:
+        head_parts.append(f"章节:{stitle[:60]}")
+    head = "[" + " · ".join(head_parts) + "] " if head_parts else ""
 
-    chunks = []
+    return [{
+        'text': head + text,
+        'metadata': {
+            **base_metadata,
+            'chunk_id':     sid,                     # PK = section_id(业务语义,可追溯)
+            'chunk_method': 'section',
+            'section_id':   sid,
+            'section_title': stitle,
+            'section_text':  text,                   # 保留原文(不带 head),给 enrich/调试
+            'page_idx':      section.get('page_idx', -1),
+            'source_type':   'report_fulltext',      # 兼容 04 旧 API,05 重命名为 report_section
+        },
+    }]
 
-    # section 本身短于 chunk_size → 整块作 1 个 Child,不切
-    if len(text) <= chunk_size:
-        if len(text) >= 20:
-            chunks.append({
-                'text': header + text,
-                'metadata': {**section_meta,
-                             'chunk_id':     f"{sid}_c0",
-                             'chunk_method': 'fixed_window',
-                             'chunk_index':  0},
-            })
-        return chunks
 
-    # section 长于 chunk_size → 滑窗切
-    start = 0
-    idx = 0
-    while start < len(text):
-        end = start + chunk_size
-        ct = text[start:end].strip()
-        if len(ct) >= 50:   # 尾部太短丢弃
-            chunks.append({
-                'text': header + ct,
-                'metadata': {**section_meta,
-                             'chunk_id':     f"{sid}_c{idx}",
-                             'chunk_method': 'fixed_window',
-                             'chunk_index':  idx},
-            })
-            idx += 1
-        start = end - overlap
-        if start >= len(text):
-            break
-    return chunks
+# 旧 API 兼容(指向新实现):section 切分逻辑唯一入口
+def _fixed_window_chunks(section, base_metadata, **_kwargs):
+    """[deprecated] V3.5 起用 _section_chunk;此函数保留是为了兼容历史调用点。"""
+    return _section_chunk(section, base_metadata)
 
 
 def _html_table_to_md(html: str) -> str:
@@ -819,9 +822,9 @@ def build_fulltext_chunks_mineru(cleaned_dir: str, pdf_map_path: str = None,
             if not _is_real_section(section):
                 continue
             stats['sections_kept'] += 1
-            all_chunks.extend(_fixed_window_chunks(
-                section, base_metadata, chunk_size=chunk_size, overlap=overlap,
-            ))
+            # V3.5: section 整段直接作 chunk(不再 fixed_window 切分);
+            # chunk_size / overlap 参数已废弃,_section_chunk 用 max_section_chars=3000
+            all_chunks.extend(_section_chunk(section, base_metadata))
 
         # --- 表格路径:产出独立 parent records ---
         # 遍历时同步追踪 current_section(最近一次遇到的 text_level=1 标题),

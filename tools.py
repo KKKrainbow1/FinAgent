@@ -42,12 +42,14 @@ TOOLS_NATIVE = [
     {
         "type": "function",
         "function": {
-            "name": "search_report",
+            "name": "search_report_meta",
             "description": (
-                "检索**单一公司**的券商研报信息,返回机构评级、目标价、EPS 预测、深度研报观点等。\n"
-                "⚠️ 仅限单只公司或单一议题的研报观点查询。涉及行业整体趋势/同行对比时禁用本工具,改用 search_industry。\n"
-                "返回格式: '[report · - | 公司名 | 2026-XX-XX] 机构观点... 评级:... 目标价:... '\n"
-                "    或: '[report_fulltext | 公司名 | 日期] 研报正文段落...'"
+                "检索**单一公司**的券商研报**评级摘要**(机构观点 / 评级 / 目标价 / EPS 预测 / 盈利预测)。\n"
+                "⚠️ 一次工具调用仅检索一家公司。涉及多公司对比/排名时,**为每家公司分别调用一次本工具**,然后综合分析。\n"
+                "⚠️ 仅适合查"机构观点 / 评级 / 目标价 / EPS / 盈利预测"等摘要级信息。\n"
+                "    需要研报正文细节(章节叙述 / 业务分析 / 财务表格)时改用 search_report_content。\n"
+                "    需要行业整体趋势 / 同行均值时用 search_industry。\n"
+                "返回格式: '[report | 公司名 | 2026-XX-XX] 公司名(代码) 研报:标题 出品机构:XXX 评级:买入 盈利预测:...'"
             ),
             "parameters": {
                 "type": "object",
@@ -55,13 +57,53 @@ TOOLS_NATIVE = [
                     "query": {
                         "type": "string",
                         "description": (
-                            "研报检索关键词。建议结构: '<公司名> <主题/指标关键词> <期别>'。"
+                            "研报检索关键词。建议结构: '<公司名> <评级/目标价/EPS等关键词> <期别>'。"
                             "示例见 examples 字段。"
                         ),
                         "examples": [
                             "贵州茅台 投资评级 目标价 2025 2026",
-                            "宁德时代 业绩点评 2025H1",
-                            "招商银行 深度研报 净息差预期"
+                            "宁德时代 业绩点评 EPS 预测",
+                            "招商银行 评级 净息差预期"
+                        ]
+                    },
+                    "top_k": {
+                        "type": "integer",
+                        "description": "返回结果数量,默认 5,上限 20",
+                        "default": 5,
+                        "minimum": 1,
+                        "maximum": 20
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "search_report_content",
+            "description": (
+                "检索**单一公司**的券商研报**正文细节**(章节叙述 + 财务表格 / 业务分析 / 主题深度内容)。\n"
+                "⚠️ 一次工具调用仅检索一家公司。涉及多公司对比/排名时,**为每家公司分别调用一次本工具**,然后综合分析。\n"
+                "⚠️ 适合查"业务/产品分析 / 主题深度 / 海外扩张 / 财务表格 / 现金流细节"等正文内容。\n"
+                "    只想要评级 / 目标价 / EPS 预测时改用 search_report_meta(更精准)。\n"
+                "    需要行业整体趋势 / 同行均值时用 search_industry。\n"
+                "返回格式: '[报告标题 章节:章节名] 章节正文段落...'  或  '【表格 标题 第 X 页】Markdown 表格 + 检索命中事实'"
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": (
+                            "研报正文检索关键词。建议结构: '<公司名> <主题/业务关键词> <期别可选>'。"
+                            "示例见 examples 字段。"
+                        ),
+                        "examples": [
+                            "宁德时代 海外扩张 储能业务",
+                            "贵州茅台 渠道改革 直营",
+                            "招商银行 净息差走势 资产质量",
+                            "美的集团 海外OBM 业务结构"
                         ]
                     },
                     "top_k": {
@@ -83,7 +125,8 @@ TOOLS_NATIVE = [
             "description": (
                 "检索**单一公司**的财务数据,返回 ROE / ROA / 毛利率 / 净利率 / 营收增长率 / 资产负债率 / "
                 "杜邦三因子 / 周转率 等 80+ 指标(中国 A 股财报口径)。\n"
-                "⚠️ 仅限单只公司查询。涉及行业对比/同行排名/行业均值时**禁用本工具**,必须用 search_industry。\n"
+                "⚠️ 一次工具调用仅检索一家公司。多公司对比时**为每家分别调用一次本工具**。\n"
+                "⚠️ 涉及行业对比/同行排名/行业均值时**禁用本工具**,必须用 search_industry。\n"
                 "⚠️ 银行/保险/证券类公司**不要用毛利率**(用 NIM / 综合成本率 / 经纪业务收入 等行业专属指标)。\n"
                 "返回格式: '[financial · profitability | 公司 | 2024-12-31] ROE 36.99%, 毛利率 91.93%...'\n"
                 "    多 chunk 拼接,subtype 标签:profitability / balance_structure / dupont 等"
@@ -273,15 +316,20 @@ class FinAgentTools:
 
     # V1 纯文本工具描述（保留供 V1 代码使用）
     TOOL_DESCRIPTIONS = {
-        "search_report": (
-            "search_report(query: str) → 检索券商研报信息。"
-            "返回机构评级、目标价、EPS预测、行业分析等。"
-            "适用于：查机构观点、投资评级、行业前景、竞争分析等。"
+        "search_report_meta": (
+            "search_report_meta(query: str) → 检索券商研报评级摘要(机构观点 / 评级 / 目标价 / EPS 预测)。"
+            "⚠️ 一次仅查一家公司,跨公司分别调用。"
+            "适用于：查机构观点、投资评级、目标价、盈利预测等。"
+        ),
+        "search_report_content": (
+            "search_report_content(query: str) → 检索券商研报正文(章节叙述 + 表格)。"
+            "⚠️ 一次仅查一家公司,跨公司分别调用。"
+            "适用于：查业务分析、主题深度、海外扩张、财务表格等正文细节。"
         ),
         "search_financial": (
             "search_financial(query: str) → 检索公司财务数据。"
             "返回ROE、毛利率、营收增长率、资产负债率等指标。"
-            "适用于：查具体财务数据、盈利能力、偿债能力、运营效率等。"
+            "⚠️ 一次仅查一家公司。适用于：查具体财务数据、盈利能力、偿债能力、运营效率等。"
         ),
         "search_industry": (
             "search_industry(query: str) → 检索行业对比数据。"
@@ -348,7 +396,8 @@ class FinAgentTools:
                 tool_input = json.loads(tool_input)
             except (json.JSONDecodeError, TypeError):
                 # 纯字符串，包装为 dict
-                if tool_name in ("search_report", "search_financial", "search_industry"):
+                if tool_name in ("search_report", "search_report_meta", "search_report_content",
+                                 "search_financial", "search_industry"):
                     tool_input = {"query": tool_input.strip()}
                 elif tool_name == "calculate":
                     tool_input = {"expression": tool_input.strip()}
@@ -364,8 +413,19 @@ class FinAgentTools:
             except (TypeError, ValueError):
                 return default
 
-        if tool_name == "search_report":
-            return self._search_report(
+        if tool_name == "search_report_meta":
+            return self._search_report_meta(
+                query=_safe_query(tool_input.get("query", "")),
+                top_k=_safe_top_k(tool_input.get("top_k", 5), default=5),
+            )
+        elif tool_name == "search_report_content":
+            return self._search_report_content(
+                query=_safe_query(tool_input.get("query", "")),
+                top_k=_safe_top_k(tool_input.get("top_k", 5), default=5),
+            )
+        elif tool_name == "search_report":
+            # 旧 V1/V2 调用兼容:meta + content 二路融合
+            return self._search_report_legacy(
                 query=_safe_query(tool_input.get("query", "")),
                 top_k=_safe_top_k(tool_input.get("top_k", 5), default=5),
             )
@@ -387,32 +447,52 @@ class FinAgentTools:
         else:
             return f"[错误] 未知工具: {tool_name}。可用工具: {', '.join(TOOL_NAMES_NATIVE)}", None
 
-    # ---------- search_report ----------
+    # ---------- search_report_meta(评级摘要) ----------
 
-    def _search_report(self, query: str, top_k: int = 5) -> tuple:
-        """
-        检索研报信息
+    def _search_report_meta(self, query: str, top_k: int = 5) -> tuple:
+        """检索研报评级摘要(机构观点 / 评级 / 目标价 / EPS 预测)。"""
+        try:
+            results = self.retriever.search_report_meta(query, top_k=top_k)
+        except Exception as e:
+            logger.error(f"search_report_meta 异常: {e}")
+            return f"[检索错误] 研报摘要检索失败: {str(e)}", None
+        if not results:
+            return "[检索结果为空] 未找到与查询相关的研报评级摘要。", None
+        lines = [f"找到 {len(results)} 条相关研报评级摘要："]
+        for i, r in enumerate(results):
+            lines.append(f"{i+1}. {_format_result(r)}")
+        return "\n".join(lines), self._build_retrieval_meta(results)
 
-        返回格式示例：
-        找到 5 条相关研报片段（按 12K 上下文预算截取）：
-        1. [report · - | 宁德时代 | 2026-02-15] 宁德时代(300750) 研报：全年业绩超预期...评级：买入...
-        2. [report_fulltext | 宁德时代 | 2026-02-15] 公司动力电池市占率持续提升...
-        ...
-        """
+    # ---------- search_report_content(正文章节 + 表格) ----------
+
+    def _search_report_content(self, query: str, top_k: int = 5) -> tuple:
+        """检索研报正文(章节 + 表格)。"""
+        try:
+            results = self.retriever.search_report_content(query, top_k=top_k)
+        except Exception as e:
+            logger.error(f"search_report_content 异常: {e}")
+            return f"[检索错误] 研报正文检索失败: {str(e)}", None
+        if not results:
+            return "[检索结果为空] 未找到与查询相关的研报正文。", None
+        lines = [f"找到 {len(results)} 条相关研报正文片段(按 12K 上下文预算截取):"]
+        for i, r in enumerate(results):
+            lines.append(f"{i+1}. {_format_result(r, max_text_len=400)}")
+        return "\n".join(lines), self._build_retrieval_meta(results)
+
+    # ---------- search_report (V1/V2 兼容,meta+content 二路融合) ----------
+
+    def _search_report_legacy(self, query: str, top_k: int = 5) -> tuple:
+        """旧 search_report 兼容入口,内部调 retriever.search_report(meta+content 融合)。"""
         try:
             results = self.retriever.search_report(query, top_k=top_k)
         except Exception as e:
-            logger.error(f"search_report 异常: {e}")
+            logger.error(f"search_report (legacy) 异常: {e}")
             return f"[检索错误] 研报检索失败: {str(e)}", None
-
         if not results:
             return "[检索结果为空] 未找到与查询相关的研报信息。", None
-
-        # 提示 LLM:N 是"按上下文预算截取后"的数量,不是数据库总匹配数
-        lines = [f"找到 {len(results)} 条相关研报片段（按 12K 上下文预算截取，数据库可能还有更多匹配）："]
+        lines = [f"找到 {len(results)} 条相关研报片段(按 12K 上下文预算截取):"]
         for i, r in enumerate(results):
             lines.append(f"{i+1}. {_format_result(r)}")
-
         return "\n".join(lines), self._build_retrieval_meta(results)
 
     # ---------- search_financial ----------

@@ -69,7 +69,9 @@ else:
     W_STRATEGY_MATCH = 0.25
     W_LLM_JUDGE = 0.0
 
-VALID_TOOLS = {"search_financial", "search_report", "search_industry", "calculate"}
+VALID_TOOLS = {"search_financial", "search_report_meta", "search_report_content",
+               "search_industry", "calculate",
+               "search_report"}  # search_report 保留兼容旧 SFT V3 trajectory
 
 # LLM client（延迟初始化）
 _llm_client = None
@@ -136,22 +138,57 @@ class FinAgentEnv:
         self.tool_steps[-1]['retrieved'] = retrieved
         return result
 
-    def search_report(self, query: str) -> str:
+    def search_report_meta(self, query: str) -> str:
         """
-        搜索券商研报（评级、目标价、EPS预测、深度分析）。
+        搜索券商研报评级摘要(机构观点 / 评级 / 目标价 / EPS 预测)。
+        ⚠️ 一次仅查一家公司,跨公司比较请分别调用。
 
         Args:
-            query: 检索关键词，如"贵州茅台 最新研报 2025"
+            query: 检索关键词,如 "贵州茅台 投资评级 目标价 2025"
 
         Returns:
             检索结果文本
+        """
+        self.tool_steps.append({"tool": "search_report_meta", "query": query})
+        try:
+            result, retrieved = self._shared_tools.call("search_report_meta", {"query": query})
+        except Exception as e:
+            logger.warning(f"search_report_meta 调用失败: {e}")
+            return f"搜索失败:{str(e)}"
+        self.tool_steps[-1]['retrieved'] = retrieved
+        return result
+
+    def search_report_content(self, query: str) -> str:
+        """
+        搜索券商研报正文(章节叙述 + 表格)。
+        ⚠️ 一次仅查一家公司,跨公司比较请分别调用。
+
+        Args:
+            query: 检索关键词,如 "宁德时代 海外业务 储能"
+
+        Returns:
+            检索结果文本
+        """
+        self.tool_steps.append({"tool": "search_report_content", "query": query})
+        try:
+            result, retrieved = self._shared_tools.call("search_report_content", {"query": query})
+        except Exception as e:
+            logger.warning(f"search_report_content 调用失败: {e}")
+            return f"搜索失败:{str(e)}"
+        self.tool_steps[-1]['retrieved'] = retrieved
+        return result
+
+    def search_report(self, query: str) -> str:
+        """
+        [兼容] 旧 search_report 接口(meta + content 二路融合)。
+        新 trajectory 应优先用 search_report_meta / search_report_content。
         """
         self.tool_steps.append({"tool": "search_report", "query": query})
         try:
             result, retrieved = self._shared_tools.call("search_report", {"query": query})
         except Exception as e:
             logger.warning(f"search_report 调用失败: {e}")
-            return f"搜索失败：{str(e)}"
+            return f"搜索失败:{str(e)}"
         self.tool_steps[-1]['retrieved'] = retrieved
         return result
 
@@ -651,11 +688,12 @@ def _compute_reject_reward(env, answer: str) -> float:
 LLM_BINARY_PROMPT = """你是一个金融分析 Agent 工具调用策略的评审。
 
 ## Agent 的能力范围
-Agent **仅有**以下 4 个工具，没有其他信息来源：
-1. **search_financial(query)**：搜索公司财务数据（ROE、净利率、资产负债率等），每次返回 top-3 条
-2. **search_report(query)**：搜索券商研报（目标价、评级、EPS 预测），每次返回 top-3 条
-3. **search_industry(query)**：搜索行业对比数据（同行业公司指标均值和排名）
-4. **calculate(expression)**：计算数学表达式
+Agent **仅有**以下 5 个工具,没有其他信息来源:
+1. **search_report_meta(query)**:搜索研报评级摘要(机构观点 / 评级 / 目标价 / EPS 预测),每次仅一家公司
+2. **search_report_content(query)**:搜索研报正文(章节叙述 + 表格细节),每次仅一家公司
+3. **search_financial(query)**:搜索公司财务数据(ROE / 净利率 / 资产负债率等),每次仅一家公司
+4. **search_industry(query)**:搜索行业对比数据(同行业公司指标均值和排名)
+5. **calculate(expression)**:计算数学表达式
 
 数据库覆盖：沪深300公司的财务指标 + 券商研报 + 30个行业对比数据。
 **不包含**：现金流明细、费用率、股价K线、管理层信息、政策原文。

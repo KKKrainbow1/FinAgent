@@ -76,7 +76,13 @@ for _dim_name, _config in DIMENSION_CONFIG.items():
         METRIC_TO_DIMENSION[_metric] = _dim_name
 
 # 有效工具集
-VALID_TOOLS = {"search_financial", "search_report", "search_industry", "calculate"}
+# V3.5 拆 search_report 后,有效工具加入 _meta / _content 两个新工具。
+# 旧 search_report 保留兼容(V3 SFT trajectory 还在用),reward rule 用 search_report 时
+# 通过 SEARCH_REPORT_FAMILY 自动展开成"任一研报工具命中即可"的并集语义。
+SEARCH_REPORT_FAMILY = ("search_report", "search_report_meta", "search_report_content")
+VALID_TOOLS = set(SEARCH_REPORT_FAMILY) | {
+    "search_financial", "search_industry", "calculate"
+}
 
 
 # ============================================================
@@ -450,8 +456,11 @@ def count_unique_companies(tool_steps: list) -> set:
     返回公司名集合。
     """
     names = set()
+    # V3.5 拆 search_report 后:financial + 任一 report 工具 query 都参与统计
+    _COMPANY_TOOLS = {"search_financial", "search_report",
+                      "search_report_meta", "search_report_content"}
     for step in tool_steps:
-        if step.get("tool") in ("search_financial", "search_report"):
+        if step.get("tool") in _COMPANY_TOOLS:
             name = extract_company_name(step.get("query", ""))
             if name:
                 names.add(name)
@@ -686,11 +695,21 @@ def check_item(item: dict, tool_steps: list, queries: List[str],
     check_type = item["check"]
     tools_used = [s.get("tool") for s in tool_steps]
 
+    def _expand_family(t):
+        """V3.5 兼容:rule 写 'search_report' 时,展开成 (search_report, _meta, _content) 三家任一命中。"""
+        if t == "search_report":
+            return SEARCH_REPORT_FAMILY
+        return (t,)
+
     if check_type == "has_tool":
-        return 1.0 if item["tool"] in tools_used else 0.0
+        family = _expand_family(item["tool"])
+        return 1.0 if any(t in tools_used for t in family) else 0.0
 
     elif check_type == "has_any_tool":
-        return 1.0 if any(t in tools_used for t in item["tools"]) else 0.0
+        all_options = []
+        for t in item["tools"]:
+            all_options.extend(_expand_family(t))
+        return 1.0 if any(t in tools_used for t in all_options) else 0.0
 
     elif check_type == "unique_companies_ge_2":
         # company_comparison 的 graded must：≥2→1.0, =1→0.5, =0→0.0
