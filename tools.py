@@ -46,7 +46,7 @@ TOOLS_NATIVE = [
             "description": (
                 "检索**单一公司**的券商研报**评级摘要**(机构观点 / 评级 / 目标价 / EPS 预测 / 盈利预测)。\n"
                 "⚠️ 一次工具调用仅检索一家公司。涉及多公司对比/排名时,**为每家公司分别调用一次本工具**,然后综合分析。\n"
-                "⚠️ 仅适合查"机构观点 / 评级 / 目标价 / EPS / 盈利预测"等摘要级信息。\n"
+                "⚠️ 仅适合查“机构观点 / 评级 / 目标价 / EPS / 盈利预测”等摘要级信息。\n"
                 "    需要研报正文细节(章节叙述 / 业务分析 / 财务表格)时改用 search_report_content。\n"
                 "    需要行业整体趋势 / 同行均值时用 search_industry。\n"
                 "返回格式: '[report | 公司名 | 2026-XX-XX] 公司名(代码) 研报:标题 出品机构:XXX 评级:买入 盈利预测:...'"
@@ -68,8 +68,8 @@ TOOLS_NATIVE = [
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "返回结果数量,默认 5,上限 20",
-                        "default": 5,
+                        "description": "返回结果数量,默认 3,上限 20",
+                        "default": 3,
                         "minimum": 1,
                         "maximum": 20
                     }
@@ -85,7 +85,7 @@ TOOLS_NATIVE = [
             "description": (
                 "检索**单一公司**的券商研报**正文细节**(章节叙述 + 财务表格 / 业务分析 / 主题深度内容)。\n"
                 "⚠️ 一次工具调用仅检索一家公司。涉及多公司对比/排名时,**为每家公司分别调用一次本工具**,然后综合分析。\n"
-                "⚠️ 适合查"业务/产品分析 / 主题深度 / 海外扩张 / 财务表格 / 现金流细节"等正文内容。\n"
+                "⚠️ 适合查“业务/产品分析 / 主题深度 / 海外扩张 / 财务表格 / 现金流细节”等正文内容。\n"
                 "    只想要评级 / 目标价 / EPS 预测时改用 search_report_meta(更精准)。\n"
                 "    需要行业整体趋势 / 同行均值时用 search_industry。\n"
                 "返回格式: '[报告标题 章节:章节名] 章节正文段落...'  或  '【表格 标题 第 X 页】Markdown 表格 + 检索命中事实'"
@@ -108,8 +108,8 @@ TOOLS_NATIVE = [
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "返回结果数量,默认 5,上限 20",
-                        "default": 5,
+                        "description": "返回结果数量,默认 3,上限 20",
+                        "default": 3,
                         "minimum": 1,
                         "maximum": 20
                     }
@@ -148,8 +148,8 @@ TOOLS_NATIVE = [
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "返回结果数量,默认 5,上限 20",
-                        "default": 5,
+                        "description": "返回结果数量,默认 3,上限 20",
+                        "default": 3,
                         "minimum": 1,
                         "maximum": 20
                     }
@@ -189,8 +189,8 @@ TOOLS_NATIVE = [
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "返回结果数量,默认 5,上限 20",
-                        "default": 5,
+                        "description": "返回结果数量,默认 3,上限 20",
+                        "default": 3,
                         "minimum": 1,
                         "maximum": 20
                     }
@@ -407,7 +407,7 @@ class FinAgentTools:
         # 输入校验(LLM 可能传 99999 / 'abc' / 10K 字符 query)
         def _safe_query(v):
             return str(v or "")[:500]    # 长度上限,避免 DoS
-        def _safe_top_k(v, default=5):
+        def _safe_top_k(v, default=3):
             try:
                 return max(1, min(int(v), 20))
             except (TypeError, ValueError):
@@ -416,28 +416,28 @@ class FinAgentTools:
         if tool_name == "search_report_meta":
             return self._search_report_meta(
                 query=_safe_query(tool_input.get("query", "")),
-                top_k=_safe_top_k(tool_input.get("top_k", 5), default=5),
+                top_k=_safe_top_k(tool_input.get("top_k", 3), default=3),
             )
         elif tool_name == "search_report_content":
             return self._search_report_content(
                 query=_safe_query(tool_input.get("query", "")),
-                top_k=_safe_top_k(tool_input.get("top_k", 5), default=5),
+                top_k=_safe_top_k(tool_input.get("top_k", 3), default=3),
             )
         elif tool_name == "search_report":
             # 旧 V1/V2 调用兼容:meta + content 二路融合
             return self._search_report_legacy(
                 query=_safe_query(tool_input.get("query", "")),
-                top_k=_safe_top_k(tool_input.get("top_k", 5), default=5),
+                top_k=_safe_top_k(tool_input.get("top_k", 3), default=3),
             )
         elif tool_name == "search_financial":
             return self._search_financial(
                 query=_safe_query(tool_input.get("query", "")),
-                top_k=_safe_top_k(tool_input.get("top_k", 5), default=5),
+                top_k=_safe_top_k(tool_input.get("top_k", 3), default=3),
             )
         elif tool_name == "search_industry":
             return self._search_industry(
                 query=_safe_query(tool_input.get("query", "")),
-                top_k=_safe_top_k(tool_input.get("top_k", 5), default=5),
+                top_k=_safe_top_k(tool_input.get("top_k", 3), default=3),
             )
         elif tool_name == "calculate":
             return self._calculate(
@@ -449,7 +449,7 @@ class FinAgentTools:
 
     # ---------- search_report_meta(评级摘要) ----------
 
-    def _search_report_meta(self, query: str, top_k: int = 5) -> tuple:
+    def _search_report_meta(self, query: str, top_k: int = 3) -> tuple:
         """检索研报评级摘要(机构观点 / 评级 / 目标价 / EPS 预测)。"""
         try:
             results = self.retriever.search_report_meta(query, top_k=top_k)
@@ -465,7 +465,7 @@ class FinAgentTools:
 
     # ---------- search_report_content(正文章节 + 表格) ----------
 
-    def _search_report_content(self, query: str, top_k: int = 5) -> tuple:
+    def _search_report_content(self, query: str, top_k: int = 3) -> tuple:
         """检索研报正文(章节 + 表格)。"""
         try:
             results = self.retriever.search_report_content(query, top_k=top_k)
@@ -481,7 +481,7 @@ class FinAgentTools:
 
     # ---------- search_report (V1/V2 兼容,meta+content 二路融合) ----------
 
-    def _search_report_legacy(self, query: str, top_k: int = 5) -> tuple:
+    def _search_report_legacy(self, query: str, top_k: int = 3) -> tuple:
         """旧 search_report 兼容入口,内部调 retriever.search_report(meta+content 融合)。"""
         try:
             results = self.retriever.search_report(query, top_k=top_k)
@@ -497,7 +497,7 @@ class FinAgentTools:
 
     # ---------- search_financial ----------
 
-    def _search_financial(self, query: str, top_k: int = 5) -> tuple:
+    def _search_financial(self, query: str, top_k: int = 3) -> tuple:
         """
         检索财务数据
 
@@ -524,7 +524,7 @@ class FinAgentTools:
 
     # ---------- search_industry ----------
 
-    def _search_industry(self, query: str, top_k: int = 5) -> tuple:
+    def _search_industry(self, query: str, top_k: int = 3) -> tuple:
         """
         检索行业对比数据
 

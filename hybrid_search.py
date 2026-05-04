@@ -15,13 +15,13 @@ FinAgent Retriever (V3 · 多 collection 版)
 
 对外 API(变化):
     retriever = FinAgentRetriever()
-    retriever.search_report_meta(query, top_k=5)         # 新,评级摘要
-    retriever.search_report_content(query, top_k=5)      # 新,正文+表格(text section + tabular)
-    retriever.search_financial(query, top_k=5, stock_code=None)
-    retriever.search_industry(query, top_k=5)
+    retriever.search_report_meta(query, top_k=3)         # 新,评级摘要
+    retriever.search_report_content(query, top_k=3)      # 新,正文+表格(text section + tabular)
+    retriever.search_financial(query, top_k=3, stock_code=None)
+    retriever.search_industry(query, top_k=3)
 
     # 旧 search_report 保留作兼容(meta + content 二路融合,新代码不应再调)
-    retriever.search_report(query, top_k=5)
+    retriever.search_report(query, top_k=3)
 
 每个 dict 格式:{text, metadata, score},和 V2/V3 保持一致。
 
@@ -334,7 +334,7 @@ class FinAgentRetriever:
 
     # ============ search_report_meta(评级摘要主路) ============
 
-    def search_report_meta(self, query: str, top_k: int = 5) -> list[dict]:
+    def search_report_meta(self, query: str, top_k: int = 3) -> list[dict]:
         """检索研报评级摘要(机构观点 / 评级 / 目标价 / EPS 预测)。
         RRF 融合 dense + sparse,期间词 + 年份齐全才加 date expr。
         """
@@ -362,7 +362,7 @@ class FinAgentRetriever:
 
     # ============ search_report_content(正文 section + 表格 二路 RRF) ============
 
-    def search_report_content(self, query: str, top_k: int = 5) -> list[dict]:
+    def search_report_content(self, query: str, top_k: int = 3) -> list[dict]:
         """检索研报正文章节 + 表格内容。
         内部:section + tabular 两个 collection 独立查 → 应用层 RRF 融合 → table 走 enrich_with_parent。
         """
@@ -431,7 +431,7 @@ class FinAgentRetriever:
 
     # ============ search_financial ============
 
-    def search_financial(self, query: str, top_k: int = 5,
+    def search_financial(self, query: str, top_k: int = 3,
                          stock_code: Optional[str] = None) -> list[dict]:
         """检索财务指标(单公司财报 80+ 指标),可选 stock_code 精确过滤。"""
         import re
@@ -467,7 +467,7 @@ class FinAgentRetriever:
 
     # ============ search_industry(字典快路径 + 向量 fallback) ============
 
-    def search_industry(self, query: str, top_k: int = 5,
+    def search_industry(self, query: str, top_k: int = 3,
                         sim_threshold: float = 0.75) -> list[dict]:
         """字典快路径(255 别名 → 标准名 → query 取整个行业聚合 chunk),
         没命中再走 ANN fallback。"""
@@ -556,7 +556,7 @@ class FinAgentRetriever:
 
     # ============ 兼容老 API:search_report = meta + content 二路融合 ============
 
-    def search_report(self, query: str, top_k: int = 5) -> list[dict]:
+    def search_report(self, query: str, top_k: int = 3) -> list[dict]:
         """兼容 V2/V3 旧调用。新代码请改用 search_report_meta / search_report_content。"""
         meta_hits    = self.search_report_meta(query, top_k=top_k * 2)
         content_hits = self.search_report_content(query, top_k=top_k * 2)
