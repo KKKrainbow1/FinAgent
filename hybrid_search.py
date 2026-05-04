@@ -345,13 +345,16 @@ class FinAgentRetriever:
         # 这里 expr 整体可以是 None(无 period 时);Milvus 接受
         expr = period_clause.removeprefix(" and ") if period_clause else None
 
+        # 单路 limit=15:RRF k=60 公式下 rank≥20 的 chunk 几乎不可能进 top-3
+        # (rank=20 单路 score 0.0125 × 2 路 = 0.025 < single-path top-1 0.0164)
+        # 实测 87 条 query HR@3=100%,所有命中 chunk 单路 rank<15,limit=30 是过度宽裕
         results = self.clients["report_meta"].hybrid_search(
             collection_name=self.collections["report_meta"],
             reqs=[
                 AnnSearchRequest(data=[q_dense],  anns_field="dense",
-                                 param={"metric_type": "COSINE"}, limit=30, expr=expr),
+                                 param={"metric_type": "COSINE"}, limit=15, expr=expr),
                 AnnSearchRequest(data=[q_sparse], anns_field="sparse",
-                                 param={"metric_type": "IP"},     limit=30, expr=expr),
+                                 param={"metric_type": "IP"},     limit=15, expr=expr),
             ],
             ranker=RRFRanker(k=60),
             output_fields=["text", "stock_code", "stock_name", "institution",
@@ -372,13 +375,14 @@ class FinAgentRetriever:
         period_expr = period_clause.removeprefix(" and ") if period_clause else None
 
         # 1) section 路(prose 整段 chunk)
+        # limit=20:section_text 长 dense 信号稳但 sparse 命中分散,留点 buffer
         section_hits = self.clients["report_section"].hybrid_search(
             collection_name=self.collections["report_section"],
             reqs=[
                 AnnSearchRequest(data=[q_dense],  anns_field="dense",
-                                 param={"metric_type": "COSINE"}, limit=30, expr=period_expr),
+                                 param={"metric_type": "COSINE"}, limit=20, expr=period_expr),
                 AnnSearchRequest(data=[q_sparse], anns_field="sparse",
-                                 param={"metric_type": "IP"},     limit=30, expr=period_expr),
+                                 param={"metric_type": "IP"},     limit=20, expr=period_expr),
             ],
             ranker=RRFRanker(k=60),
             output_fields=["text", "stock_code", "stock_name", "industry", "date",
@@ -389,13 +393,14 @@ class FinAgentRetriever:
         section_chunks = [self._hit_to_chunk(h) for h in section_hits[0]]
 
         # 2) tabular 路(table_narrative + parent_md)
+        # limit=30:同 PDF 多张表,需要给 per-pdf cap=3 + budget 留候选;原 60 过度宽裕
         tab_hits = self.clients["report_tabular"].hybrid_search(
             collection_name=self.collections["report_tabular"],
             reqs=[
                 AnnSearchRequest(data=[q_dense],  anns_field="dense",
-                                 param={"metric_type": "COSINE"}, limit=60, expr=period_expr),
+                                 param={"metric_type": "COSINE"}, limit=30, expr=period_expr),
                 AnnSearchRequest(data=[q_sparse], anns_field="sparse",
-                                 param={"metric_type": "IP"},     limit=60, expr=period_expr),
+                                 param={"metric_type": "IP"},     limit=30, expr=period_expr),
             ],
             ranker=RRFRanker(k=60),
             output_fields=["text", "chunk_method", "stock_code", "stock_name",
@@ -441,13 +446,14 @@ class FinAgentRetriever:
         # collection 内部全是 source_type='financial',不需 source_type filter
         expr = f'stock_code == "{stock_code}"' if stock_code else None
 
+        # limit=15:单 stock+date+metric_class 的 chunk 数 < 20,30 过度宽裕
         results = self.clients["financial"].hybrid_search(
             collection_name=self.collections["financial"],
             reqs=[
                 AnnSearchRequest(data=[q_dense],  anns_field="dense",
-                                 param={"metric_type": "COSINE"}, limit=30, expr=expr),
+                                 param={"metric_type": "COSINE"}, limit=15, expr=expr),
                 AnnSearchRequest(data=[q_sparse], anns_field="sparse",
-                                 param={"metric_type": "IP"},     limit=30, expr=expr),
+                                 param={"metric_type": "IP"},     limit=15, expr=expr),
             ],
             ranker=RRFRanker(k=60),
             output_fields=["text", "stock_code", "stock_name",
